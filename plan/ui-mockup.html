@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-ds-dark-theme>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>内容扫描器 · ContentSonar — UI 样板</title>
+<style>
+/* ============ 设计系统变量（dsw-theme 语义层 + 独立渲染 fallback） ============ */
+/* 说明：--dsw-alias-* 为 dsw-theme 真实语义 token，运行时由 DSH 注入；
+   此处 fallback 值取自 dsw 静态色板，仅用于独立预览。 */
+:root{
+  --dsw-alias-bg-base:#0f0f0f;
+  --dsw-alias-bg-layer-1:#151517;
+  --dsw-alias-bg-layer-2:#1c1c1f;
+  --dsw-alias-bg-overlay:rgba(0,0,0,.62);
+  --dsw-alias-border-l1:rgba(255,255,255,.08);
+  --dsw-alias-border-l2:rgba(255,255,255,.13);
+  --dsw-alias-brand-primary:#5686fe;
+  --dsw-alias-brand-primary-strong:#4176e6;
+  --dsw-alias-label-primary:#f5f5f5;
+  --dsw-alias-label-secondary:#979da6;
+  --dsw-alias-state-error-primary:#ef4444;
+  --dsw-alias-state-success-primary:#22c55e;
+  --dsw-alias-state-warn-primary:#f59e0b;
+  --dsw-specific-sidebar-fill:#131316;
+  --radius-s:6px; --radius-m:9px; --radius-l:12px;
+  --pad-xs:6px; --pad-s:10px; --pad-m:16px; --pad-l:22px;
+  --font-ui:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Roboto,Helvetica,Arial,sans-serif;
+  --font-mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --track-h:8px;
+}
+html[data-ds-dark-theme="false"]{
+  --dsw-alias-bg-base:#ffffff;
+  --dsw-alias-bg-layer-1:#fafafa;
+  --dsw-alias-bg-layer-2:#f2f2f3;
+  --dsw-alias-bg-overlay:rgba(255,255,255,.9);
+  --dsw-alias-border-l1:rgba(0,0,0,.08);
+  --dsw-alias-border-l2:rgba(0,0,0,.14);
+  --dsw-alias-brand-primary:#4176e6;
+  --dsw-alias-brand-primary-strong:#2563eb;
+  --dsw-alias-label-primary:#0f0f0f;
+  --dsw-alias-label-secondary:#65676b;
+  --dsw-specific-sidebar-fill:#fbfbfc;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;
+  font-family:var(--font-ui);
+  background:var(--dsw-alias-bg-base);
+  color:var(--dsw-alias-label-primary);
+  font-size:13px;
+  line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+  user-select:none;
+}
+/* 顶栏 */
+.tb{display:flex;align-items:center;gap:14px;padding:0 var(--pad-m);height:46px;
+  background:var(--dsw-specific-sidebar-fill);border-bottom:1px solid var(--dsw-alias-border-l1)}
+.tb .brand{display:flex;align-items:center;gap:9px;font-weight:600;font-size:13.5px;letter-spacing:.2px}
+.tb .brand .dot{width:8px;height:8px;border-radius:2px;background:var(--dsw-alias-brand-primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-brand-primary) 18%,transparent)}
+.tb .brand small{font-weight:400;color:var(--dsw-alias-label-secondary);font-size:11px;letter-spacing:0}
+.tb .sp{flex:1}
+.btn{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 13px;border-radius:var(--radius-s);
+  border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);
+  font-family:var(--font-ui);font-size:12.5px;cursor:pointer;transition:background .15s,border-color .15s,transform .05s}
+.btn:hover{background:var(--dsw-alias-bg-layer-2)}
+.btn:active{transform:translateY(1px)}
+.btn.primary{background:var(--dsw-alias-brand-primary);border-color:transparent;color:#fff}
+.btn.primary:hover{background:var(--dsw-alias-brand-primary-strong)}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--dsw-alias-label-secondary)}
+.btn.ghost:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1)}
+.btn.stop{background:transparent;border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}
+.btn.stop:hover{background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 12%,transparent)}
+.btn:disabled{opacity:.45;pointer-events:none}
+/* 骨架：左配置 / 右结果 */
+.layout{display:grid;grid-template-columns:296px 1fr;height:calc(100% - 46px)}
+.panel{border-right:1px solid var(--dsw-alias-border-l1);background:var(--dsw-specific-sidebar-fill);
+  overflow-y:auto;padding:var(--pad-m);display:flex;flex-direction:column;gap:var(--pad-m)}
+.panel-head{display:flex;align-items:center;justify-content:space-between}
+.panel-head h2{margin:0;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.7px;color:var(--dsw-alias-label-secondary)}
+.field{display:flex;flex-direction:column;gap:6px}
+.field label{font-size:11.5px;color:var(--dsw-alias-label-secondary);font-weight:500}
+.field label b{color:var(--dsw-alias-brand-primary);font-weight:600}
+.input,.select{height:32px;padding:0 10px;border-radius:var(--radius-s);border:1px solid var(--dsw-alias-border-l2);
+  background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-family:var(--font-ui);font-size:12.5px;width:100%;outline:none}
+.input:focus,.select:focus{border-color:var(--dsw-alias-brand-primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-brand-primary) 16%,transparent)}
+.input.mono{font-family:var(--font-mono);letter-spacing:.2px}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.dir{display:flex;gap:6px}
+.dir .input{flex:1;text-overflow:ellipsis}
+.dir .btn{padding:0 10px}
+/* 匹配模式：含 / 不含 分段开关 */
+.seg{display:grid;grid-template-columns:1fr 1fr;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);border-radius:var(--radius-s);padding:3px;gap:3px}
+.seg button{height:28px;border:0;border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);
+  font-family:var(--font-ui);font-size:12.5px;cursor:pointer;font-weight:500}
+.seg button.on{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);box-shadow:inset 0 0 0 1px var(--dsw-alias-border-l2)}
+.seg button.on.inc{color:var(--dsw-alias-state-success-primary)}
+.seg button.on.exc{color:var(--dsw-alias-state-error-primary)}
+/* 滑块行 */
+.slider{display:flex;align-items:center;gap:10px}
+input[type=range]{flex:1;accent-color:var(--dsw-alias-brand-primary);height:20px}
+.num{width:52px;height:32px;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--radius-s);
+  background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);text-align:center;font-family:var(--font-mono);font-size:12.5px}
+/* 开关 */
+.switch{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dsw-alias-label-secondary)}
+.switch input{display:none}
+.switch .track{width:30px;height:18px;border-radius:99px;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);position:relative;transition:background .15s}
+.switch .track:after{content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:var(--dsw-alias-label-secondary);transition:transform .15s,background .15s}
+.switch input:checked+.track{background:var(--dsw-alias-brand-primary)}
+.switch input:checked+.track:after{transform:translateX(12px);background:#fff}
+/* 右侧结果 */
+.main{display:flex;flex-direction:column;min-width:0}
+.main .toolbar{display:flex;align-items:center;gap:10px;padding:var(--pad-s) var(--pad-m);height:52px;border-bottom:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1)}
+.stat{display:flex;align-items:baseline;gap:18px;margin-right:auto}
+.stat .s{display:flex;flex-direction:column;gap:1px}
+.stat .s .n{font-size:17px;font-weight:600;font-family:var(--font-mono);line-height:1}
+.stat .s .l{font-size:10.5px;color:var(--dsw-alias-label-secondary);letter-spacing:.3px}
+.stat .s.good .n{color:var(--dsw-alias-state-success-primary)}
+.stat .s.bad .n{color:var(--dsw-alias-state-error-primary)}
+.prog{flex:1;max-width:300px}
+.prog .bar{height:var(--track-h);border-radius:99px;background:var(--dsw-alias-bg-layer-2);overflow:hidden}
+.prog .bar i{display:block;height:100%;width:0;background:var(--dsw-alias-brand-primary);border-radius:99px;transition:width .2s}
+.prog .pt{font-size:10.5px;color:var(--dsw-alias-label-secondary);margin-top:4px;text-align:right;font-family:var(--font-mono)}
+/* 结果表格 */
+.table-wrap{flex:1;overflow:auto}
+table{width:100%;border-collapse:collapse;font-size:12px}
+thead th{position:sticky;top:0;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);
+  font-weight:500;text-align:left;padding:9px 12px;font-size:11px;letter-spacing:.3px;border-bottom:1px solid var(--dsw-alias-border-l1);white-space:nowrap;z-index:2}
+tbody td{padding:8px 12px;border-bottom:1px solid var(--dsw-alias-border-l1);white-space:nowrap;color:var(--dsw-alias-label-primary)}
+tbody td.mono{font-family:var(--font-mono);font-size:11.5px}
+tbody tr{background:transparent}
+tbody tr:hover{background:var(--dsw-alias-bg-layer-1)}
+tbody tr.sel{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 12%,transparent)}
+td .tag{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:5px;font-size:10.5px;font-weight:500}
+.tag.hit{background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 16%,transparent);color:var(--dsw-alias-state-success-primary)}
+.tag.miss{background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 16%,transparent);color:var(--dsw-alias-state-error-primary)}
+.path-cell{white-space:normal;max-width:340px;overflow:hidden;text-overflow:ellipsis;color:var(--dsw-alias-label-secondary);font-family:var(--font-mono);font-size:11px}
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:10px;color:var(--dsw-alias-label-secondary)}
+.empty svg{opacity:.5}
+/* 底部日志面板 */
+.logbar{height:26px;display:flex;align-items:center;gap:8px;padding:0 var(--pad-m);background:var(--dsw-alias-bg-layer-1);
+  border-top:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-secondary);font-size:11.5px}
+.logbar .logtitle{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
+.logbar .logtitle:hover{color:var(--dsw-alias-label-primary)}
+.logbar .ind{width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-state-success-primary)}
+.logbar .ind.busy{background:var(--dsw-alias-brand-primary);animation:pulse 1s infinite}
+@keyframes pulse{50%{opacity:.35}}
+/* 弹窗 */
+.overlay{position:fixed;inset:0;background:var(--dsw-alias-bg-overlay);display:none;align-items:center;justify-content:center;z-index:50}
+.overlay.show{display:flex}
+.modal{width:640px;max-width:92vw;max-height:78vh;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);
+  border-radius:var(--radius-l);display:flex;flex-direction:column;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.modal-head{display:flex;align-items:center;gap:10px;padding:13px var(--pad-m);border-bottom:1px solid var(--dsw-alias-border-l1)}
+.modal-head h3{margin:0;font-size:13px;font-weight:600}
+.modal-head .sp{flex:1}
+.modal-body{flex:1;overflow:auto;padding:var(--pad-m);font-family:var(--font-mono);font-size:11.5px;line-height:1.7;color:var(--dsw-alias-label-primary)}
+.modal-body .ln{white-space:pre-wrap;word-break:break-all}
+.modal-body .ln.info{color:var(--dsw-alias-label-secondary)}
+.modal-body .ln.ok{color:var(--dsw-alias-state-success-primary)}
+.modal-body .ln.warn{color:var(--dsw-alias-state-warn-primary)}
+.modal-body .ln.err{color:var(--dsw-alias-state-error-primary)}
+.modal-body .ln .t{color:var(--dsw-alias-label-secondary)}
+.console-row{display:flex;gap:8px;padding:9px var(--pad-m);border-top:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2)}
+.chip{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:5px;background:var(--dsw-alias-bg-layer-2);
+  border:1px solid var(--dsw-alias-border-l1);font-size:11px;color:var(--dsw-alias-label-secondary)}
+.chip b{color:var(--dsw-alias-label-primary);font-family:var(--font-mono)}
+/* 滚动条（参考 scrollbar_css_default） */
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--dsw-alias-label-secondary) 38%,transparent);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:color-mix(in srgb,var(--dsw-alias-label-secondary) 60%,transparent)}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-corner{background:transparent}
+</style>
+</head>
+<body>
+<!-- 顶栏 -->
+<div class="tb">
+  <div class="brand"><span class="dot"></span>内容扫描器<small>ContentSonar</small></div>
+  <div class="sp"></div>
+  <button class="btn ghost" onclick="toggleMode()">主题</button>
+  <button class="btn" onclick="openLog()">日志</button>
+  <button class="btn" onclick="alert('打开输出目录 out\\\'（复制到剪贴板）')">打开输出目录</button>
+</div>
+
+<div class="layout">
+  <!-- 左：配置面板 -->
+  <aside class="panel">
+    <div class="panel-head"><h2>扫描配置</h2><button class="btn ghost" style="height:24px;font-size:11px" onclick="alert('重置为默认配置')">重置</button></div>
+
+    <div class="field">
+      <label>扫描目录</label>
+      <div class="dir">
+        <input class="input mono" id="dir" value="D:\数据\生产\物料" spellcheck="false">
+        <button class="btn" onclick="alert('系统目录选择对话框')">…</button>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>关键字 / 字符串</label>
+      <input class="input mono" id="kw" value="IT6563" spellcheck="false">
+    </div>
+
+    <div class="field">
+      <label>匹配模式</label>
+      <div class="seg">
+        <button class="on inc" id="mInc" onclick="setMode('inc')">包含</button>
+        <button id="mExc" onclick="setMode('exc')">不包含</button>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>并发线程数</label>
+      <div class="slider">
+        <input type="range" id="threads" min="1" max="64" value="8" oninput="thrSync()">
+        <input class="num" id="thrNum" value="8" oninput="thrNumSync()">
+      </div>
+    </div>
+
+    <div class="field">
+      <label>文件扩展名<i style="color:var(--dsw-alias-label-secondary);font-style:normal;font-weight:400">（逗号分隔，留空=全部）</i></label>
+      <input class="input mono" value="txt,log,csv,md,xml,json,java,cpp" spellcheck="false">
+    </div>
+
+    <div class="field">
+      <label>编码</label>
+      <select class="select"><option selected>自动探测 (UTF-8 / GBK)</option><option>UTF-8</option><option>GBK / GB2312</option><option>UTF-16</option><option>ASCII</option></select>
+    </div>
+
+    <div class="field">
+      <label>选项</label>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <label class="switch"><input type="checkbox"><span class="track"></span>大小写敏感</label>
+        <label class="switch"><input type="checkbox" checked><span class="track"></span>递归子目录</label>
+        <label class="switch"><input type="checkbox"><span class="track"></span>将命中文件复制到 out</label>
+        <label class="switch"><input type="checkbox" checked><span class="track"></span>同时在 Excel 记录未命中文件</label>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>输出目录</label>
+      <input class="input mono" id="out" value="out\2026-01-09_14-32" spellcheck="false">
+    </div>
+  </aside>
+
+  <!-- 右：结果区 -->
+  <section class="main">
+    <div class="toolbar">
+      <div class="stat">
+        <div class="s"><span class="n" id="stF">0</span><span class="l">已扫描文件</span></div>
+        <div class="s good"><span class="n" id="stH">0</span><span class="l">命中</span></div>
+        <div class="s bad"><span class="n" id="stM">0</span><span class="l">未命中</span></div>
+        <div class="s"><span class="n" id="stD">0s</span><span class="l">耗时</span></div>
+      </div>
+      <div class="prog"><div class="bar"><i id="bar"></i></div><div class="pt" id="pt">就绪</div></div>
+      <button class="btn primary" id="goBtn" onclick="startScan()">开始扫描</button>
+      <button class="btn stop" id="stopBtn" onclick="stopScan()" disabled>停止</button>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>#</th><th>目录</th><th>文件</th><th>关键字</th><th>命中状态</th><th>命中行</th><th>大小</th><th>修改时间</th></tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+      <div class="empty" id="empty">
+        <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+        <div>配置左侧条件，点击「开始扫描」</div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- 底部日志条 -->
+<div class="logbar">
+  <span class="logtitle" onclick="openLog()"><span class="ind" id="logInd"></span>日志</span>
+  <span id="logTail" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">等待任务…</span>
+</div>
+
+<!-- 日志弹窗 -->
+<div class="overlay" id="overlay">
+  <div class="modal">
+    <div class="modal-head"><h3>运行日志</h3><span class="sp"></span>
+      <button class="btn ghost" onclick="clearLog()">清空</button>
+      <button class="btn" onclick="closeLog()">关闭</button>
+    </div>
+    <div class="modal-body" id="logBody"></div>
+  </div>
+</div>
+
+<script>
+// 会话日志 buffer
+const logs=[];
+function push(level,line){logs.push({t:new Date().toLocaleTimeString('zh-CN',{hour12:false}),level,line});renderLog();setTail();}
+function renderLog(){const b=document.getElementById('logBody');b.innerHTML=logs.slice(-800).map(l=>{
+ const color={info:'',ok:'ok',warn:'warn',err:'err'}[l.level]||'';
+ return '<div class="ln '+color+'"><span class="t">'+l.t+'</span>  '+escapeHtml(l.line)+'</div>';}).join('');b.scrollTop=b.scrollHeight;}
+function setTail(){const t=logs[logs.length-1];document.getElementById('logTail').textContent=t?t.line:'';}
+function escapeHtml(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function openLog(){document.getElementById('overlay').classList.add('show');}
+function closeLog(){document.getElementById('overlay').classList.remove('show');}
+function clearLog(){logs.length=0;renderLog();setTail();}
+// 模式
+function setMode(m){document.getElementById('mInc').classList.toggle('on',m==='inc');document.getElementById('mExc').classList.toggle('on',m==='exc');
+  document.getElementById('mInc').classList.toggle('inc',m==='inc');document.getElementById('mExc').classList.toggle('exc',m==='exc');push('info','切换匹配模式：'+(m==='inc'?'包含 IT6563':'不包含 IT6563'));}
+// 线程
+function thrSync(){const v=document.getElementById('threads').value;document.getElementById('thrNum').value=v;}
+function thrNumSync(){let v=parseInt(document.getElementById('thrNum').value)||8;v=Math.max(1,Math.min(64,v));document.getElementById('threads').value=v;}
+// 主题
+function toggleMode(){const html=document.documentElement;const dark=html.getAttribute('data-ds-dark-theme');html.setAttribute('data-ds-dark-theme',dark==='true'?'false':'true');}
+// 模拟扫描（前端伪数据，用于评审交互）
+let timer=null,running=false;
+function startScan(){
+  if(running)return;running=true;
+  const go=document.getElementById('goBtn'),stop=document.getElementById('stopBtn');
+  go.disabled=true;stop.disabled=false;
+  document.getElementById('logInd').classList.add('busy');
+  document.getElementById('empty').style.display='none';
+  const total=48;let done=0,hit=0,miss=0;
+  const dirs=['物料\A线','物料\B线','物料\返修','工艺\SMT','工艺\波峰焊','质量\IQC','质量\OQC','工程\ECN'];
+  const files=['BOM_2024.xlsx.csv','ECN_0145.txt','lot.IT.log','SOP_003.log','BOM_split.csv','参数_校验.xml','recipe.json','工艺_卡_060.txt','物料_主档.xlsx.csv','trace.log'];
+  const t0=Date.now();
+  push('info','开始扫描目录：D:\数据\生产\物料');
+  push('info','并发线程数：8，关键字：IT6563，模式：包含');
+  document.getElementById('tbody').innerHTML='';
+  timer=setInterval(()=>{
+    const batch=8;
+    for(let k=0;k<batch && done<total;k++){
+      const d=dirs[Math.floor(Math.random()*dirs.length)];
+      const f=files[Math.floor(Math.random()*files.length)];
+      const isHit=Math.random()<0.66;
+      (isHit?hit++:miss++);
+      done++;
+      appendRow(done, d, f, isHit);
+    }
+    const p=done/total*100;
+    document.getElementById('bar').style.width=p+'%';
+    document.getElementById('pt').textContent=done+'/'+total;
+    document.getElementById('stF').textContent=done;
+    document.getElementById('stH').textContent=hit;
+    document.getElementById('stM').textContent=miss;
+    const sec=((Date.now()-t0)/1000).toFixed(1);
+    document.getElementById('stD').textContent=sec+'s';
+    if(done>=total){finish(hit,miss,sec);}
+  },260);
+}
+function appendRow(i,d,f,isHit){
+  const tb=document.getElementById('tbody');
+  const tr=document.createElement('tr');
+  const size=(Math.random()*900+8).toFixed(1)+' KB';
+  const mt=new Date(Date.now()-Math.random()*90000000).toLocaleString('zh-CN',{hour12:false});
+  const line=isHit?(Math.floor(Math.random()*1200)+1):'—';
+  tr.innerHTML='<td class="mono">'+i+'</td>'+
+    '<td class="path-cell">'+d+'</td>'+
+    '<td class="mono">'+f+'</td>'+
+    '<td class="mono">IT6563</td>'+
+    '<td>'+(isHit?'<span class="tag hit">命中</span>':'<span class="tag miss">未命中</span>')+'</td>'+
+    '<td class="mono">'+line+'</td><td class="mono">'+size+'</td><td class="mono">'+mt+'</td>';
+  tb.appendChild(tr);
+}
+function finish(h,ms,sec){
+  clearInterval(timer);running=false;
+  document.getElementById('goBtn').disabled=false;document.getElementById('stopBtn').disabled=true;
+  document.getElementById('logInd').classList.remove('busy');
+  document.getElementById('pt').textContent='完成';
+  push('ok','扫描完成：共 '+h+' 命中，'+ms+' 未命中，耗时 '+sec+'s');
+  push('warn','Excel 明细已输出：out\2026-01-09_14-32\scan_result.xlsx');
+}
+function stopScan(){if(!running)return;clearInterval(timer);running=false;document.getElementById('goBtn').disabled=false;document.getElementById('stopBtn').disabled=true;document.getElementById('logInd').classList.remove('busy');document.getElementById('pt').textContent='已停止';push('warn','用户停止扫描');}
+// 初始日志
+push('info','ContentSonar 已就绪。配置左侧条件后开始扫描。');
+push('info','示例关键字：IT6563（匹配范围：文件内容）');
+</script>
+</body>
+</html>
