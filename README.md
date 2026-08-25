@@ -58,7 +58,12 @@ python app.py
 py -3 app.py
 ```
 
-> **若 `python app.py` 点了没反应**：多半是系统的 `python` 被**微软商店存根**（`C:\...\WindowsApps\python.exe`）截胡了，它不会真正运行 Python。请改用 `py -3 app.py`，或直接双击 `run.bat`（它会优先用 `py -3`，找不到再自动回退到打包版 `dist\findany.exe` 跑 GUI）。
+> **若 `python app.py` 点了没反应**：多半是系统的 `python` 被**微软商店存根**（`C:\...\WindowsApps\python.exe`）截胡了，它不会真正运行 Python。请改用 `py -3 app.py`，或直接双击 `run.bat`（它会优先用 `py -3`，找不到再自动回退到打包版 `dist\findany.exe` 跑 GUI）。若想彻底让 `python app.py` 可用，二选一：
+>
+> 1. **关闭应用执行别名**：设置 → 应用 → 高级应用设置 → 应用执行别名 → 把 `python.exe` 和 `python3.exe` 的开关**关掉**（之后 `python` 会落到已安装的 Python 上）。
+> 2. **调整 PATH**：把 `C:\Users\<你>\AppData\Local\Programs\Python\Python313\`（及其 `Scripts\`）移到 `%LOCALAPPDATA%\Microsoft\WindowsApps\` 之前。
+>
+> 也可双击 `check_env.bat` 一键诊断，看 `python` 到底解析到谁、有没有 PySide6。
 >
 > 若启动失败，会写 `crash.log` 并弹错误窗；`run_debug.bat` 会把真实报错暂停打印。
 
@@ -101,6 +106,17 @@ py -3 app.py
 
 明细列：序号、相对路径、目录、扩展名、包含状态、命中行号、命中行内容、匹配计数、大小、修改时间、编码、绝对路径。
 
+## 日志
+
+程序日志统一写入 `logs/` 目录（以项目名命名，`logs/` 已 gitignore）：
+
+```
+logs/
+ ├─ findany-startup.log   # 启动过程（main→窗口显示，用于定位启动失败）
+ ├─ findany-run.log       # 每次扫描/操作的运行日志（超 5MB 自动轮换为 .1）
+ └─ findany-crash.log     # 启动/运行异常堆栈
+```
+
 ## 一键打包 EXE
 
 双击 **`build_exe.bat`** 或命令行运行：
@@ -126,8 +142,9 @@ findany/
  ├─ build_exe.bat        # 一键打包
  ├─ requirements.txt
  ├─ LICENSE
+ ├─ check_env.bat        # 环境自检（python 解析/是否有 PySide6）
  ├─ config.json          # 运行时生成
- ├─ crash.log            # 启动失败时生成
+ ├─ logs/                # 运行日志（findany-*.log，已 gitignore）
  └─ out/                 # 输出根
 ```
 

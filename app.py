@@ -16,6 +16,32 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# 日志目录：统一落到 log 下，以项目名命名
+LOGS_DIR = os.path.join(APP_DIR, "logs")
+try:
+    os.makedirs(LOGS_DIR, exist_ok=True)
+except Exception:
+    LOGS_DIR = APP_DIR
+
+
+def _log_path(name: str) -> str:
+    return os.path.join(LOGS_DIR, name)
+
+
+def _write_file(name: str, text: str, mode: str = "a") -> None:
+    """写日志文件；运行日志超过 5MB 自动轮换为 name.1。"""
+    p = _log_path(name)
+    try:
+        if mode == "a" and os.path.exists(p) and os.path.getsize(p) > 5 * 1024 * 1024:
+            try:
+                os.replace(p, _log_path(name + ".1"))
+            except Exception:
+                pass
+        with open(p, mode, encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        pass
+
 try:
     from PySide6.QtCore import Qt, QThread, Signal
     from PySide6.QtGui import QColor, QBrush, QFont
@@ -29,11 +55,10 @@ try:
     from sonar.scanner import ScanEngine
     from sonar.exporter import export_excel, copy_hits, make_batch_dir
 except Exception:
-    # 任何导入失败（pythonw 下无控制台）→ crash.log + 本机弹窗 + stderr
+    # 任何导入失败（pythonw 下无控制台）→ logs/findany-crash.log + 本机弹窗 + stderr
     _err = traceback.format_exc()
     try:
-        with open(os.path.join(APP_DIR, "crash.log"), "w", encoding="utf-8") as _f:
-            _f.write(_err)
+        _write_file("findany-crash.log", _err, "w")
     except Exception:
         pass
     try:
@@ -208,6 +233,8 @@ class MainWindow(QMainWindow):
         self.dark = True
         self.setWindowTitle(f"内容扫描器 · {APP_NAME}")
         self.resize(1180, 760)
+        self.setMinimumSize(980, 640)
+        self._center_on_screen()
 
         self._logs = []            # 会话日志 [[t, level, line], ...]
         self._worker: ScanWorker | None = None
@@ -217,6 +244,18 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._load_cfg()
         self._apply_theme()
+
+    def _center_on_screen(self):
+        """主窗口在可用屏幕区域内居中，避免出现在屏幕外。"""
+        try:
+            scr = QApplication.primaryScreen()
+            if scr:
+                geo = scr.availableGeometry()
+                fw = self.frameGeometry()
+                fw.moveCenter(geo.center())
+                self.move(fw.topLeft())
+        except Exception:
+            pass
 
     # ---------- UI 构建 ----------
     def _build_ui(self):
@@ -499,6 +538,8 @@ class MainWindow(QMainWindow):
     # ---------- 日志 ----------
     def _push_log(self, level: str, line: str):
         self._logs.append([time.strftime("%H:%M:%S"), level, line])
+        # 落盘到 logs/findany-run.log
+        _write_file("findany-run.log", time.strftime("%Y-%m-%d %H:%M:%S") + "  [" + level.upper() + "]  " + line + "\n")
         # 弹窗着色
         self.log_dialog.append(level, line)
         # 底部状态条
@@ -638,19 +679,35 @@ class MainWindow(QMainWindow):
         super().closeEvent(ev)
 
 
+def _mark(msg: str):
+    """逐步启动日志，便于定位 python app.py 在哪一步失败。写入 logs/findany-startup.log。"""
+    _write_file("findany-startup.log", time.strftime("%Y-%m-%d %H:%M:%S") + "  " + msg + "\n")
+
+
 def main():
     global app
+    _mark("main start | python=" + sys.executable + " | appdir=" + APP_DIR)
     try:
         app = QApplication(sys.argv)
         app.setApplicationName(APP_NAME)
+        _mark("QApplication created")
         w = MainWindow()
+        _mark("MainWindow constructed")
         w.show()
+        _mark("window shown")
+        try:
+            w.raise_()
+            w.activateWindow()
+            _mark("window raised/activated")
+        except Exception:
+            _mark("raise/activate failed")
+        _write_file("findany-run.log", "\n===== findany 会话开始 " + time.strftime("%Y-%m-%d %H:%M:%S") + " =====\n")
         sys.exit(app.exec())
     except Exception:
         err = traceback.format_exc()
+        _mark("EXCEPTION: " + err.replace("\n", " | "))
         try:
-            with open(os.path.join(APP_DIR, "crash.log"), "w", encoding="utf-8") as f:
-                f.write(err)
+            _write_file("findany-crash.log", err, "w")
         except Exception:
             pass
         try:

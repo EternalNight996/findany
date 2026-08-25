@@ -3,8 +3,11 @@ __pycache__/
 build/
 dist/
 out/
+logs/
 config.json
 crash.log
+startup.log
+check_env_output.txt
 *.spec
 .venv/
 venv/
