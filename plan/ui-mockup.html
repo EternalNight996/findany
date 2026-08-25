@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>内容扫描器 · ContentSonar — UI 样板</title>
+<title>内容扫描器 · findany — UI 样板</title>
 <style>
 /* ============ 设计系统变量（dsw-theme 语义层 + 独立渲染 fallback） ============ */
 /* 说明：--dsw-alias-* 为 dsw-theme 真实语义 token，运行时由 DSH 注入；
@@ -176,7 +176,7 @@ td .tag{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-ra
 <body>
 <!-- 顶栏 -->
 <div class="tb">
-  <div class="brand"><span class="dot"></span>内容扫描器<small>ContentSonar</small></div>
+  <div class="brand"><span class="dot"></span>内容扫描器<small>findany</small></div>
   <div class="sp"></div>
   <button class="btn ghost" onclick="toggleMode()">主题</button>
   <button class="btn" onclick="openLog()">日志</button>
@@ -369,7 +369,7 @@ function finish(h,ms,sec){
 }
 function stopScan(){if(!running)return;clearInterval(timer);running=false;document.getElementById('goBtn').disabled=false;document.getElementById('stopBtn').disabled=true;document.getElementById('logInd').classList.remove('busy');document.getElementById('pt').textContent='已停止';push('warn','用户停止扫描');}
 // 初始日志
-push('info','ContentSonar 已就绪。配置左侧条件后开始扫描。');
+push('info','findany 已就绪。配置左侧条件后开始扫描。');
 push('info','示例关键字：IT6563（匹配范围：文件内容）');
 </script>
 </body>

@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-echo === ContentSonar 调试模式（出错会暂停并显示）===
+echo === findany 调试模式（出错会暂停并显示）===
 python app.py
 if errorlevel 1 (
   echo.

@@ -1,6 +1,6 @@
 <div align="center">
-  <img src="https://img.icons8.com/color/96/magnifying-glass--v1.png" alt="ContentSonar" width="72">
-  <h1>ContentSonar</h1>
+  <img src="https://img.icons8.com/color/96/magnifying-glass--v1.png" alt="findany" width="72">
+  <h1>findany</h1>
   <p>目录内容扫描器 —— 在指定目录树下并发检索文件内容，判定「包含 / 不包含」关键字，一键导出 Excel 并落盘命中文件。</p>
 
   [![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows)](https://github.com/)
@@ -11,7 +11,7 @@
 
 > 一次配置，并发扫描，结果即出。生产 / 物料 / 工程等场景里的「有没有出现某个关键字」排查利器。
 
-ContentSonar 是一个 Windows 桌面程序，用 **Python + PySide6** 编写，核心扫描引擎不依赖 Qt、可独立复用。对目录下所有文件做「**包含 / 不包含**」关键字判定，支持并发、编码探测、二进制/超大文件跳过、Excel 明细与摘要输出，并把命中文件按 `out/日期时间/目录/文件` 落盘。
+findany 是一个 Windows 桌面程序，用 **Python + PySide6** 编写，核心扫描引擎不依赖 Qt、可独立复用。对目录下所有文件做「**包含 / 不包含**」关键字判定，支持并发、编码探测、二进制/超大文件跳过、Excel 明细与摘要输出，并把命中文件按 `out/日期时间/目录/文件` 落盘。
 
 ## 功能特性
 
@@ -99,17 +99,17 @@ python app.py
 
 ```bash
 pip install pyinstaller
-python -m PyInstaller --noconfirm --clean --windowed --onefile --name ContentSonar app.py
+python -m PyInstaller --noconfirm --clean --windowed --onefile --name findany app.py
 ```
 
-产物：`dist/ContentSonar.exe`（可分发，免装 Python）。
+产物：`dist/findany.exe`（可分发，免装 Python）。
 
 > 可加自定义图标：准备 `icon.ico` 后，在 `build_exe.bat` 的 PyInstaller 命令加 `--icon icon.ico`。
 
 ## 目录结构
 
 ```
-ContentSonar/
+findany/
  ├─ app.py               # PySide6 GUI 入口
  ├─ sonar/               # 后端（无 Qt，可复用）：config / scanner / exporter
  ├─ plan/                # UI 样板 + 方案规范 (ui-mockup.html, spec.md)
@@ -123,25 +123,41 @@ ContentSonar/
  └─ out/                 # 输出根
 ```
 
-## 发布到 GitHub / Gitee
+## 发布到 GitHub / Gitee（SSH）
 
-本项目支持双远端发布（GitHub + Gitee）。先建好两个仓库（如同名 `ContentSonar`），双击 **`publish.bat`** 或：
+本项目支持双远端发布（GitHub + Gitee），通过 **SSH** 推送。先在两平台建好同名空仓库（`findany`），并配置 SSH 公钥：
+
+```bash
+# 1. 生成 SSH 密钥（回车三次即可，已有则跳过）
+ssh-keygen -t ed25519 -C "you@example.com"
+
+# 2. 查看并复制公钥
+cat %USERPROFILE%\.ssh\id_ed25519.pub
+
+# 3. 到 GitHub / Gitee 设置 → SSH Keys → 添加该公钥
+```
+
+然后双击 **`publish.bat`**（先把文件顶部 `GH` / `GITEE` 改成你的 SSH 地址），或手动：
 
 ```bash
 git init
+git branch -M main
 git add -A
-git commit -m "init: ContentSonar v1.0"
+git commit -m "init: findany v1.0"
 
-# GitHub
-git remote add origin https://github.com/<你的用户名>/ContentSonar.git
-# Gitee
-git remote add gitee  https://gitee.com/<你的用户名>/ContentSonar.git
+# GitHub（SSH）
+git remote add origin git@github.com:<你的用户名>/findany.git
+# Gitee（SSH）
+git remote add gitee  git@gitee.com:<你的用户名>/findany.git
 
-git push -u origin master
-git push -u gitee  master
+git push -u origin main
+git push -u gitee  main
 ```
 
-> `build/`、`dist/`、`out/`、`config.json`、`crash.log`、`__pycache__` 已写入 `.gitignore`，不会提交。
+> 用途说明：
+> - SSH 方式推送，无需每次输入账号密码，需先在本地 `ssh-keygen` 生成密钥并在两端添加公钥。
+> - 若提示 `Permission denied (publickey)`，检查公钥是否已添加、`ssh -T git@github.com` 是否能通。
+> - `build/`、`dist/`、`out/`、`config.json`、`crash.log`、`__pycache__` 已写入 `.gitignore`，不会提交。
 
 ## 许可证
 

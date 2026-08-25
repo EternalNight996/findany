@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""内容扫描器 ContentSonar — PySide6 桌面 GUI 入口。
+"""内容扫描器 findany — PySide6 桌面 GUI 入口。
 
 用法：python app.py
 """
@@ -10,7 +10,11 @@ import sys
 import time
 import traceback
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    # PyInstaller 打包后：__file__ 指向临时解压目录(_MEIPASS)，输出必须落在 exe 旁边
+    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 try:
     from PySide6.QtCore import Qt, QThread, Signal
@@ -34,7 +38,7 @@ except Exception:
         pass
     try:
         import ctypes
-        ctypes.windll.user32.MessageBoxW(0, _err, "ContentSonar 启动失败", 0x00000010)
+        ctypes.windll.user32.MessageBoxW(0, _err, "findany 启动失败", 0x00000010)
     except Exception:
         pass
     sys.stderr.write(_err)

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""配置模型与持久化（ContentSonar）."""
+"""配置模型与持久化（findany）."""
 from __future__ import annotations
 
 import json
@@ -7,7 +7,7 @@ import os
 from dataclasses import dataclass, field, asdict
 from typing import List
 
-APP_NAME = "ContentSonar"
+APP_NAME = "findany"
 
 
 @dataclass
