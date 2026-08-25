@@ -1,7 +1,8 @@
 __pycache__/
 *.pyc
 build/
-dist/
+dist/*
+!dist/findany.exe
 out/
 logs/
 config.json
