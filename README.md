@@ -9,6 +9,10 @@
   [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 </div>
 
+<div align="center">
+  <img src="assets/screen/screenshot.png" alt="findany 界面" width="100%" style="border-radius:10px; border:1px solid rgba(128,128,128,.25)">
+</div>
+
 > 一次配置，并发扫描，结果即出。生产 / 物料 / 工程等场景里的「有没有出现某个关键字」排查利器。
 
 findany 是一个 Windows 桌面程序，用 **Python + PySide6** 编写，核心扫描引擎不依赖 Qt、可独立复用。对目录下所有文件做「**包含 / 不包含**」关键字判定，支持并发、编码探测、二进制/超大文件跳过、Excel 明细与摘要输出，并把命中文件按 `out/日期时间/目录/文件` 落盘。
@@ -50,8 +54,12 @@ pip install -r requirements.txt
 
 ```bash
 python app.py
+# 或使用 Python 官方启动器（推荐，可绕开微软商店的 python 存根）
+py -3 app.py
 ```
 
+> **若 `python app.py` 点了没反应**：多半是系统的 `python` 被**微软商店存根**（`C:\...\WindowsApps\python.exe`）截胡了，它不会真正运行 Python。请改用 `py -3 app.py`，或直接双击 `run.bat`（它会优先用 `py -3`，找不到再自动回退到打包版 `dist\findany.exe` 跑 GUI）。
+>
 > 若启动失败，会写 `crash.log` 并弹错误窗；`run_debug.bat` 会把真实报错暂停打印。
 
 ## 使用说明
