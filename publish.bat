@@ -1,15 +1,15 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-set "GH=https://github.com/YOUR_USER/ContentSonar.git"
-set "GITEE=https://gitee.com/YOUR_USER/ContentSonar.git"
-echo === ContentSonar 发布 (GitHub + Gitee) ===
+set "GH=ssh@github.com:eternalnight996/findany.git"
+set "GITEE=ssh@gitee.com:eternalnight996/findany.git"
+echo === findany 发布 (GitHub + Gitee) ===
 echo 请先改本文件顶部 GH / GITEE 为你的仓库地址，并在 GitHub/Gitee 建好同名仓库。
 echo.
 if not exist .git ( git init )
 git branch -M main
 git add -A
-git commit -m "init: ContentSonar"
+git commit -m "init: findany"
 git remote get-url origin >nul 2>nul || git remote add origin %GH%
 git remote get-url gitee >nul 2>nul || git remote add gitee %GITEE%
 echo 推送 GitHub...
