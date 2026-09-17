@@ -22,7 +22,11 @@ DETAIL_COLS = [
     ("注入开始", "inject_start_at"), ("注入结束", "inject_end_at"), ("ProductKey", "product_key"),
     ("Baseboard", "baseboard_product"), ("批次号", "mo_lot_no"), ("工位任务", "task_tag"),
     ("JSON状态", "json_state"), ("JSON res_value", "json_res_value"),
-    ("项目版本", "project_version"), ("提取状态", "extract_state"),
+    ("项目版本", "project_version"),
+    ("生产编号", "production_num"), ("系统SN", "system_sn"), ("板卡SN", "board_sn"),
+    ("UUID", "uuid"), ("BIOS版本", "bios_version"), ("OS激活码", "os_key"),
+    ("有线MAC", "lan"), ("无线MAC", "wifilan"), ("蓝牙MAC", "bluetooth"),
+    ("提取状态", "extract_state"),
     ("回传状态", "upload_state"), ("退出码", "upload_code"), ("request_id", "request_id"),
     ("回传错误", "upload_error"),
 ]

@@ -565,7 +565,8 @@ class MainWindow(QMainWindow):
         g.addWidget(QLabel("筛选类型"), 0, 0)
         self.type_combo = QComboBox()
         for label, val in [("自动识别", LogType.AUTO.value), ("etest(OA3)", LogType.ETEST_OA3.value),
-                           ("etest", LogType.ETEST.value), ("e-autotest", LogType.EAUTOTEST.value)]:
+                           ("etest", LogType.ETEST.value), ("e-autotest", LogType.EAUTOTEST.value),
+                           ("海格旧测试2", LogType.HEG_AUTOTEST2.value), ("海格旧测试3", LogType.HEG_AUTOTEST3.value)]:
             self.type_combo.addItem(label, val)
         g.addWidget(self.type_combo, 0, 1)
 

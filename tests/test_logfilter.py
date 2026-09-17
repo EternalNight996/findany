@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sonar.logfilter.extractors import extract, read_text  # noqa: E402
-from sonar.logfilter.types import LogType, detect_log_type  # noqa: E402
+from sonar.logfilter.types import HEG3_PREFIXES, LogType, detect_log_type  # noqa: E402
 from sonar.logfilter.uploader import (  # noqa: E402
     ST_CONFLICT, ST_DRY_RUN, ST_FAIL, ST_OK,
     UploadProfile, build_payload, missing_fields, render_args,
@@ -107,6 +107,79 @@ def test_engine_dry_run():
     check("引擎 dry-run 产物落盘", s.excel_path and os.path.isfile(s.excel_path) and os.path.isfile(s.audit_path))
 
 
+# ---------- 2.7) heg-admin-log 对齐：e-autotest 增强 + 海格旧测试2/3 ----------
+def test_heg_alignment():
+    # 真样例判型（失败 run，但前缀可判）：BURN/BATTERY -> 海格旧测试3
+    hg_dir = ROOT.parent / "hg-autotest" / "hg-autotest-logs"
+    if (hg_dir / "BURN.log").is_file():
+        check("detect BURN.log = 海格旧测试3",
+              detect_log_type(str(hg_dir / "BURN.log"), read_text(str(hg_dir / "BURN.log"))) == LogType.HEG_AUTOTEST3)
+
+    # e-autotest 增强（真样例 0015：app_tag 分发 + MAC 归类）
+    p15 = sample_files("Ift")[0]
+    f = extract(p15, read_text(p15))
+    check("e-autotest 系统SN校验 -> system_sn", f.get("system_sn") == "MT71I2GSF-2HG260807250XAG0015")
+    check("e-autotest BIOS版本校验 -> bios_version", f.get("bios_version") == "MT71H-SHP-006-V3.14-F")
+    check("e-autotest MAC获取 -> lan(去横杠)", "54014AF088C4" in str(f.get("lan", "")))
+    check("e-autotest production_num = 文件名", f.get("production_num") == "MT71I2GSF-2HG260807250XAG0015")
+    check("e-autotest oa3_id 别名", f.get("oa3_id") == "4362262499781")
+
+    # 合成海格旧测试3（锚点逐条对齐 heg-admin-log from_heg3）
+    heg3 = "\n".join([
+        "2026-09-01 [BURN] INFO start",
+        "@OS激活码=VK7JB-G8YPH-XXXXX-XXXXX-XXXXX",
+        "@OS激活码=烧录失败行应被忽略",
+        "@UUID=1234ABCD-5678-90EF-1122-334455667788",
+        "@BIOS_SN=SYS_SN_0001",
+        "@BOARD_SN=BRD_SN_0002",
+        "@BIOS版本=F.15",
+        "<ProductKeyID>4362262499781</ProductKeyID>",
+        "<ProductKey>QYNK9-GTV9Y-HM8J4-P4M2P-6JH4D</ProductKey>",
+        '@网络MAC=[{"interface":"以太网","mac":"AA-BB-CC-DD-EE-01"},'
+        '{"interface":"以太网","mac":"00-00-00-00-00-00"},'
+        '{"interface":"vEthernet (WSL)","mac":"AA-BB-CC-DD-EE-99"}]',
+        "2026-09-01 [BURN] INFO done",
+    ])
+    f3 = extract("BFT-xxx.log", heg3, LogType.HEG_AUTOTEST3)
+    check("heg3 判型=旧测试3", detect_log_type("BFT-xxx.log", heg3) == LogType.HEG_AUTOTEST3)
+    check("heg3 OS激活码(忽略烧录)", f3.get("os_key") == "VK7JB-G8YPH-XXXXX-XXXXX-XXXXX")
+    check("heg3 UUID", f3.get("uuid") == "1234ABCD-5678-90EF-1122-334455667788")
+    check("heg3 BIOS_SN->system_sn", f3.get("system_sn") == "SYS_SN_0001")
+    check("heg3 BOARD_SN->board_sn", f3.get("board_sn") == "BRD_SN_0002")
+    check("heg3 BIOS版本", f3.get("bios_version") == "F.15")
+    check("heg3 oa3_id/oa3_key", f3.get("oa3_id") == "4362262499781" and f3.get("oa3_key") == "QYNK9-GTV9Y-HM8J4-P4M2P-6JH4D")
+    check("heg3 有线MAC(去无效/虚拟,保留横杠)", f3.get("lan") == "AA-BB-CC-DD-EE-01")
+    check("heg3 production_num", f3.get("production_num") == "BFT-xxx")
+
+    # 合成海格旧测试2（多行接口块：MAC 在接口行后第 3 行）
+    heg2 = "\n".join([
+        "IFT-START 测试开始",
+        "@OS激活码=VK7JB-HEG2-KEY",
+        "@UUID=UUID-HEG2-0001",
+        "@网络MAC=以下接口:",
+        "以太网 接口:",
+        "   连接状态: 已连接",
+        "   速率: 1000",
+        "   MAC地址: 11-22-33-44-55-66",
+        "WLAN 接口:",
+        "   连接状态: 已断开",
+        "   速率: 0",
+        "   MAC地址: 77-88-99-AA-BB-CC",
+    ])
+    f2 = extract("IFT-START-xxx.log", heg2, LogType.HEG_AUTOTEST2)
+    check("heg2 判型=旧测试2(先于IFT前缀)", detect_log_type("IFT-START-xxx.log", heg2) == LogType.HEG_AUTOTEST2)
+    check("heg2 OS激活码", f2.get("os_key") == "VK7JB-HEG2-KEY")
+    check("heg2 UUID", f2.get("uuid") == "UUID-HEG2-0001")
+    check("heg2 有线MAC(j+3)", f2.get("lan") == "11-22-33-44-55-66")
+    check("heg2 无线MAC(j+3)", f2.get("wifilan") == "77-88-99-AA-BB-CC")
+    check("heg2 production_num", f2.get("production_num") == "IFT-START-xxx")
+
+    # 前缀表回归：IFT-START 优先于 IFT
+    check("IFT-START 前缀优先于 IFT",
+          detect_log_type("IFT-START-x.log", "no content") == LogType.HEG_AUTOTEST2
+          and detect_log_type("IFT-x.log", "no content") == LogType.HEG_AUTOTEST3)
+
+
 # ---------- 3) dry-run 与判定/重试（注入桩，不碰网） ----------
 def _fields_of_first():
     p = sample_files("Ift")[0]
@@ -160,6 +233,7 @@ def test_dry_run_and_judge():
 def main() -> int:
     test_detect()
     test_oa3_extraction()
+    test_heg_alignment()
     test_engine_dry_run()
     test_dry_run_and_judge()
     fails = [n for n, ok, _ in _results if not ok]

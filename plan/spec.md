@@ -192,5 +192,17 @@ findany/
 **陷阱移植**：OA3 正文块每台出现 2 次 → 取第 1 次 + 记 `oa3_block_count`；`R<{...}>R` 取最后一个；`OEMRevision` 不误命中（锚点含 `msg="`）。
 **产物**：`out/<时间>/filter_result.xlsx + upload-result.csv + 命中日志留存`；审计不含 Hash/SecretKey（SOP 第 6 条）。
 **筛选模式固定扫 `.log`**（不沿用通用扫描扩展名，避免卷入采样 csv/json）。
-**自校验**：`py -3 tests\\test_logfilter.py` → 75 条断言 ALL PASS。
+**自校验**：`py -3 tests\\test_logfilter.py` → 97 条断言 ALL PASS。
+
+### 10.1 v1.2 增补：对齐 heg-admin-log 的 e-autotest / 海格旧测试解析
+
+| 项 | 内容 | 验证 |
+|---|------|------|
+| 判型扩容 | `IFT-START`/`SN` 前缀→海格旧测试2；`IFT/CLEAN/BURN/FFT/BATTERY/BFT-SL/BFT`→海格旧测试3（文件名前缀优先，顺序同 `parse_path_type`） | BURN.log 真样例 + IFT-START 优先级断言 |
+| e-autotest 增强 | 尾部 JSON `app_tag` 分发：UUID校验/系统SN校验/板卡SN校验/BIOS版本校验/系统激活|自动化激活→OS激活码/MAC获取（friendly_name 分类 + if_type 兜底，MAC 去横杠） | 0015 真值：system_sn/bios_version/lan |
+| 海格旧测试3 | `@OS激活码=/@UUID=/@BIOS_SN=/@BOARD_SN=/@BIOS版本=`（BURN_IGNORE 过滤）+ `<ProductKey>/</ProductKeyID>` + `@网络MAC=[...]` JSON（虚拟卡剔除，MAC 保留横杠） | 合成夹具 9 断言 |
+| 海格旧测试2 | 同 @ 锚点 + 多行「接口」块（MAC 在接口行后第 3 行 `MAC地址: `) | 合成夹具 6 断言 |
+| 字段对齐 | production_num/system_sn/board_sn/uuid/bios_version/os_key/oa3_key/oa3_id/lan/wifilan/bluetooth（= `DataTaskSigle`）进明细列 | 引擎/报表列扩充 |
+| 修复移植 | 上游 `trim_data_list2` 的 contains 反条件按意图修复为去重 push | 夹具断言 |
+| 默认策略 | 海格旧测试 2/3 只提取不回传（类型闸默认仅 etest(OA3)） | 引擎 dry-run dry=3 |
 

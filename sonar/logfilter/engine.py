@@ -147,7 +147,9 @@ class FilterEngine:
                           "product_key_state", "hardware_hash_len", "hardware_hash_sha256",
                           "inject_start_at", "inject_end_at", "product_key",
                           "baseboard_product", "mo_lot_no", "task_tag", "json_state",
-                          "json_res_value", "project_version")})
+                          "json_res_value", "project_version",
+                          "production_num", "system_sn", "board_sn", "uuid", "bios_version",
+                          "os_key", "lan", "wifilan", "bluetooth", "oa3_key", "oa3_id")})
             item["extract_ok"] = True
         except Exception:
             item["error"] = "提取异常: " + traceback.format_exc(limit=1).strip().splitlines()[-1]

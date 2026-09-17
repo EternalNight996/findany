@@ -39,6 +39,12 @@ RE_BASEBOARD = re.compile(r'\(/BP\)Baseboard product\s+\S+\s+\S+\s+\\"([^"\\]+)'
 RE_LINE_TS = re.compile(r"^\[([^\]]+)\]")
 RE_LOG_UPLOAD = re.compile(r'msg="文件云上传\(含批次号\)=([^"]+)"')
 
+# ---------- heg-admin-log txt.rs 同款忽略表 ----------
+MAC_IGNORE = ("00-00-00-00-00-00", "88-88-88-88-87-88", "88-88-88-88-88-88", "to be filled by o.e.m.")
+BURN_IGNORE = ("ERROR", "to be filled by o.e.m.", "无法", "烧录")
+# e-autotest 尾部 JSON 条目 -> 标准字段（from_e_autotest 的 app_tag 分发表）
+APP_TAG_MAP = {"UUID校验": "uuid", "系统SN校验": "system_sn", "板卡SN校验": "board_sn", "BIOS版本校验": "bios_version"}
+
 
 def _first(pattern: re.Pattern, text: str, group: int = 1) -> str:
     m = pattern.search(text)
@@ -99,6 +105,7 @@ def _base_fields(path: str, text: str) -> Dict:
     return {
         "log_file": os.path.basename(path),
         "station": os.path.basename(os.path.dirname(path)) or ".",
+        "production_num": os.path.splitext(os.path.basename(path))[0],
         "project_version": _first(RE_PROJECT, text, 0) or str(opts.get("autotest_version") or ""),
         "sn": _first(RE_SN, text) or str(opts.get("lot_sn_code") or ""),
         "mo_lot_no": str(opts.get("mo_lot_no") or ""),
@@ -165,6 +172,9 @@ def extract_etest_oa3(path: str, text: str) -> Dict:
         "json_runtime_nanos": rt.get("nanos", "") if isinstance(rt, dict) else "",
         "oa3_log_path": str((item or {}).get("value") or ""),
     })
+    _map_app_tags(f, _data_items(_tail_json(text)))      # 校验类/MAC获取同源分发
+    f["oa3_key"] = f.get("product_key", "")              # 列别名对齐 heg-admin-log
+    f["oa3_id"] = f.get("product_key_id", "")
     # baseboard 兜底：主板型号校验结果行 / JSON 条目
     if not f["baseboard_product"]:
         m = re.search(r'msg="主板型号校验=([^"]+)"', text)
@@ -179,10 +189,174 @@ def extract_etest_oa3(path: str, text: str) -> Dict:
 
 
 def extract_generic(path: str, text: str) -> Dict:
-    """etest / e-autotest（无 OA3）：尾部 JSON 概要 + 基础字段。"""
+    """etest / e-autotest（无 OA3）：尾部 JSON 概要 + 基础字段 + app_tag 分发
+    （UUID/系统SN/板卡SN/BIOS版本/激活码/MAC，同 heg-admin-log from_e_autotest）。"""
     f = _base_fields(path, text)
     f["has_oa3"] = False
+    _map_app_tags(f, _data_items(_tail_json(text)))
     return f
+
+
+# ---------- 海格旧测试 2/3（移植 heg-admin-log from_heg2/from_heg3） ----------
+
+def _trim_list(dst: List[str], line: str, pat: str, ignores=BURN_IGNORE) -> None:
+    """取 pat 右侧值；命中忽略词跳过；去重（同 trim_data_list）。"""
+    line = line.rstrip("\n ")
+    for ig in ignores:
+        if ig in line:
+            return
+    res = line.split(pat, 1)[1].strip() if pat in line else ""
+    if res and res not in dst:
+        dst.append(res)
+
+
+def _xml_between(line: str, start: str, end: str):
+    """取 <start>..</end> 中间值。注意：上游 trim_data_list2 的 contains 条件写反
+    （只在已包含时 push），此处按意图修复为去重后 push。"""
+    i = line.find(start)
+    j = line.find(end)
+    if 0 <= i < j:
+        mid = line[i + len(start):j].rstrip(" ")
+        return mid or None
+    return None
+
+
+def _mac_class(name: str):
+    """接口名 -> lan/wifilan/bluetooth；虚拟网卡 None（同参考分类）。"""
+    if "vEthernet" in name or "虚拟" in name:
+        return None
+    if "Ethernet" in name or "以太网" in name:
+        return "lan"
+    if "WLAN" in name or "Wi-Fi" in name or "无线" in name:
+        return "wifilan"
+    if "Bluetooth" in name or "蓝牙" in name:
+        return "bluetooth"
+    return None
+
+
+def _add_mac(macs: Dict, cls, mac: str, keep_dash: bool) -> None:
+    mac = str(mac or "").strip()
+    if not keep_dash:
+        mac = mac.replace("-", "")
+    if not mac or mac.lower() in MAC_IGNORE:
+        return
+    if cls and mac not in macs[cls]:
+        macs[cls].append(mac)
+
+
+def _empty_macs() -> Dict:
+    return {"lan": [], "wifilan": [], "bluetooth": []}
+
+
+_HEG_AT_ANCHORS = (("@OS激活码=", "os_key"), ("@UUID=", "uuid"), ("@BIOS_SN=", "system_sn"),
+                   ("@BOARD_SN=", "board_sn"), ("@BIOS版本=", "bios_version"))
+
+
+def extract_heg3(path: str, text: str) -> Dict:
+    """海格旧测试3（IFT/CLEAN/BURN/FFT/BATTERY/BFT 前缀）：@锚点 + <ProductKey> + @网络MAC JSON。"""
+    f = _base_fields(path, text)
+    f["production_num"] = os.path.splitext(os.path.basename(path))[0]
+    f["has_oa3"] = False
+    vals = {k: [] for _, k in _HEG_AT_ANCHORS}
+    vals["oa3_key"], vals["oa3_id"] = [], []
+    macs = _empty_macs()
+    for line in text.splitlines():
+        if "<ProductKeyID>" in line:
+            mid = _xml_between(line, "<ProductKeyID>", "</ProductKeyID>")
+            if mid and mid not in vals["oa3_id"]:
+                vals["oa3_id"].append(mid)
+            continue
+        if "<ProductKey>" in line:
+            mid = _xml_between(line, "<ProductKey>", "</ProductKey>")
+            if mid and mid not in vals["oa3_key"]:
+                vals["oa3_key"].append(mid)
+            continue
+        if "@网络MAC=[{" in line:
+            try:
+                lst = json.loads(line.split("@网络MAC=", 1)[1])
+            except Exception:
+                lst = None
+            for info in lst or []:
+                if not isinstance(info, dict):
+                    continue
+                _add_mac(macs, _mac_class(str(info.get("interface", ""))), info.get("mac", ""), keep_dash=True)
+            continue
+        for anchor, key in _HEG_AT_ANCHORS:
+            if anchor in line:
+                _trim_list(vals[key], line, anchor)
+                break
+    f["oa3_result"] = ""
+    f.update({k: v[-1] if v else "" for k, v in vals.items()})       # 同 Sigle::last：取最后一次
+    f.update({k: ";".join(v) for k, v in macs.items()})
+    return f
+
+
+def extract_heg2(path: str, text: str) -> Dict:
+    """海格旧测试2（IFT-START/SN 前缀）：@锚点 + 多行「接口」块（MAC 在接口行后第 3 行）。"""
+    f = _base_fields(path, text)
+    f["production_num"] = os.path.splitext(os.path.basename(path))[0]
+    f["has_oa3"] = False
+    vals = {k: [] for _, k in _HEG_AT_ANCHORS}
+    macs = _empty_macs()
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if "@网络MAC=" in line and ("接口" in line or (i + 1 < len(lines) and "接口" in lines[i + 1])):
+            for j in range(i, len(lines)):
+                lj = lines[j]
+                if "接口" not in lj:
+                    continue
+                if "虚拟" in lj or "vEthernet" in lj:
+                    continue
+                cls = _mac_class(lj)
+                if cls and j + 3 < len(lines):
+                    mac = lines[j + 3].lstrip(" ")
+                    if mac.startswith("MAC地址: "):
+                        mac = mac[len("MAC地址: "):]
+                    _add_mac(macs, cls, mac, keep_dash=True)
+            continue
+        for anchor, key in _HEG_AT_ANCHORS:
+            if anchor in line:
+                _trim_list(vals[key], line, anchor)
+                break
+    f.update({k: v[-1] if v else "" for k, v in vals.items()})
+    f.update({k: ";".join(v) for k, v in macs.items()})
+    return f
+
+
+def _map_app_tags(f: Dict, items: List[dict]) -> None:
+    """e-autotest 尾部 JSON 条目分发（同 from_e_autotest）：校验类/激活类/MAC获取。"""
+    macs = _empty_macs()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        tag = str(it.get("app_tag", "") or "")
+        res = str(it.get("res_value", "") or "").strip()
+        key = APP_TAG_MAP.get(tag)
+        if key and res:
+            f[key] = res                                   # 多次出现取最后（同 Sigle::last）
+        elif ("系统激活" in tag or "自动化激活" in tag) and res:
+            f["os_key"] = res
+        elif "MAC获取" in tag and res:
+            js = res.split("=", 1)[1] if "=" in res else ""
+            try:
+                lst = json.loads(js)
+            except Exception:
+                lst = None
+            for info in lst or []:
+                if not isinstance(info, dict):
+                    continue
+                cls = _mac_class(str(info.get("friendly_name", "")))
+                if cls is None:
+                    # 参考的 if_type 兜底：以太网类->lan，Wireless80211->wifilan
+                    t = str(info.get("if_type", "") or "").lower()
+                    if t.startswith("ethernet") or t == "gigabitethernet" or "fastethernet" in t:
+                        cls = "lan"
+                    elif t == "wireless80211":
+                        cls = "wifilan"
+                _add_mac(macs, cls, info.get("mac_addr", ""), keep_dash=False)
+    f["lan"] = ";".join(macs["lan"])
+    f["wifilan"] = ";".join(macs["wifilan"])
+    f["bluetooth"] = ";".join(macs["bluetooth"])
 
 
 def extract_unknown(path: str, text: str) -> Dict:
@@ -198,6 +372,8 @@ _EXTRACTORS = {
     LogType.ETEST_OA3: extract_etest_oa3,
     LogType.ETEST: extract_generic,
     LogType.EAUTOTEST: extract_generic,
+    LogType.HEG_AUTOTEST2: extract_heg2,
+    LogType.HEG_AUTOTEST3: extract_heg3,
     LogType.UNKNOWN: extract_unknown,
 }
 
