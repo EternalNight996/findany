@@ -43,7 +43,7 @@ def _write_file(name: str, text: str, mode: str = "a") -> None:
         pass
 
 try:
-    from PySide6.QtCore import Qt, QThread, Signal
+    from PySide6.QtCore import Qt, QThread, Signal, QTimer
     from PySide6.QtGui import QColor, QBrush, QFont
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -54,6 +54,9 @@ try:
     from sonar.config import SearchConfig, load_config, save_config, default_out_dir, APP_NAME
     from sonar.scanner import ScanEngine
     from sonar.exporter import export_excel, copy_hits, make_batch_dir
+    from sonar.logfilter.engine import FilterEngine, FilterRunCfg
+    from sonar.logfilter.uploader import UploadProfile
+    from sonar.logfilter.types import LogType
 except Exception:
     # 任何导入失败（pythonw 下无控制台）→ logs/findany-crash.log + 本机弹窗 + stderr
     _err = traceback.format_exc()
@@ -182,6 +185,117 @@ class ScanWorker(QThread):
             self.error.emit(traceback.format_exc())
 
 
+class FilterWorker(QThread):
+    """后台线程：跑 FilterEngine（判型提取 → 逐台回传），信号回主线程。"""
+    progress = Signal(dict)
+    upload = Signal(dict)
+    log = Signal(str, str)
+    done = Signal(list, object)     # items, FilterSummary
+    error = Signal(str)
+
+    def __init__(self, cfg: SearchConfig):
+        super().__init__()
+        self.cfg = cfg
+        self._engine: FilterEngine | None = None
+
+    def cancel(self):
+        if self._engine:
+            self._engine.cancel()
+
+    def run(self):
+        try:
+            rcfg = FilterRunCfg(
+                root_dir=self.cfg.root_dir,
+                out_dir=self.cfg.out_dir,
+                log_type=self.cfg.filter_log_type,
+                recursive=self.cfg.recursive,
+                extensions=["log"],   # 筛选模式固定 .log（避免卷入 csv/json 采样文件）
+                max_file_mb=self.cfg.max_file_mb,
+                threads=self.cfg.threads,
+                keep_logs=self.cfg.filter_keep_logs,
+                upload_enabled=self.cfg.upload_enabled,
+                upload_types=([self.cfg.filter_log_type] if self.cfg.filter_log_type != "auto"
+                              else [t.strip() for t in self.cfg.upload_types.split(",") if t.strip()]),
+                dry_run=self.cfg.upload_dry_run,
+                profile=UploadProfile(
+                    cli_path=self.cfg.upload_cli_path,
+                    args=self.cfg.upload_args,
+                    use_stdin=self.cfg.upload_stdin,
+                    timeout_sec=float(self.cfg.upload_timeout),
+                    max_retries=int(self.cfg.upload_retries),
+                    secret_key=self.cfg.upload_secret_key,
+                ),
+                app_dir=APP_DIR,
+            )
+            eng = FilterEngine(
+                rcfg,
+                on_progress=lambda d: self.progress.emit(d),
+                on_upload=lambda d: self.upload.emit(d),
+                on_log=lambda lvl, msg: self.log.emit(lvl, msg),
+            )
+            self._engine = eng
+            items, summary = eng.run()
+            self.done.emit(items, summary)
+        except Exception:
+            self.error.emit(traceback.format_exc())
+
+
+class CountdownDialog(QDialog):
+    """完成后倒计时：归零自动退出；可取消 / 延时 30s / 打开输出目录。"""
+
+    def __init__(self, parent, seconds: int, out_dir: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("自动退出")
+        self.setModal(True)
+        self.remaining = max(1, int(seconds))
+        self.out_dir = out_dir
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 18, 22, 14)
+        lay.setSpacing(12)
+        self.lbl = QLabel()
+        lay.addWidget(self.lbl)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        btn_cancel = QPushButton("取消关闭")
+        btn_more = QPushButton("延时 30s")
+        btn_open = QPushButton("打开输出目录")
+        btn_cancel.clicked.connect(self.reject)
+        btn_more.clicked.connect(self._extend)
+        btn_open.clicked.connect(self._open_out)
+        row.addWidget(btn_cancel)
+        row.addWidget(btn_more)
+        row.addStretch(1)
+        row.addWidget(btn_open)
+        lay.addLayout(row)
+        self.timer = QTimer(self)
+        self.timer.setInterval(1000)
+        self.timer.timeout.connect(self._tick)
+        self._render()
+        self.timer.start()
+
+    def _render(self):
+        self.lbl.setText(f"全部完成，{self.remaining} 秒后自动关闭程序。")
+
+    def _tick(self):
+        self.remaining -= 1
+        if self.remaining <= 0:
+            self.timer.stop()
+            self.accept()          # 归零 → 主窗口 close，程序退出
+        else:
+            self._render()
+
+    def _extend(self):
+        self.remaining += 30
+        self._render()
+
+    def _open_out(self):
+        if self.out_dir and os.path.isdir(self.out_dir):
+            try:
+                os.startfile(self.out_dir)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+
 class LogDialog(QDialog):
     """运行日志弹窗。"""
     def __init__(self, parent=None):
@@ -303,6 +417,7 @@ class MainWindow(QMainWindow):
         h2 = QLabel("扫描配置", objectName="h2")
         pv.addWidget(h2)
         self._build_config(panel, pv)
+        self._build_filter_group(panel, pv)
         pv.addStretch(1)
         bl.addWidget(panel)
 
@@ -332,6 +447,17 @@ class MainWindow(QMainWindow):
         root.addWidget(logbar)
 
     def _build_config(self, panel, pv: QVBoxLayout):
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(6)
+        mode_lbl = QLabel("工作模式")
+        self.work_combo = QComboBox()
+        self.work_combo.addItem("通用扫描（包含 / 不包含）", "scan")
+        self.work_combo.addItem("日志筛选 / 回传（etest 系）", "filter")
+        self.work_combo.currentIndexChanged.connect(self._toggle_work_mode)
+        mode_row.addWidget(mode_lbl)
+        mode_row.addWidget(self.work_combo, 1)
+        pv.addLayout(mode_row)
+
         grid = QGridLayout()
         grid.setVerticalSpacing(8)
         grid.setHorizontalSpacing(10)
@@ -422,6 +548,85 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.out_edit, 7, 1)
 
         pv.addLayout(grid)
+        # 日志筛选模式下禁用的通用扫描专属控件
+        self._scan_only = [self.kw_edit, self.mode_inc, self.mode_exc, self.thread_slider,
+                           self.thread_spin, self.enc_combo, self.case_check, self.record_check]
+
+    def _build_filter_group(self, panel, pv: QVBoxLayout):
+        """日志筛选 / 回传配置组（工作模式=日志筛选时显示）。"""
+        box = QGroupBox("日志筛选 / 回传")
+        gv = QVBoxLayout(box)
+        gv.setContentsMargins(10, 8, 10, 8)
+        gv.setSpacing(8)
+        g = QGridLayout()
+        g.setVerticalSpacing(8)
+        g.setHorizontalSpacing(10)
+
+        g.addWidget(QLabel("筛选类型"), 0, 0)
+        self.type_combo = QComboBox()
+        for label, val in [("自动识别", LogType.AUTO.value), ("etest(OA3)", LogType.ETEST_OA3.value),
+                           ("etest", LogType.ETEST.value), ("e-autotest", LogType.EAUTOTEST.value)]:
+            self.type_combo.addItem(label, val)
+        g.addWidget(self.type_combo, 0, 1)
+
+        self.upload_check = QCheckBox("启用数据回传（逐台调第三方 CLI；自动模式下仅 etest(OA3)）")
+        self.dry_check = QCheckBox("dry-run（只组包校验，不调 CLI）")
+        self.dry_check.setChecked(True)
+        self.keep_check = QCheckBox("留存命中日志到批次目录")
+        self.keep_check.setChecked(True)
+        self.autoclose_check = QCheckBox("完成后倒计时自动关闭程序")
+        for r, cb in enumerate((self.upload_check, self.dry_check, self.keep_check, self.autoclose_check), start=1):
+            g.addWidget(cb, r, 0, 1, 2)
+
+        g.addWidget(QLabel("CLI 路径"), 5, 0)
+        cli_row = QHBoxLayout()
+        cli_row.setSpacing(6)
+        self.cli_edit = QLineEdit()
+        self.cli_edit.setProperty("mono", "true")
+        self.cli_edit.setPlaceholderText("留空=程序目录下 intunehelper_cli.exe")
+        cli_browse = QPushButton("…")
+        cli_browse.setFixedWidth(30)
+        cli_browse.clicked.connect(self._pick_cli)
+        cli_row.addWidget(self.cli_edit, 1)
+        cli_row.addWidget(cli_browse)
+        g.addLayout(cli_row, 5, 1)
+
+        g.addWidget(QLabel("SecretKey"), 6, 0)
+        self.secret_edit = QLineEdit()
+        self.secret_edit.setProperty("mono", "true")
+        self.secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        g.addWidget(self.secret_edit, 6, 1)
+
+        g.addWidget(QLabel("参数模板"), 7, 0)
+        self.args_edit = QLineEdit()
+        self.args_edit.setProperty("mono", "true")
+        self.args_edit.setToolTip("占位符 ~key~：~secret_key~ / ~payload~ / 提取字段（~sn~ 等）。"
+                                  "含 ~payload~ 时走参数传 JSON，否则 payload 写 stdin")
+        g.addWidget(self.args_edit, 7, 1)
+
+        g.addWidget(QLabel("超时 / 重试"), 8, 0)
+        tr = QHBoxLayout()
+        tr.setSpacing(8)
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setRange(5, 600)
+        self.timeout_spin.setSuffix(" s")
+        self.retry_spin = QSpinBox()
+        self.retry_spin.setRange(0, 10)
+        self.retry_spin.setPrefix("重试 ")
+        tr.addWidget(self.timeout_spin, 1)
+        tr.addWidget(self.retry_spin, 1)
+        g.addLayout(tr, 8, 1)
+
+        g.addWidget(QLabel("倒计时"), 9, 0)
+        self.countdown_spin = QSpinBox()
+        self.countdown_spin.setRange(3, 3600)
+        self.countdown_spin.setSuffix(" s")
+        g.addWidget(self.countdown_spin, 9, 1)
+
+        gv.addLayout(g)
+        self.filter_group = box
+        box.setVisible(False)
+        pv.addWidget(box)
 
     def _build_result(self, right, rv: QVBoxLayout):
         # 顶部统计 + 操作
@@ -461,6 +666,23 @@ class MainWindow(QMainWindow):
         tl.addWidget(self.stop_btn)
         rv.addWidget(toolbar)
 
+        # 回传进度行（日志筛选模式显示）
+        self.up_row = QWidget(objectName="stat")
+        ul = QHBoxLayout(self.up_row)
+        ul.setContentsMargins(14, 0, 14, 8)
+        up_lbl = QLabel("回传")
+        up_lbl.setStyleSheet("color:#979da6;font-size:11px;")
+        self.up_progress = QProgressBar()
+        self.up_progress.setRange(0, 100)
+        self.up_progress.setFixedWidth(260)
+        self.up_text = QLabel("—")
+        self.up_text.setStyleSheet("color:#979da6;font-size:11px;")
+        ul.addWidget(up_lbl)
+        ul.addWidget(self.up_progress)
+        ul.addWidget(self.up_text, 1)
+        self.up_row.setVisible(False)
+        rv.addWidget(self.up_row)
+
         # 结果表格
         self.table = QTableWidget(0, 11)
         self.table.setHorizontalHeaderLabels(
@@ -473,13 +695,44 @@ class MainWindow(QMainWindow):
         self.table.setColumnWidth(1, 300)
         self.table.setColumnWidth(2, 120)
         self.table.setColumnWidth(6, 240)
+        self._set_table_mode(False)
         rv.addWidget(self.table, 1)
+
+    SCAN_HEADERS = ["#", "相对路径", "目录", "扩展名", "包含状态", "命中行号", "命中行内容", "匹配计数", "大小", "修改时间", "编码"]
+
+    def _set_table_mode(self, is_filter: bool):
+        """两种工作模式的表头与列宽。"""
+        if is_filter:
+            headers = ["#", "相对路径", "判型", "SN", "提取", "OA3结果", "PKID", "Hash长度", "回传", "request_id / 错误"]
+            widths = {1: 280, 2: 88, 3: 210, 4: 56, 5: 118, 6: 108, 7: 66, 8: 84, 9: 250}
+        else:
+            headers = self.SCAN_HEADERS
+            widths = {1: 300, 2: 120, 6: 240}
+        self.table.clear()
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
+        for c, w in widths.items():
+            self.table.setColumnWidth(c, w)
 
     # ---------- 配置读写 ----------
     def _pick_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择扫描目录", self.dir_edit.text() or ".")
         if d:
             self.dir_edit.setText(d)
+
+    def _pick_cli(self):
+        f, _ = QFileDialog.getOpenFileName(self, "选择回传 CLI", self.cli_edit.text() or APP_DIR,
+                                           "可执行文件 (*.exe);;所有文件 (*.*)")
+        if f:
+            self.cli_edit.setText(f)
+
+    def _toggle_work_mode(self):
+        is_filter = self.work_combo.currentData() == "filter"
+        self.filter_group.setVisible(is_filter)
+        for w in getattr(self, "_scan_only", []):
+            w.setEnabled(not is_filter)
+        self.up_row.setVisible(is_filter)
+        self._set_table_mode(is_filter)
 
     def _set_mode(self, mode: str):
         self.mode_inc.setChecked(mode == "inc")
@@ -499,6 +752,20 @@ class MainWindow(QMainWindow):
         cfg.record_miss = self.record_check.isChecked()
         out = self.out_edit.text().strip()
         cfg.out_dir = out if out else default_out_dir(APP_DIR)
+        # 日志筛选 / 回传
+        cfg.work_mode = self.work_combo.currentData() or "scan"
+        cfg.filter_log_type = self.type_combo.currentData() or "auto"
+        cfg.filter_keep_logs = self.keep_check.isChecked()
+        cfg.upload_enabled = self.upload_check.isChecked()
+        cfg.upload_dry_run = self.dry_check.isChecked()
+        cfg.upload_cli_path = self.cli_edit.text().strip()
+        cfg.upload_secret_key = self.secret_edit.text().strip()
+        cfg.upload_args = self.args_edit.text().strip() or "upload --stdin --secret-key ~secret_key~"
+        cfg.upload_timeout = float(self.timeout_spin.value())
+        cfg.upload_retries = self.retry_spin.value()
+        cfg.upload_stdin = "~payload~" not in cfg.upload_args   # 模板含 ~payload~ 则走参数，否则写 stdin
+        cfg.filter_countdown = self.countdown_spin.value()
+        cfg.filter_auto_close = self.autoclose_check.isChecked()
         return cfg
 
     def _apply_cfg(self, cfg: SearchConfig):
@@ -514,6 +781,20 @@ class MainWindow(QMainWindow):
         self.copy_check.setChecked(cfg.copy_files)
         self.record_check.setChecked(cfg.record_miss)
         self.out_edit.setText(cfg.out_dir)
+        idx_w = self.work_combo.findData(cfg.work_mode)
+        self.work_combo.setCurrentIndex(idx_w if idx_w >= 0 else 0)
+        idx_t = self.type_combo.findData(cfg.filter_log_type)
+        self.type_combo.setCurrentIndex(idx_t if idx_t >= 0 else 0)
+        self.keep_check.setChecked(cfg.filter_keep_logs)
+        self.upload_check.setChecked(cfg.upload_enabled)
+        self.dry_check.setChecked(cfg.upload_dry_run)
+        self.cli_edit.setText(cfg.upload_cli_path)
+        self.secret_edit.setText(cfg.upload_secret_key)
+        self.args_edit.setText(cfg.upload_args or "upload --stdin --secret-key ~secret_key~")
+        self.timeout_spin.setValue(int(cfg.upload_timeout))
+        self.retry_spin.setValue(int(cfg.upload_retries))
+        self.countdown_spin.setValue(int(cfg.filter_countdown))
+        self.autoclose_check.setChecked(cfg.filter_auto_close)
 
     def _load_cfg(self):
         self._apply_cfg(load_config(APP_DIR))
@@ -581,10 +862,19 @@ class MainWindow(QMainWindow):
         self._set_running(True)
         self.table.setRowCount(0)
         self.progress.setValue(0)
-        self.prog_text.setText("扫描中…")
-        self._push_log("info", f"开始扫描：{cfg.root_dir}  关键字「{cfg.keyword}」 模式：{'包含' if cfg.mode=='inc' else '不包含'}  线程 {cfg.threads}")
-
-        self._worker = ScanWorker(cfg)
+        self.up_progress.setValue(0)
+        if cfg.work_mode == "filter":
+            self.prog_text.setText("筛选中…")
+            self.up_text.setText("等待提取完成…")
+            self._push_log("info", f"开始日志筛选：{cfg.root_dir}  类型「{cfg.filter_log_type}」  "
+                                   f"回传{'开' if cfg.upload_enabled else '关'}"
+                                   + ("（dry-run）" if cfg.upload_enabled and cfg.upload_dry_run else ""))
+            self._worker = FilterWorker(cfg)
+            self._worker.upload.connect(self._on_upload_progress)
+        else:
+            self.prog_text.setText("扫描中…")
+            self._push_log("info", f"开始扫描：{cfg.root_dir}  关键字「{cfg.keyword}」 模式：{'包含' if cfg.mode=='inc' else '不包含'}  线程 {cfg.threads}")
+            self._worker = ScanWorker(cfg)
         self._worker.progress.connect(self._on_progress)
         self._worker.log.connect(self._push_log)
         self._worker.done.connect(self._on_done)
@@ -602,14 +892,25 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(running)
 
     def _on_progress(self, d: dict):
-        self.progress.setValue(int(d["pct"]))
-        self.prog_text.setText(f'{d["done"]}/{d["total"]}')
-        self.st_scanned.setText(str(d["done"]))
-        self.st_hit.setText(str(d["hit"]))
-        self.st_miss.setText(str(d["miss"]))
-        self.st_skip.setText(str(d["skipped"]))
+        self.progress.setValue(int(d.get("pct", 0)))
+        if d.get("phase") == "extract":
+            self.prog_text.setText(f'提取 {d.get("done", 0)}/{d.get("total", 0)}')
+        else:
+            self.prog_text.setText(f'{d.get("done", 0)}/{d.get("total", 0)}')
+        self.st_scanned.setText(str(d.get("done", 0)))
+        self.st_hit.setText(str(d.get("hit", "—")))
+        self.st_miss.setText(str(d.get("miss", "—")))
+        self.st_skip.setText(str(d.get("skipped", "—")))
+
+    def _on_upload_progress(self, d: dict):
+        self.up_progress.setValue(int(d.get("pct", 0)))
+        label = {"ok": "成功", "conflict": "冲突", "fail": "失败", "dry_run": "dry-run"}.get(d.get("status"), "")
+        self.up_text.setText(f'{d.get("index", 0)}/{d.get("total", 0)}  {d.get("sn", "")}  {label}')
 
     def _on_done(self, items, summary):
+        if isinstance(self._worker, FilterWorker):
+            self._on_filter_done(items, summary)
+            return
         cfg = self._extract_last_cfg()
         # 导出 + 落盘
         try:
@@ -627,6 +928,59 @@ class MainWindow(QMainWindow):
             self._push_log("err", f"导出失败：{e}\n{traceback.format_exc()}")
         self._populate_table(items, cfg)
         self._finish_ui(summary)
+
+    def _on_filter_done(self, items, summary):
+        cfg = self._collect_cfg()
+        self._populate_filter_table(items)
+        self._set_running(False)
+        self.prog_text.setText("完成")
+        self.st_time.setText(f"{summary.elapsed}s")
+        self.st_scanned.setText(str(summary.total))
+        self.st_hit.setText(str(summary.extracted))
+        self.st_miss.setText(str(summary.unknown))
+        self.st_skip.setText(str(summary.skipped))
+        self.up_progress.setValue(100)
+        self.up_text.setText(
+            f"成功 {summary.upload_ok} / 冲突 {summary.upload_conflict} / 失败 {summary.upload_fail}"
+            + (f" / dry-run {summary.upload_dry}" if summary.upload_dry else "")
+            if cfg.upload_enabled else "未启用回传")
+        self._push_log("ok", f"筛选完成：提取 {summary.extracted}/{summary.total}（未知类型 {summary.unknown}），"
+                             f"回传 成功 {summary.upload_ok} / 冲突 {summary.upload_conflict} / 失败 {summary.upload_fail}")
+        self._last_output_dir = summary.batch_dir
+        self._worker = None
+        if cfg.filter_auto_close:
+            dlg = CountdownDialog(self, cfg.filter_countdown, summary.batch_dir)
+            if dlg.exec():
+                self.close()       # 倒计时归零 → 退出程序
+        else:
+            ret = QMessageBox.question(self, "完成",
+                                       f"日志筛选完成。\n输出：{summary.batch_dir}\n是否打开输出目录？")
+            if ret == QMessageBox.StandardButton.Yes:
+                try:
+                    os.startfile(summary.batch_dir)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+        if self.isVisible():
+            self.log_dialog.show()
+
+    def _populate_filter_table(self, items):
+        self.table.setRowCount(len(items))
+        c_ok = COLORS["dark" if self.dark else "light"]["ok"]
+        c_warn = COLORS["dark" if self.dark else "light"]["warn"]
+        c_err = COLORS["dark" if self.dark else "light"]["err"]
+        for r, it in enumerate(items):
+            up = str(it.get("upload_state", "") or "")
+            vals = [str(r + 1), it.get("rel_path", ""), it.get("detected_type", ""), it.get("sn", ""),
+                    "成功" if it.get("extract_ok") else "失败", it.get("oa3_result", ""),
+                    str(it.get("product_key_id", "") or ""), str(it.get("hardware_hash_len", "") or ""),
+                    up, (it.get("request_id", "") or it.get("upload_error", "") or it.get("error", ""))]
+            for c, v in enumerate(vals):
+                t = QTableWidgetItem(v)
+                if c == 4:
+                    t.setForeground(QBrush(QColor(c_ok if it.get("extract_ok") else c_err)))
+                elif c == 8 and up:
+                    t.setForeground(QBrush(QColor({"成功": c_ok, "冲突(人工)": c_warn}.get(up, c_err))))
+                self.table.setItem(r, c, t)
 
     def _on_error(self, msg: str):
         self._push_log("err", "扫描异常：\n" + msg)

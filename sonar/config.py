@@ -26,18 +26,47 @@ class SearchConfig:
     max_file_mb: float = 20.0         # 超过此大小视为二进制/超大，跳过
     out_dir: str = ""                 # 输出根目录，空=程序目录下的 out
 
+    # ---------- 日志筛选 / 回传（work_mode="filter" 时生效） ----------
+    work_mode: str = "scan"           # scan 通用扫描 | filter 日志筛选
+    filter_log_type: str = "auto"     # auto | etest(OA3) | etest | e-autotest
+    filter_keep_logs: bool = True     # 提取成功日志留存到批次目录
+    upload_enabled: bool = False      # 数据回传开关
+    upload_types: str = "etest(OA3)"  # 自动模式下参与回传的判型（逗号分隔）；选定具体类型时以该类型为准
+    upload_dry_run: bool = True       # dry-run：只组包校验，不调 CLI
+    upload_cli_path: str = ""         # 空=程序目录(或 doc/devicehashupload)下 intunehelper_cli.exe
+    upload_secret_key: str = ""       # SecretKey：config.json 已 gitignore，不进源码/日志
+    upload_args: str = "upload --stdin --secret-key ~secret_key~"   # ~key~ 占位符模板
+    upload_timeout: float = 60.0      # 单台 CLI 超时（秒）
+    upload_retries: int = 3           # 退出码 21 重试次数（1/2/4s 退避）
+    upload_stdin: bool = True         # False 时 payload 经 ~payload~ 传参
+    filter_countdown: int = 30        # 完成后倒计时（秒）
+    filter_auto_close: bool = False   # 倒计时归零自动关闭程序
+
     def validate(self) -> List[str]:
         errs: List[str] = []
         if not self.root_dir or not os.path.isdir(self.root_dir):
             errs.append("扫描目录不存在")
-        if not self.keyword.strip():
-            errs.append("关键字不能为空")
         if not (1 <= self.threads <= 64):
             errs.append("线程数需在 1~64 之间")
-        if self.mode not in ("inc", "exc"):
-            errs.append("匹配模式不合法")
-        if self.encoding == "ascii" and len(self.keyword) > 0 and any(ord(c) > 127 for c in self.keyword):
-            errs.append("ASCII 编码无法匹配非 ASCII 关键字")
+        if self.work_mode == "scan":
+            if not self.keyword.strip():
+                errs.append("关键字不能为空")
+            if self.mode not in ("inc", "exc"):
+                errs.append("匹配模式不合法")
+            if self.encoding == "ascii" and len(self.keyword) > 0 and any(ord(c) > 127 for c in self.keyword):
+                errs.append("ASCII 编码无法匹配非 ASCII 关键字")
+        else:  # filter
+            if self.work_mode not in ("scan", "filter"):
+                errs.append("工作模式不合法")
+            if self.upload_enabled:
+                if not self.upload_dry_run and not self.upload_secret_key.strip():
+                    errs.append("正式回传需填写 SecretKey（dry-run 可留空）")
+                if self.upload_timeout <= 0:
+                    errs.append("回传超时需大于 0 秒")
+                if self.upload_retries < 0 or self.upload_retries > 10:
+                    errs.append("回传重试次数需在 0~10 之间")
+            if self.filter_countdown < 3 or self.filter_countdown > 3600:
+                errs.append("倒计时需在 3~3600 秒之间")
         return errs
 
 

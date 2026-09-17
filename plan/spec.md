@@ -172,3 +172,25 @@ findany/
 - **只读/无权限文件**：捕获异常记日志，跳过继续。
 - **Excel 依赖缺失**：自动降级 CSV 兜底。
 ```
+
+---
+
+## 10. v1.1 增补：日志筛选 / 数据回传（契约对照）
+
+> 定版问答（全A）落档。承载：findany 内新增「工作模式」，不动通用扫描路径。
+
+| # | 契约 | 实现 | 验证（可执行断言） |
+|---|------|------|--------------------|
+| 1 | 判型：etest(OA3)=doc样例格式；etest=同平台无OA3；e-autotest=AUTO2前缀/首行`: e-autotest`；自动判型，未知落清单 | `sonar/logfilter/types.py::detect_log_type` 五级优先 | 测试 detect 4 条断言 |
+| 2 | 回传范围：OA3 默认提 SN/PKID/Hash/Baseboard 回传；etest/e-autotest 默认只提取；回传开关可调 | `FilterRunCfg.upload_types`（默认 `["etest(OA3)]"`），GUI 自动模式下仅 OA3 | 引擎 dry-run dry=3/6 |
+| 3 | 通用回传全可配（CLI/参数模板~key~/stdin/超时/重试/判定） | `uploader.UploadProfile` + config.json + GUI 面板；intunehelper 预设 | 参数渲染断言 |
+| 4 | 判定：退出码0 且 status∈{accepted,duplicate_accepted} 双确认；12黄；10/20/30红；21 重试 | `uploader.run_upload`（移植 etest-core check_result 思路） | 桩测 5 条（ok/conflict/retry/fail/字段不全） |
+| 5 | 手动开始→筛选→回传→倒计时(30s可配)自动关，可取消/延时 | GUI 工作模式切换 + `CountdownDialog` | 离屏冒烟 |
+| 6 | dry-run 全量 + 真传 1 台；SecretKey 进 config.json(gitignore) | dry-run 只组包；真传走 `doc/devicehashupload` CLI | 6/6 断言 + 真传 accepted(rid 7854aba1…) |
+
+**锚点来源**：`doc/etest-log/extract-oa3.ps1`（ASCII 锚点逐条移植 Python）；期望值基准 `oa3-samples.json`。
+**陷阱移植**：OA3 正文块每台出现 2 次 → 取第 1 次 + 记 `oa3_block_count`；`R<{...}>R` 取最后一个；`OEMRevision` 不误命中（锚点含 `msg="`）。
+**产物**：`out/<时间>/filter_result.xlsx + upload-result.csv + 命中日志留存`；审计不含 Hash/SecretKey（SOP 第 6 条）。
+**筛选模式固定扫 `.log`**（不沿用通用扫描扩展名，避免卷入采样 csv/json）。
+**自校验**：`py -3 tests\\test_logfilter.py` → 75 条断言 ALL PASS。
+

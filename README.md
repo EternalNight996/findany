@@ -28,6 +28,7 @@ findany 是一个 Windows 桌面程序，用 **Python + PySide6** 编写，核�
 - `🧩` **编码智能**：chardet 探测 + 多编码降级（utf-8/GBK/UTF-16），杜绝乱码误判。
 - `🛡️` **稳健**：二进制 / 超大文件跳过，输出目录自扫描排除，无权限文件记日志不中断。
 - `💬` **日志弹窗**：运行日志实时滚动，按级别着色，可清空 / 关闭。
+- `🧭` **日志筛选 / 数据回传**：内置 etest(OA3) / etest / e-autotest 三类判型提取，通用 CLI 回传（intunehelper 预设）+ dry-run + 回传进度条 + 完成倒计时自动关。
 - `🎨` **深 / 浅主题**：一键切换。
 
 ## 系统要求
@@ -75,6 +76,32 @@ py -3 app.py
 4. 调整**并发线程数**（1~64）、**扩展名**（逗号分隔，留空=全部）、**编码**、各开关。
 5. 点**开始扫描**，右侧实时显示统计与进度，可随时**停止**。
 6. 完成弹窗提示，可一键**打开输出目录**。
+
+## 日志筛选 / 数据回传（工作模式切换）
+
+顶栏「工作模式」切到 **日志筛选** 后，左侧出现筛选 / 回传面板：
+
+| 配置项 | 说明 | 默认 |
+| --- | --- | --- |
+| 筛选类型 | 自动识别 / etest(OA3) / etest / e-autotest | 自动识别 |
+| 判型规则 | 文件名 `AUTO2` 前缀→e-autotest；含 `OA3 inject Start`/`<HardwareHash>`→etest(OA3)；首行含 `: e-autotest`→e-autotest；尾部 `R<{`→etest；其余=未知 | — |
+| 启用数据回传 | 提取成功后逐台调第三方 CLI；自动模式下仅 etest(OA3) 参与回传 | 关 |
+| dry-run | 只组包校验四字段，不调 CLI、不碰网 | 开 |
+| CLI 路径 | 空=程序目录（或 `doc/devicehashupload/`）下 `intunehelper_cli.exe` | 空 |
+| SecretKey | 存 `config.json`（已 gitignore，不进源码/日志，按交付 SOP 第 6 条） | 空 |
+| 参数模板 | 占位符 `~key~`：`~secret_key~` / `~payload~` / 提取字段；含 `~payload~` 走参数否则写 stdin | `upload --stdin --secret-key ~secret_key~` |
+| 超时 / 重试 | 单台 CLI 超时；退出码 21 自动重试（1/2/4s 退避），10/12/20/30 不重试 | 60s / 3 次 |
+| 倒计时自动关 | 完成后倒计时归零自动退出程序；弹窗可取消 / 延时 30s / 打开输出目录 | 30s，默认关 |
+
+**回传判定**（移植 etest-core `check_result` 思路，规则可配）：退出码 0 且 stdout `status∈{accepted, duplicate_accepted}` 双确认=成功；退出码 12=冲突转人工（黄）；其余=失败（红）。结果审计落 `out/<时间>/upload-result.csv`（不含 Hash 与 SecretKey）。
+
+**产物**：`out/<YYYY-MM-DD_HH-MM>/` 下 `filter_result.xlsx`（OA3 字段明细+摘要）、`upload-result.csv`（回传审计）、命中日志留存。
+
+**自校验**（对 doc/etest-log 6 份生产样例，71 条断言）：
+
+```bash
+py -3 tests\\test_logfilter.py    # 输出 ALL PASS，退出码 0
+```
 
 ## 配置
 
@@ -136,6 +163,8 @@ python -m PyInstaller --noconfirm --clean --windowed --onefile --name findany ap
 findany/
  ├─ app.py               # PySide6 GUI 入口
  ├─ sonar/               # 后端（无 Qt，可复用）：config / scanner / exporter
+ │   └─ logfilter/       # 日志筛选与回传：types(判型) / extractors(提取) / uploader(CLI回传) / engine(编排) / report(产物)
+ ├─ tests/               # 自校验（判型/提取/判定/重试，71 条断言）
  ├─ plan/                # UI 样板 + 方案规范 (ui-mockup.html, spec.md)
  ├─ run.bat              # 无控制台启动
  ├─ run_debug.bat        # 控制台启动（出错暂停显示）
