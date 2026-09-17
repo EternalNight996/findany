@@ -57,6 +57,7 @@ try:
     from sonar.logfilter.engine import FilterEngine, FilterRunCfg
     from sonar.logfilter.uploader import UploadProfile
     from sonar.logfilter.types import LogType
+    from sonar.logfilter import autoconfig
 except Exception:
     # 任何导入失败（pythonw 下无控制台）→ logs/findany-crash.log + 本机弹窗 + stderr
     _err = traceback.format_exc()
@@ -204,12 +205,24 @@ class FilterWorker(QThread):
 
     def run(self):
         try:
+            # 回传方案：SN 关联多文件（方案一）/ 单文件（方案二）
+            file_list = None
+            if self.cfg.filter_sn:
+                file_list = autoconfig.find_sn_logs(self.cfg.root_dir, self.cfg.filter_sn, self.cfg.recursive)
+                if not file_list:
+                    self.error.emit(f"未找到与 SN「{self.cfg.filter_sn}」关联的日志（{self.cfg.root_dir}）")
+                    return
+                self.log.emit("info", f"SN「{self.cfg.filter_sn}」关联日志 {len(file_list)} 份："
+                                      + "、".join(os.path.basename(p) for p in file_list))
+            elif self.cfg.filter_file:
+                file_list = [self.cfg.filter_file]
             rcfg = FilterRunCfg(
                 root_dir=self.cfg.root_dir,
                 out_dir=self.cfg.out_dir,
                 log_type=self.cfg.filter_log_type,
                 recursive=self.cfg.recursive,
                 extensions=["log"],   # 筛选模式固定 .log（避免卷入 csv/json 采样文件）
+                file_list=file_list,
                 max_file_mb=self.cfg.max_file_mb,
                 threads=self.cfg.threads,
                 keep_logs=self.cfg.filter_keep_logs,
@@ -727,8 +740,27 @@ class MainWindow(QMainWindow):
         if f:
             self.cli_edit.setText(f)
 
+    def apply_auto(self, auto) -> bool:
+        """TOML 自动化：覆盖 UI 配置；通过校验则标记自动开跑。"""
+        cfg = self._collect_cfg()
+        autoconfig.apply_to_config(auto, cfg)
+        errs = cfg.validate()
+        if errs:
+            self._push_log("err", "TOML 配置错误：" + "; ".join(errs))
+            return False
+        self._apply_cfg(cfg)
+        self._auto_sn = cfg.filter_sn
+        self._auto_file = cfg.filter_file
+        self._auto_pending = True
+        scheme = "SN关联多文件" if cfg.filter_sn else ("单文件" if cfg.filter_file else "目录遍历")
+        self._push_log("info", f"自动化配置已加载（方案：{scheme}，dry-run={'开' if cfg.upload_dry_run else '关'}），即将自动开始…")
+        return True
+
     def _toggle_work_mode(self):
         is_filter = self.work_combo.currentData() == "filter"
+        if not is_filter:
+            self._auto_sn = ""
+            self._auto_file = ""
         self.filter_group.setVisible(is_filter)
         for w in getattr(self, "_scan_only", []):
             w.setEnabled(not is_filter)
@@ -767,6 +799,9 @@ class MainWindow(QMainWindow):
         cfg.upload_stdin = "~payload~" not in cfg.upload_args   # 模板含 ~payload~ 则走参数，否则写 stdin
         cfg.filter_countdown = self.countdown_spin.value()
         cfg.filter_auto_close = self.autoclose_check.isChecked()
+        # TOML 自动化方案（SN 关联 / 单文件）：无对应控件，挂窗口属性回填
+        cfg.filter_sn = getattr(self, "_auto_sn", "")
+        cfg.filter_file = getattr(self, "_auto_file", "")
         return cfg
 
     def _apply_cfg(self, cfg: SearchConfig):
@@ -953,6 +988,9 @@ class MainWindow(QMainWindow):
             dlg = CountdownDialog(self, cfg.filter_countdown, summary.batch_dir)
             if dlg.exec():
                 self.close()       # 倒计时归零 → 退出程序
+        elif getattr(self, "_auto_pending", False):
+            # TOML 自动化（auto_close=false）：不打断，保持界面
+            self._push_log("ok", "自动化流程完成（auto_close=false，保持界面打开）")
         else:
             ret = QMessageBox.question(self, "完成",
                                        f"日志筛选完成。\n输出：{summary.batch_dir}\n是否打开输出目录？")
@@ -1056,6 +1094,18 @@ def main():
             _mark("window raised/activated")
         except Exception:
             _mark("raise/activate failed")
+        # TOML 自动化：--config findany.toml 或程序目录 findany.toml（run.auto_start=true）
+        try:
+            ns = autoconfig.parse_args(sys.argv[1:])
+            auto = autoconfig.resolve_auto(ns, APP_DIR)
+            if auto is not None and w.apply_auto(auto) and auto.auto_start:
+                QTimer.singleShot(300, w._start)   # 等 UI 布局稳定后自动开跑
+        except SystemExit:
+            raise
+        except Exception:
+            _err2 = traceback.format_exc()
+            _mark("auto config error: " + _err2.replace("\n", " | "))
+            _write_file("findany-crash.log", _err2, "a")
         _write_file("findany-run.log", "\n===== findany 会话开始 " + time.strftime("%Y-%m-%d %H:%M:%S") + " =====\n")
         sys.exit(app.exec())
     except Exception:

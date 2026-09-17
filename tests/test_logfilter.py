@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tomllib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -180,6 +181,66 @@ def test_heg_alignment():
           and detect_log_type("IFT-x.log", "no content") == LogType.HEG_AUTOTEST3)
 
 
+# ---------- 2.8) TOML 自动化（方案一 SN 关联多文件 / 方案二 单文件） ----------
+def test_auto_toml():
+    from sonar.logfilter import autoconfig as ac
+    from sonar.logfilter.engine import FilterEngine, FilterRunCfg
+    from sonar.logfilter.uploader import UploadProfile
+
+    toml = """
+[filter]
+root_dir = "D:/logs"
+log_type = "auto"
+recursive = true
+[run]
+auto_start = true
+countdown_sec = 3
+auto_close = true
+[upload]
+enabled = true
+dry_run = true
+types = ["etest(OA3)"]
+secret_key = "sk-toml"
+[scheme]
+mode = "sn_dir"
+sn = "MT71I2GSF"
+"""
+    auto = ac.parse_auto(tomllib.loads(toml))
+    check("toml 解析 enabled/倒计时3s", auto.enabled and auto.countdown_sec == 3)
+    check("toml 方案/dry-run/密钥", auto.scheme == "sn_dir" and auto.sn == "MT71I2GSF"
+          and auto.dry_run is True and auto.secret_key == "sk-toml")
+
+    # 方案一：SN 关联检索（文件名+内容双通道）
+    hits = ac.find_sn_logs(str(SAMPLES), "MT71I2GSF-2HG260807250XAG0015")
+    check("SN 精确检索=1 份", len(hits) == 1 and hits[0].endswith("0015.log"))
+    hits6 = ac.find_sn_logs(str(SAMPLES), "MT71I2GSF")
+    check("SN 前缀检索=6 份", len(hits6) == 6)
+    hits_pk = ac.find_sn_logs(str(SAMPLES), "4362262499781")   # 仅内容含 PKID
+    check("SN 内容命中(文件名不含)", len(hits_pk) == 1 and hits_pk[0].endswith("0015.log"))
+
+    # 方案一 引擎：file_list 通道（dry-run 全链）
+    cfg = FilterRunCfg(root_dir=str(SAMPLES), out_dir=str(ROOT / "out"),
+                       file_list=hits, upload_enabled=True, dry_run=True,
+                       profile=UploadProfile(secret_key="x"))
+    items, s = FilterEngine(cfg).run()
+    check("方案一 引擎: total=1 dry=1", s.total == 1 and s.upload_dry == 1)
+
+    # 方案二 引擎：单文件
+    cfg2 = FilterRunCfg(root_dir=str(SAMPLES), out_dir=str(ROOT / "out"),
+                        file_list=[sample_files("Ift")[1]], upload_enabled=True, dry_run=True,
+                        profile=UploadProfile(secret_key="x"))
+    items2, s2 = FilterEngine(cfg2).run()
+    check("方案二 引擎: total=1 提取成功", s2.total == 1 and s2.extracted == 1)
+
+    # toml -> SearchConfig 覆盖
+    from sonar.config import SearchConfig
+    cfgS = SearchConfig()
+    ac.apply_to_config(auto, cfgS)
+    check("toml 覆盖 SearchConfig", cfgS.work_mode == "filter" and cfgS.filter_sn == "MT71I2GSF"
+          and cfgS.upload_dry_run is True and cfgS.filter_countdown == 3)
+    check("覆盖后校验过(SN 有目录)", cfgS.validate() == [] or all("SN" not in e for e in cfgS.validate()))
+
+
 # ---------- 3) dry-run 与判定/重试（注入桩，不碰网） ----------
 def _fields_of_first():
     p = sample_files("Ift")[0]
@@ -235,6 +296,7 @@ def main() -> int:
     test_oa3_extraction()
     test_heg_alignment()
     test_engine_dry_run()
+    test_auto_toml()
     test_dry_run_and_judge()
     fails = [n for n, ok, _ in _results if not ok]
     print()

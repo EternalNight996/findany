@@ -91,7 +91,8 @@ py -3 app.py
 | SecretKey | 存 `config.json`（已 gitignore，不进源码/日志，按交付 SOP 第 6 条） | 空 |
 | 参数模板 | 占位符 `~key~`：`~secret_key~` / `~payload~` / 提取字段；含 `~payload~` 走参数否则写 stdin | `upload --stdin --secret-key ~secret_key~` |
 | 超时 / 重试 | 单台 CLI 超时；退出码 21 自动重试（1/2/4s 退避），10/12/20/30 不重试 | 60s / 3 次 |
-| 倒计时自动关 | 完成后倒计时归零自动退出程序；弹窗可取消 / 延时 30s / 打开输出目录 | 30s，默认关 |
+| 倒计时自动关 | 完成后倒计时归零自动退出程序；弹窗可取消 / 延时 30s / 打开输出目录 | 3s，默认关 |
+| 回传方案 | 方案一 `sn_dir`：SN 关联日志（文件名或内容命中，**多文件**回传）；方案二 `single`：单文件筛选回传。由 TOML 配置或 CLI 参数指定 | — |
 
 **回传判定**（移植 etest-core `check_result` 思路，规则可配）：退出码 0 且 stdout `status∈{accepted, duplicate_accepted}` 双确认=成功；退出码 12=冲突转人工（黄）；其余=失败（红）。结果审计落 `out/<时间>/upload-result.csv`（不含 Hash 与 SecretKey）。
 
@@ -102,6 +103,39 @@ py -3 app.py
 ```bash
 py -3 tests\\test_logfilter.py    # 输出 ALL PASS，退出码 0
 ```
+
+## TOML 自动化（检测 → 回传 → 倒计时关）
+
+程序目录放 **`findany.toml`**（或 `findany.exe --config 路径.toml`），`run.auto_start = true` 即启动后自动开跑，完成按倒计时自动关——产线无人值守。
+
+```toml
+[filter]
+root_dir = "D:\\logs"          # 方案一：SN 检索根目录
+log_type = "auto"              # auto|etest(OA3)|etest|e-autotest|海格旧测试2|海格旧测试3
+recursive = true
+
+[run]
+auto_start = true
+countdown_sec = 3              # 完成后倒计时，归零自动关
+auto_close = true
+
+[upload]
+enabled = true
+dry_run = false                # 上线前先 true 演练
+types = ["etest(OA3)"]
+cli_path = ""
+secret_key = ""
+args = "upload --stdin --secret-key ~secret_key~"
+timeout_sec = 60
+max_retries = 3
+
+[scheme]
+mode = "sn_dir"                # sn_dir=方案一 | single=方案二
+sn = ""                        # 方案一：设备 SN（--sn 可覆盖）
+file = ""                      # 方案二：单文件路径（--file 可覆盖）
+```
+
+命令行：`findany.exe --config findany.toml [--sn 设备SN] [--file 单文件]`（`--sn`/`--file` 覆盖 toml 并隐含对应方案）。
 
 ## 配置
 

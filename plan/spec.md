@@ -206,3 +206,14 @@ findany/
 | 修复移植 | 上游 `trim_data_list2` 的 contains 反条件按意图修复为去重 push | 夹具断言 |
 | 默认策略 | 海格旧测试 2/3 只提取不回传（类型闸默认仅 etest(OA3)） | 引擎 dry-run dry=3 |
 
+### 10.2 v1.3 增补：TOML 自动化 + 回传双方案
+
+| 项 | 内容 | 验证 |
+|---|---|---|
+| 倒计时默认 | 30s → **3s**（归零自动关程序） | GUI spin 默认值断言 |
+| TOML 配置 | `findany.toml`（`[filter]/[run]/[upload]/[scheme]`）或 `--config`；`auto_start=true` 启动即自动跑完整流程 | toml 解析断言 |
+| 方案一 sn_dir | 动态 SN 关联日志：文件名或内容命中（64MB 读入上限），**多文件**逐台回传 | 0015→1 份；前缀→6 份；PKID 内容命中→1 份 |
+| 方案二 single | 指定单文件筛选回传 | 引擎 total=1 断言 |
+| CLI 参数 | `--sn` / `--file` 覆盖 toml 并隐含对应方案 | resolve_auto |
+| 自动化交互 | auto_pending 时完成不弹询问框；auto_close=false 保持界面 | GUI 双方案离屏冒烟 |
+

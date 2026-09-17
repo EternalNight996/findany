@@ -39,8 +39,10 @@ class SearchConfig:
     upload_timeout: float = 60.0      # 单台 CLI 超时（秒）
     upload_retries: int = 3           # 退出码 21 重试次数（1/2/4s 退避）
     upload_stdin: bool = True         # False 时 payload 经 ~payload~ 传参
-    filter_countdown: int = 30        # 完成后倒计时（秒）
+    filter_countdown: int = 3         # 完成后倒计时（秒），归零自动关
     filter_auto_close: bool = False   # 倒计时归零自动关闭程序
+    filter_sn: str = ""               # 方案一：SN 关联日志检索（多文件回传）
+    filter_file: str = ""             # 方案二：单文件筛选回传
 
     def validate(self) -> List[str]:
         errs: List[str] = []
@@ -67,6 +69,12 @@ class SearchConfig:
                     errs.append("回传重试次数需在 0~10 之间")
             if self.filter_countdown < 3 or self.filter_countdown > 3600:
                 errs.append("倒计时需在 3~3600 秒之间")
+            if self.filter_sn and not self.root_dir:
+                errs.append("SN 关联检索需配置扫描目录")
+            if self.filter_file and not os.path.isfile(self.filter_file):
+                errs.append("单文件模式：文件不存在")
+            if self.filter_sn and self.filter_file:
+                errs.append("SN 关联与单文件方案二选一")
         return errs
 
 

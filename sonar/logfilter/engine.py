@@ -34,6 +34,7 @@ class FilterRunCfg:
     dry_run: bool = True
     profile: UploadProfile = field(default_factory=UploadProfile)
     app_dir: str = ""                    # 用于 CLI 默认路径解析；空=项目根兜底
+    file_list: Optional[List[str]] = None   # 指定文件清单（SN关联/单文件方案）；None=走目录遍历
 
 
 @dataclass
@@ -160,7 +161,7 @@ class FilterEngine:
         cfg = self.cfg
         t0 = time.time()
         s = FilterSummary()
-        files = self._walk()
+        files = list(cfg.file_list) if cfg.file_list is not None else self._walk()
         s.total = len(files)
         self._on_log("info", f"日志筛选：{cfg.root_dir} 共 {len(files)} 个文件，类型={cfg.log_type or 'auto'}，"
                              f"回传={'开' if cfg.upload_enabled else '关'}"
