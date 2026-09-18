@@ -215,5 +215,6 @@ findany/
 | 方案一 sn_dir | 动态 SN 关联日志：文件名或内容命中（64MB 读入上限），**多文件**逐台回传 | 0015→1 份；前缀→6 份；PKID 内容命中→1 份 |
 | 方案二 single | 指定单文件筛选回传 | 引擎 total=1 断言 |
 | CLI 参数 | `--sn` / `--file` 覆盖 toml 并隐含对应方案 | resolve_auto |
+| 模板自生成 | toml 不存在（默认路径或 --config 路径）→ 输出默认模板 + GUI 提示；不覆盖已有；已 gitignore（防 SecretKey 入库） | 生成/不覆盖/显式路径/用户配置 5 断言 |
 | 自动化交互 | auto_pending 时完成不弹询问框；auto_close=false 保持界面 | GUI 双方案离屏冒烟 |
 

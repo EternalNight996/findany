@@ -241,6 +241,40 @@ sn = "MT71I2GSF"
     check("覆盖后校验过(SN 有目录)", cfgS.validate() == [] or all("SN" not in e for e in cfgS.validate()))
 
 
+# ---------- 2.9) toml 缺席时生成默认模板 ----------
+def test_default_toml_generation():
+    import tempfile
+    from sonar.logfilter import autoconfig as ac
+
+    with tempfile.TemporaryDirectory() as td:
+        ns = ac.parse_args([])                       # 无 --config：走默认路径
+        app_dir = td
+        auto = ac.resolve_auto(ns, app_dir)
+        default_path = os.path.join(app_dir, "findany.toml")
+        check("默认路径不存在 → 生成模板", auto.generated is True and os.path.isfile(default_path))
+        check("模板不自动开跑", auto.enabled is False)
+        # 模板本身可被 tomllib 解析且字段有效
+        parsed = ac.parse_auto(ac.load_toml(default_path))
+        check("模板可解析且 dry_run=true", parsed.dry_run is True and parsed.auto_start is False
+              and parsed.countdown_sec == 3 and parsed.scheme == "sn_dir")
+
+        # 二次启动：模板已存在 → 不覆盖、不再标记 generated
+        auto2 = ac.resolve_auto(ac.parse_args([]), app_dir)
+        check("已存在不覆盖", auto2.generated is False and auto2.enabled is False)
+
+        # 显式 --config 指向缺失路径 → 也生成模板
+        custom = os.path.join(td, "sub", "my.toml")
+        auto3 = ac.resolve_auto(ac.parse_args(["--config", custom]), td)
+        check("显式缺失路径也生成", auto3.generated is True and os.path.isfile(custom))
+
+        # 已有配置不受影响：写入后 resolve 读用户值
+        with open(default_path, "w", encoding="utf-8") as f:
+            f.write("[run]\nauto_start = true\ncountdown_sec = 5\n[filter]\nroot_dir = \"" + str(SAMPLES).replace("\\", "/") + "\"\n[scheme]\nmode = \"sn_dir\"\nsn = \"MT71I2GSF\"\n")
+        auto4 = ac.resolve_auto(ac.parse_args([]), app_dir)
+        check("用户配置正常读取且 enabled", auto4.enabled is True and auto4.sn == "MT71I2GSF"
+              and auto4.countdown_sec == 5)
+
+
 # ---------- 3) dry-run 与判定/重试（注入桩，不碰网） ----------
 def _fields_of_first():
     p = sample_files("Ift")[0]
@@ -297,6 +331,7 @@ def main() -> int:
     test_heg_alignment()
     test_engine_dry_run()
     test_auto_toml()
+    test_default_toml_generation()
     test_dry_run_and_judge()
     fails = [n for n, ok, _ in _results if not ok]
     print()

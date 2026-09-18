@@ -108,6 +108,8 @@ py -3 tests\\test_logfilter.py    # 输出 ALL PASS，退出码 0
 
 程序目录放 **`findany.toml`**（或 `findany.exe --config 路径.toml`），`run.auto_start = true` 即启动后自动开跑，完成按倒计时自动关——产线无人值守。
 
+> **首次运行自动生成**：启动时若找不到 toml，程序会输出一份默认模板（含全字段注释）并提示路径；编辑 `root_dir`/`scheme` 后把 `run.auto_start` 改 `true` 即生效。模板已 gitignore（防后续填入的 SecretKey 入库）。
+
 ```toml
 [filter]
 root_dir = "D:\\logs"          # 方案一：SN 检索根目录

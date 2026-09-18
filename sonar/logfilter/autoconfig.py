@@ -67,6 +67,7 @@ class AutoRun:
     max_retries: int = 3
     countdown_sec: int = 3
     auto_close: bool = True
+    generated: bool = False        # 本次为自动生成默认模板（非用户已有配置）
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -82,13 +83,55 @@ def load_toml(path: str) -> dict:
         return tomllib.load(f)
 
 
-def resolve_auto(ns: argparse.Namespace, app_dir: str) -> Optional[AutoRun]:
-    """--config 显式指定则缺失即抛错；否则缺省路径不存在时返回 None（纯 GUI 模式）。"""
+DEFAULT_TOML = """# findany 自动化配置（本文件由程序自动生成；改 auto_start = true 即自动开跑）
+
+[filter]
+root_dir = ""                  # 方案一：SN 检索根目录；必填
+log_type = "auto"              # auto | etest(OA3) | etest | e-autotest | 海格旧测试2 | 海格旧测试3
+recursive = true
+
+[run]
+auto_start = false             # 改 true：启动即自动「检测→回传→倒计时关」
+countdown_sec = 3              # 完成后倒计时，归零自动关程序
+auto_close = true
+
+[upload]
+enabled = true
+dry_run = true                 # 先 true 演练（只组包不打网），无误后改 false
+types = ["etest(OA3)"]         # 参与回传的判型
+cli_path = ""                  # 空=程序目录下 intunehelper_cli.exe
+secret_key = ""                # 正式回传必填；本文件勿提交仓库
+args = "upload --stdin --secret-key ~secret_key~"
+timeout_sec = 60
+max_retries = 3
+
+[scheme]
+mode = "sn_dir"                # sn_dir=方案一(SN关联多文件) | single=方案二(单文件)
+sn = ""                        # 方案一：设备 SN（--sn 可覆盖）
+file = ""                      # 方案二：单文件路径（--file 可覆盖）
+"""
+
+
+def _write_default(path: str) -> bool:
+    """输出默认 toml；成功 True。已存在时不覆盖。"""
+    if os.path.exists(path):
+        return False
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(DEFAULT_TOML)
+        return True
+    except OSError:
+        return False
+
+
+def resolve_auto(ns: argparse.Namespace, app_dir: str) -> AutoRun:
+    """toml 不存在时输出一份默认模板，返回 enabled=False（GUI 模式，模板待编辑）。
+    显式 --config 缺失同样生成模板而非报错。CLI --sn/--file 覆盖并隐含方案。"""
     path = ns.config or os.path.join(app_dir, "findany.toml")
-    if not ns.config and not os.path.isfile(path):
-        return None
-    if ns.config and not os.path.isfile(path):
-        raise FileNotFoundError(f"TOML 配置不存在: {path}")
+    generated = False
+    if not os.path.isfile(path):
+        return AutoRun(enabled=False, generated=_write_default(path))
     auto = parse_auto(load_toml(path))
     if ns.sn:
         auto.sn, auto.scheme, auto.enabled = ns.sn, "sn_dir", True

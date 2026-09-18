@@ -5,6 +5,8 @@ dist/*
 !dist/findany.exe
 out/
 logs/
+findany.toml
+
 # 交付材料含 SecretKey 与明文 ProductKey/Hash，严禁入库（delivery-sop.md 第 6 条）
 doc/
 config.json

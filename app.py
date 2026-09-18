@@ -751,9 +751,10 @@ class MainWindow(QMainWindow):
         self._apply_cfg(cfg)
         self._auto_sn = cfg.filter_sn
         self._auto_file = cfg.filter_file
-        self._auto_pending = True
+        self._auto_pending = bool(getattr(auto, "enabled", False))
         scheme = "SN关联多文件" if cfg.filter_sn else ("单文件" if cfg.filter_file else "目录遍历")
-        self._push_log("info", f"自动化配置已加载（方案：{scheme}，dry-run={'开' if cfg.upload_dry_run else '关'}），即将自动开始…")
+        tail = "，即将自动开始…" if auto.auto_start else "（auto_start=false，手动点开始或改配置后自动跑）"
+        self._push_log("info", f"自动化配置已加载（方案：{scheme}，dry-run={'开' if cfg.upload_dry_run else '关'}{tail}")
         return True
 
     def _toggle_work_mode(self):
@@ -1098,8 +1099,14 @@ def main():
         try:
             ns = autoconfig.parse_args(sys.argv[1:])
             auto = autoconfig.resolve_auto(ns, APP_DIR)
-            if auto is not None and w.apply_auto(auto) and auto.auto_start:
-                QTimer.singleShot(300, w._start)   # 等 UI 布局稳定后自动开跑
+            if auto is not None:
+                if auto.generated:
+                    _toml_path = ns.config or os.path.join(APP_DIR, "findany.toml")
+                    _mark("default toml generated: " + _toml_path)
+                    w._push_log("ok", f"未找到 TOML 配置，已生成默认模板：{_toml_path}"
+                                      f"（编辑 root_dir / scheme 后把 run.auto_start 改为 true 即自动开跑）")
+                if w.apply_auto(auto) and auto.auto_start:
+                    QTimer.singleShot(300, w._start)   # 等 UI 布局稳定后自动开跑
         except SystemExit:
             raise
         except Exception:
