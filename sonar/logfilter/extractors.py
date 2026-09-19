@@ -388,11 +388,22 @@ def extract(path: str, text: str, log_type: Optional[LogType] = None) -> Dict:
 
 # ---------- 读文件（编码容错，与 sonar.scanner 降级序一致） ----------
 
-def read_text(path: str, max_mb: float = 20.0) -> str:
-    """读取全文；超限抛 ValueError；编码逐级降级，最终 errors=replace 兜底。"""
+READ_CHAINS = {
+    "auto": ("utf-8-sig", "utf-8", "gbk", "utf-16"),
+    "utf-8": ("utf-8-sig", "utf-8", "gbk"),
+    "gbk": ("gbk", "gb2312", "utf-8"),
+    "gb2312": ("gbk", "utf-8"),
+    "utf-16": ("utf-16", "utf-8-sig", "utf-8"),
+    "ascii": ("ascii", "latin-1", "utf-8"),
+    "latin-1": ("latin-1", "utf-8"),
+}
+
+
+def read_text(path: str, max_mb: float = 20.0, encoding: str = "auto") -> str:
+    """读取全文；超限抛 ValueError；编码链按 GUI「编码」选择降级，最终 errors=replace 兜底。"""
     if os.path.getsize(path) > max_mb * 1024 * 1024:
         raise ValueError("too_large")
-    for enc in ("utf-8-sig", "utf-8", "gbk", "utf-16"):
+    for enc in READ_CHAINS.get(encoding, READ_CHAINS["auto"]):
         try:
             with open(path, "r", encoding=enc, errors="strict") as fh:
                 return fh.read()

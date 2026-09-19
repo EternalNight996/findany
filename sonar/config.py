@@ -29,7 +29,6 @@ class SearchConfig:
     # ---------- 日志筛选 / 回传（work_mode="filter" 时生效） ----------
     work_mode: str = "scan"           # scan 通用扫描 | filter 日志筛选
     filter_log_type: str = "auto"     # auto | etest(OA3) | etest | e-autotest
-    filter_keep_logs: bool = True     # 提取成功日志留存到批次目录
     upload_enabled: bool = False      # 数据回传开关
     upload_types: str = "etest(OA3)"  # 自动模式下参与回传的判型（逗号分隔）；选定具体类型时以该类型为准
     upload_dry_run: bool = True       # dry-run：只组包校验，不调 CLI

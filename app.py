@@ -208,7 +208,8 @@ class FilterWorker(QThread):
             # 回传方案：SN 关联多文件（方案一）/ 单文件（方案二）
             file_list = None
             if self.cfg.filter_sn:
-                file_list = autoconfig.find_sn_logs(self.cfg.root_dir, self.cfg.filter_sn, self.cfg.recursive)
+                file_list = autoconfig.find_sn_logs(self.cfg.root_dir, self.cfg.filter_sn,
+                                                    self.cfg.recursive, self.cfg.extensions or ["log"])
                 if not file_list:
                     self.error.emit(f"未找到与 SN「{self.cfg.filter_sn}」关联的日志（{self.cfg.root_dir}）")
                     return
@@ -221,11 +222,12 @@ class FilterWorker(QThread):
                 out_dir=self.cfg.out_dir,
                 log_type=self.cfg.filter_log_type,
                 recursive=self.cfg.recursive,
-                extensions=["log"],   # 筛选模式固定 .log（避免卷入 csv/json 采样文件）
+                extensions=self.cfg.extensions or ["log"],   # 扩展名共享（GUI 可控，建议 log）
+                encoding=self.cfg.encoding,
                 file_list=file_list,
                 max_file_mb=self.cfg.max_file_mb,
                 threads=self.cfg.threads,
-                keep_logs=self.cfg.filter_keep_logs,
+                keep_logs=self.cfg.copy_files,       # 选项「将命中文件复制到 out」（共享）
                 upload_enabled=self.cfg.upload_enabled,
                 upload_types=([self.cfg.filter_log_type] if self.cfg.filter_log_type != "auto"
                               else [t.strip() for t in self.cfg.upload_types.split(",") if t.strip()]),
@@ -488,14 +490,16 @@ class MainWindow(QMainWindow):
         dir_row.addWidget(browse)
         grid.addLayout(dir_row, 0, 1)
 
-        # 关键字
-        grid.addWidget(QLabel("关键字 / 字符串"), 1, 0)
+        # 关键字（仅通用扫描）
+        self._kw_label = QLabel("关键字 / 字符串")
+        grid.addWidget(self._kw_label, 1, 0)
         self.kw_edit = QLineEdit()
         self.kw_edit.setProperty("mono", "true")
         grid.addWidget(self.kw_edit, 1, 1)
 
-        # 模式
-        grid.addWidget(QLabel("匹配模式"), 2, 0)
+        # 模式（仅通用扫描）
+        self._mode_label = QLabel("匹配模式")
+        grid.addWidget(self._mode_label, 2, 0)
         mode_row = QHBoxLayout()
         mode_row.setSpacing(6)
         self.mode_inc = QPushButton("包含")
@@ -561,9 +565,9 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.out_edit, 7, 1)
 
         pv.addLayout(grid)
-        # 日志筛选模式下禁用的通用扫描专属控件
-        self._scan_only = [self.kw_edit, self.mode_inc, self.mode_exc, self.thread_slider,
-                           self.thread_spin, self.enc_combo, self.case_check, self.record_check]
+        # 日志筛选模式下隐藏的通用扫描专属控件（共享项：扫描/输出目录、线程数、编码、扩展名、递归、复制命中）
+        self._filter_hide = [self._kw_label, self.kw_edit, self._mode_label, self.mode_inc,
+                             self.mode_exc, self.case_check, self.record_check]
 
     def _build_filter_group(self, panel, pv: QVBoxLayout):
         """日志筛选 / 回传配置组（工作模式=日志筛选时显示）。"""
@@ -586,10 +590,8 @@ class MainWindow(QMainWindow):
         self.upload_check = QCheckBox("启用数据回传（逐台调第三方 CLI；自动模式下仅 etest(OA3)）")
         self.dry_check = QCheckBox("dry-run（只组包校验，不调 CLI）")
         self.dry_check.setChecked(True)
-        self.keep_check = QCheckBox("留存命中日志到批次目录")
-        self.keep_check.setChecked(True)
         self.autoclose_check = QCheckBox("完成后倒计时自动关闭程序")
-        for r, cb in enumerate((self.upload_check, self.dry_check, self.keep_check, self.autoclose_check), start=1):
+        for r, cb in enumerate((self.upload_check, self.dry_check, self.autoclose_check), start=1):
             g.addWidget(cb, r, 0, 1, 2)
 
         g.addWidget(QLabel("CLI 路径"), 5, 0)
@@ -763,8 +765,8 @@ class MainWindow(QMainWindow):
             self._auto_sn = ""
             self._auto_file = ""
         self.filter_group.setVisible(is_filter)
-        for w in getattr(self, "_scan_only", []):
-            w.setEnabled(not is_filter)
+        for w in getattr(self, "_filter_hide", []):
+            w.setVisible(not is_filter)   # 扫描专属项隐藏，界面干净；共享项保持可用
         self.up_row.setVisible(is_filter)
         self._set_table_mode(is_filter)
 
@@ -789,7 +791,6 @@ class MainWindow(QMainWindow):
         # 日志筛选 / 回传
         cfg.work_mode = self.work_combo.currentData() or "scan"
         cfg.filter_log_type = self.type_combo.currentData() or "auto"
-        cfg.filter_keep_logs = self.keep_check.isChecked()
         cfg.upload_enabled = self.upload_check.isChecked()
         cfg.upload_dry_run = self.dry_check.isChecked()
         cfg.upload_cli_path = self.cli_edit.text().strip()
@@ -822,7 +823,6 @@ class MainWindow(QMainWindow):
         self.work_combo.setCurrentIndex(idx_w if idx_w >= 0 else 0)
         idx_t = self.type_combo.findData(cfg.filter_log_type)
         self.type_combo.setCurrentIndex(idx_t if idx_t >= 0 else 0)
-        self.keep_check.setChecked(cfg.filter_keep_logs)
         self.upload_check.setChecked(cfg.upload_enabled)
         self.dry_check.setChecked(cfg.upload_dry_run)
         self.cli_edit.setText(cfg.upload_cli_path)

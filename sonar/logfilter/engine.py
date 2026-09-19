@@ -26,6 +26,7 @@ class FilterRunCfg:
     log_type: str = LogType.AUTO.value   # auto / etest(OA3) / etest / e-autotest
     recursive: bool = True
     extensions: List[str] = field(default_factory=lambda: ["log"])
+    encoding: str = "auto"               # GUI「编码」共享项（auto/utf-8/gbk/utf-16/ascii）
     max_file_mb: float = 20.0
     threads: int = 8
     keep_logs: bool = True               # 提取成功日志留存
@@ -124,7 +125,7 @@ class FilterEngine:
             st = os.stat(path)
             item["size"] = st.st_size
             item["mtime_str"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))
-            text = read_text(path, self.cfg.max_file_mb)
+            text = read_text(path, self.cfg.max_file_mb, self.cfg.encoding)
         except ValueError:
             item["error"] = "超大/超限跳过"
             return item

@@ -210,12 +210,12 @@ sn = "MT71I2GSF"
     check("toml 方案/dry-run/密钥", auto.scheme == "sn_dir" and auto.sn == "MT71I2GSF"
           and auto.dry_run is True and auto.secret_key == "sk-toml")
 
-    # 方案一：SN 关联检索（文件名+内容双通道）
-    hits = ac.find_sn_logs(str(SAMPLES), "MT71I2GSF-2HG260807250XAG0015")
+    # 方案一：SN 关联检索（文件名+内容双通道；扩展名默认 log）
+    hits = ac.find_sn_logs(str(SAMPLES), "MT71I2GSF-2HG260807250XAG0015", True, ["log"])
     check("SN 精确检索=1 份", len(hits) == 1 and hits[0].endswith("0015.log"))
-    hits6 = ac.find_sn_logs(str(SAMPLES), "MT71I2GSF")
+    hits6 = ac.find_sn_logs(str(SAMPLES), "MT71I2GSF", True, ["log"])
     check("SN 前缀检索=6 份", len(hits6) == 6)
-    hits_pk = ac.find_sn_logs(str(SAMPLES), "4362262499781")   # 仅内容含 PKID
+    hits_pk = ac.find_sn_logs(str(SAMPLES), "4362262499781", True, ["log"])   # 仅内容含 PKID
     check("SN 内容命中(文件名不含)", len(hits_pk) == 1 and hits_pk[0].endswith("0015.log"))
 
     # 方案一 引擎：file_list 通道（dry-run 全链）
@@ -275,6 +275,29 @@ def test_default_toml_generation():
               and auto4.countdown_sec == 5)
 
 
+# ---------- 2.9) 共享项生效：编码链 + SN 检索按扩展名过滤 ----------
+def test_shared_options():
+    import tempfile
+    from sonar.logfilter import autoconfig as ac
+    from sonar.logfilter.extractors import read_text
+
+    # 编码共享项：指定 gbk 链可解 GBK 字节；auto 链也能解
+    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as fh:
+        fh.write("系统SN=MT71I2GSF-GBK测试\nOA3=Send station:PASS".encode("gbk"))
+        p_gbk = fh.name
+    check("read_text 编码=gbk 生效", "MT71I2GSF-GBK测试" in read_text(p_gbk, encoding="gbk"))
+    check("read_text 编码=auto 兜底", "Send station:PASS" in read_text(p_gbk))
+    os.unlink(p_gbk)
+
+    # SN 检索按扩展名白名单过滤（共享「文件扩展名」）
+    hits_log = ac.find_sn_logs(str(SAMPLES), "MT71I2GSF", True, ["log"])
+    check("SN 检索 ext=log", len(hits_log) == 6 and all(h.endswith(".log") for h in hits_log))
+    hits_csv = ac.find_sn_logs(str(SAMPLES), "4362262499781", True, ["csv"])
+    check("SN 检索 ext=csv（内容命中采样文件）", len(hits_csv) >= 1 and hits_csv[0].endswith(".csv"))
+    hits_none = ac.find_sn_logs(str(SAMPLES), "MT71I2GSF", True, ["xlsx"])
+    check("SN 检索 ext 不匹配=0", len(hits_none) == 0)
+
+
 # ---------- 3) dry-run 与判定/重试（注入桩，不碰网） ----------
 def _fields_of_first():
     p = sample_files("Ift")[0]
@@ -332,6 +355,7 @@ def main() -> int:
     test_engine_dry_run()
     test_auto_toml()
     test_default_toml_generation()
+    test_shared_options()
     test_dry_run_and_judge()
     fails = [n for n, ok, _ in _results if not ok]
     print()

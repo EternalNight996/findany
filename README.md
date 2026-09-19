@@ -84,6 +84,7 @@ py -3 app.py
 | 配置项 | 说明 | 默认 |
 | --- | --- | --- |
 | 筛选类型 | 自动识别 / etest(OA3) / etest / e-autotest / 海格旧测试2 / 海格旧测试3 | 自动识别 |
+| 界面（筛选页） | 与通用扫描**共享**：扫描目录 / 输出目录 / 并发线程数 / 编码 / 文件扩展名 / 选项（递归子目录、将命中文件复制到 out=留存命中日志）；扫描专属项（关键字 / 匹配模式 / 大小写敏感 / 记录未命中）自动**隐藏** | — |
 | 判型规则 | 文件名 `AUTO2`→e-autotest；`IFT-START`/`SN` 前缀→海格旧测试2；`IFT/CLEAN/BURN/FFT/BATTERY/BFT*` 前缀→海格旧测试3；含 `OA3 inject Start`/`<HardwareHash>`→etest(OA3)；首行含 `: e-autotest`→e-autotest；尾部 `R<{`→etest；其余=未知（对齐 heg-admin-log `parse_path_type` 顺序） | — |
 | 启用数据回传 | 提取成功后逐台调第三方 CLI；自动模式下仅 etest(OA3) 参与回传 | 关 |
 | dry-run | 只组包校验四字段，不调 CLI、不碰网 | 开 |

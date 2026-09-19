@@ -54,6 +54,7 @@ class AutoRun:
     root_dir: str = ""
     log_type: str = "auto"
     recursive: bool = True
+    extensions: List[str] = field(default_factory=lambda: ["log"])
     scheme: str = "sn_dir"        # sn_dir | single
     sn: str = ""
     file: str = ""
@@ -151,6 +152,7 @@ def parse_auto(data: dict) -> AutoRun:
         root_dir=str(f.get("root_dir", "") or ""),
         log_type=str(f.get("log_type", "auto") or "auto"),
         recursive=bool(f.get("recursive", True)),
+        extensions=[str(x) for x in (f.get("extensions") or ["log"])],
         scheme=str(s.get("mode", "sn_dir") or "sn_dir"),
         sn=str(s.get("sn", "") or ""),
         file=str(s.get("file", "") or ""),
@@ -173,6 +175,7 @@ def apply_to_config(auto: AutoRun, cfg) -> None:
     cfg.root_dir = auto.root_dir or cfg.root_dir
     cfg.filter_log_type = auto.log_type or cfg.filter_log_type
     cfg.recursive = auto.recursive
+    cfg.extensions = auto.extensions or cfg.extensions
     cfg.upload_enabled = auto.upload_enabled
     cfg.upload_types = ",".join(auto.upload_types) if auto.upload_types else cfg.upload_types
     cfg.upload_dry_run = auto.dry_run
@@ -189,17 +192,21 @@ def apply_to_config(auto: AutoRun, cfg) -> None:
         cfg.filter_sn, cfg.filter_file = auto.sn, ""
 
 
-def find_sn_logs(root: str, sn: str, recursive: bool = True) -> List[str]:
-    """方案一：SN 关联日志检索。文件名或内容命中即纳入（多文件）。"""
+def find_sn_logs(root: str, sn: str, recursive: bool = True, extensions: Optional[List[str]] = None) -> List[str]:
+    """方案一：SN 关联日志检索。文件名或内容命中即纳入（多文件）。
+    extensions：扩展名白名单（共享项，如 ["log"]）；None/空 = 不限。"""
     out: List[str] = []
     if not sn or not os.path.isdir(root):
         return out
+    exts = {e.lower().lstrip(".") for e in extensions} if extensions else None
     needle = sn.encode("utf-8", errors="ignore")
     for cur, dirs, files in os.walk(root):
         if not recursive:
             dirs[:] = []
         for f in files:
-            if not f.lower().endswith(".log") or f.startswith("."):
+            if f.startswith("."):
+                continue
+            if exts is not None and f.rsplit(".", 1)[-1].lower() not in exts:
                 continue
             p = os.path.join(cur, f)
             if sn in f or sn.upper() in f.upper():
