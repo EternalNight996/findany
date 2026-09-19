@@ -99,6 +99,7 @@ py -3 app.py
 
 **产物**：`out/<YYYY-MM-DD_HH-MM>/` 下 `filter_result.xlsx`、`upload-result.csv`（回传审计）、命中日志留存。
 Excel 明细为**统一模板 35 列**（6 组逻辑排序：识别→设备→网络→OA3→原始→结果）+ 摘要 sheet；**批次自适应**：本批整列全空自动隐藏、列宽按内容自适应、冻结表头+序号/文件列（openpyxl 缺失降级 CSV）。
+另有**按判型动态生成的专属 sheet**（etest(OA3)/etest/e-autotest/海格旧测试2/海格旧测试3 各用各的列集，批内没有的类型不生成；未知类型只落总表兜底）。新判型在 `report.py TYPE_TEMPLATES` 登记即获得专属模板。
 
 **自校验**（对 doc/etest-log 6 份生产样例，71 条断言）：
 

@@ -52,6 +52,33 @@ def _col_width(key: str, header: str, samples) -> float:
         longest = max([len(header)] + [len(str(s)) for s in samples[:80]])
         base = min(max(longest + 2, 9), 40)
     return base
+
+
+# ---------- 类型专属模板：按判型动态生成 sheet（列集各取所需） ----------
+_IDENT = [("序号", "idx"), ("文件", "log_file"), ("相对路径", "rel_path"),
+          ("工位", "station"), ("判型", "detected_type"), ("SN", "sn")]
+_DEVICE = [("生产编号", "production_num"), ("系统SN", "system_sn"), ("板卡SN", "board_sn"),
+           ("UUID", "uuid"), ("BIOS版本", "bios_version"), ("OS激活码", "os_key"),
+           ("有线MAC", "lan"), ("无线MAC", "wifilan"), ("蓝牙MAC", "bluetooth")]
+_OA3_FULL = [("OA3结果", "oa3_result"), ("ProductKeyID", "product_key_id"), ("PKState", "product_key_state"),
+             ("ProductKey", "product_key"), ("Hash长度", "hardware_hash_len"),
+             ("Hash SHA-256", "hardware_hash_sha256"), ("注入开始", "inject_start_at"),
+             ("注入结束", "inject_end_at"), ("Baseboard", "baseboard_product")]
+_OA3_CORE = [("ProductKeyID", "product_key_id"), ("PKState", "product_key_state"),
+             ("ProductKey", "product_key")]
+_RAW = [("批次号", "mo_lot_no"), ("工位任务", "task_tag"), ("JSON状态", "json_state"),
+        ("JSON res_value", "json_res_value"), ("项目版本", "project_version")]
+_RESULT = [("提取状态", "extract_state"), ("回传状态", "upload_state"), ("退出码", "upload_code"),
+           ("request_id", "request_id"), ("回传错误", "upload_error")]
+
+TYPE_TEMPLATES = {
+    "etest(OA3)": _IDENT + _OA3_FULL + _RAW + _RESULT,
+    "etest": _IDENT + _RAW + _RESULT,
+    "e-autotest": _IDENT + _DEVICE + _RAW + _RESULT,
+    "海格旧测试3": _IDENT + _DEVICE + _OA3_CORE + _RAW + _RESULT,
+    "海格旧测试2": _IDENT + _DEVICE + _RAW + _RESULT,
+}
+# 未来新判型：先落「明细」总表兜底；在 TYPE_TEMPLATES 登记后即获得专属 sheet
 AUDIT_COLS = ["时间", "SN", "日志文件", "回传状态", "退出码", "resp_status", "request_id", "尝试次数", "耗时s", "错误"]
 
 
@@ -85,26 +112,37 @@ def export_filter_excel(path: str, rows: List[Dict], summary_text: str) -> str:
 
     Workbook, Font, PatternFill, Alignment, get_column_letter = wb
     book = Workbook()
+
+    def write_sheet(ws, cols, sheet_rows):
+        """写一个 sheet：表头样式 + 批次自适应（空列隐藏/宽度自适应）+ 冻结 C2。"""
+        hf, hfill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="4472C4")
+        ws.append([c for c, _ in cols])
+        for c in ws[1]:
+            c.font, c.fill = hf, hfill
+            c.alignment = Alignment(horizontal="center", vertical="center")
+        for i, r in enumerate(sheet_rows, start=1):
+            ws.append([i] + [_cell(r.get(k, "")) for _, k in cols[1:]])
+        for j, (header, key) in enumerate(cols, start=1):
+            letter = get_column_letter(j)
+            samples = [str(r.get(key, "")) for r in sheet_rows if r.get(key) not in (None, "")]
+            if not samples and key != "idx":
+                ws.column_dimensions[letter].hidden = True   # 本批未命中的字段整列隐藏
+                continue
+            ws.column_dimensions[letter].width = _col_width(key, header, samples)
+            ws.column_dimensions[letter].hidden = False
+        ws.freeze_panes = "C2"   # 冻结表头 + 序号/文件两列，横向滚动不迷路
+
+    # 1) 统一总表：所有类型兜底
     ws = book.active
     ws.title = "明细"
-    hf, hfill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="4472C4")
-    ws.append([c for c, _ in DETAIL_COLS])
-    for col in ws[1]:
-        col.font, col.fill = hf, hfill
-        col.alignment = Alignment(horizontal="center", vertical="center")
-    for i, r in enumerate(rows, start=1):
-        vals = [i] + [_cell(r.get(k, "")) for _, k in DETAIL_COLS[1:]]
-        ws.append(vals)
-    # 统一模板 + 批次自适应：整列全空 → 隐藏；宽度 = 固定偏好或按内容自适应
-    for j, (header, key) in enumerate(DETAIL_COLS, start=1):
-        letter = get_column_letter(j)
-        samples = [str(r.get(key, "")) for r in rows if r.get(key) not in (None, "")]
-        if not samples and key != "idx":
-            ws.column_dimensions[letter].hidden = True      # 本批未命中的字段整列隐藏
+    write_sheet(ws, DETAIL_COLS, rows)
+
+    # 2) 类型专属 sheet：有该类型文件才生成，列集各取所需
+    for type_name, cols in TYPE_TEMPLATES.items():
+        type_rows = [r for r in rows if r.get("detected_type") == type_name]
+        if not type_rows:
             continue
-        ws.column_dimensions[letter].width = _col_width(key, header, samples)
-        ws.column_dimensions[letter].hidden = False
-    ws.freeze_panes = "C2"   # 冻结表头 + 序号/文件两列，横向滚动不迷路
+        write_sheet(book.create_sheet(title=type_name[:31]), cols, type_rows)
 
     ws2 = book.create_sheet(title="摘要")
     ws2.append(["项目", "内容"])

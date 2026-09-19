@@ -345,6 +345,27 @@ def test_excel_template():
         check("SHA-256 列宽固定偏好", ws.column_dimensions[gcl(col["hardware_hash_sha256"])].width == 20)
         check("自适应宽度不超上限", ws.column_dimensions[gcl(col["sn"])].width <= 40)
 
+        # 类型专属 sheet：按判型动态生成
+        check("类型sheet按需生成", book.sheetnames == ["明细", "etest(OA3)", "海格旧测试3", "摘要"])
+        ws_oa3 = book["etest(OA3)"]
+        oa3_keys = [k for _, k in report.TYPE_TEMPLATES["etest(OA3)"]]
+        check("OA3 sheet 列序与模板一致", [c.value for c in ws_oa3[1]] == [h for h, _ in report.TYPE_TEMPLATES["etest(OA3)"]])
+        check("OA3 sheet 行数=1(仅OA3文件)", ws_oa3.max_row == 2)
+        check("OA3 sheet 含Hash列", "hardware_hash_sha256" in oa3_keys)
+        ws_hg = book["海格旧测试3"]
+        hg_keys = [k for _, k in report.TYPE_TEMPLATES["海格旧测试3"]]
+        check("海格sheet 含设备+PKID核", "board_sn" in hg_keys and "product_key_id" in hg_keys
+              and "hardware_hash_len" not in hg_keys)
+        check("海格sheet 行数=1", ws_hg.max_row == 2)
+        # 未知类型不生成 sheet，只在总表兜底
+        rows_u = rows + [{"log_file": "x.log", "detected_type": "未知", "extract_state": "失败"}]
+        out2 = os.path.join(td, "tpl2.xlsx")
+        export_filter_excel(out2, rows_u, [("总数", 3)])
+        book2 = openpyxl.load_workbook(out2)
+        check("未知类型不生成专属sheet", book2.sheetnames == ["明细", "etest(OA3)", "海格旧测试3", "摘要"])
+        check("未知行落在总表", book2["明细"].max_row == 4)
+
+
 
 # ---------- 3) dry-run 与判定/重试（注入桩，不碰网） ----------
 def _fields_of_first():
