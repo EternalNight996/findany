@@ -97,7 +97,8 @@ py -3 app.py
 
 **回传判定**（移植 etest-core `check_result` 思路，规则可配）：退出码 0 且 stdout `status∈{accepted, duplicate_accepted}` 双确认=成功；退出码 12=冲突转人工（黄）；其余=失败（红）。结果审计落 `out/<时间>/upload-result.csv`（不含 Hash 与 SecretKey）。
 
-**产物**：`out/<YYYY-MM-DD_HH-MM>/` 下 `filter_result.xlsx`（OA3 字段明细+摘要）、`upload-result.csv`（回传审计）、命中日志留存。
+**产物**：`out/<YYYY-MM-DD_HH-MM>/` 下 `filter_result.xlsx`、`upload-result.csv`（回传审计）、命中日志留存。
+Excel 明细为**统一模板 35 列**（6 组逻辑排序：识别→设备→网络→OA3→原始→结果）+ 摘要 sheet；**批次自适应**：本批整列全空自动隐藏、列宽按内容自适应、冻结表头+序号/文件列（openpyxl 缺失降级 CSV）。
 
 **自校验**（对 doc/etest-log 6 份生产样例，71 条断言）：
 

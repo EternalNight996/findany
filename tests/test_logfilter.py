@@ -298,6 +298,54 @@ def test_shared_options():
     check("SN 检索 ext 不匹配=0", len(hits_none) == 0)
 
 
+# ---------- 2.10) 统一 Excel 模板：分组列序 + 空列隐藏 + 宽度/冻结 ----------
+def test_excel_template():
+    from sonar.logfilter import report
+    from sonar.logfilter.report import export_filter_excel
+    import tempfile
+    openpyxl_ok = report._try_openpyxl() is not None
+    if not openpyxl_ok:
+        check("openpyxl 缺失跳过模板断言", True)
+        return
+
+    # 键集合不变（仅重排）：与旧 35 键逐一对应
+    old_keys = {"idx", "log_file", "dir_name", "rel_path", "station", "detected_type", "sn",
+                "oa3_result", "product_key_id", "product_key_state", "hardware_hash_len",
+                "hardware_hash_sha256", "inject_start_at", "inject_end_at", "product_key",
+                "baseboard_product", "mo_lot_no", "task_tag", "json_state", "json_res_value",
+                "project_version", "production_num", "system_sn", "board_sn", "uuid",
+                "bios_version", "os_key", "lan", "wifilan", "bluetooth", "extract_state",
+                "upload_state", "upload_code", "request_id", "upload_error"}
+    check("模板 35 键集合不变", {k for _, k in report.DETAIL_COLS} == old_keys)
+    check("分组顺序: 设备紧随识别", [k for _, k in report.DETAIL_COLS][:12]
+          == ["idx", "log_file", "dir_name", "rel_path", "station", "detected_type",
+              "sn", "production_num", "system_sn", "board_sn", "uuid", "bios_version"])
+
+    rows = [{"log_file": "0015.log", "sn": "SN0015", "detected_type": "etest(OA3)",
+             "extract_state": "成功", "upload_state": "dry_run",
+             "hardware_hash_sha256": "A" * 64},
+            {"log_file": "BURN.log", "sn": "SNBURN", "detected_type": "海格旧测试3",
+             "extract_state": "成功", "lan": "AA-BB-CC-DD-EE-01"}]
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "tpl.xlsx")
+        export_filter_excel(out, rows, [("总数", 2)])
+        import openpyxl
+        book = openpyxl.load_workbook(out)
+        ws = book["明细"]
+        headers = [c.value for c in ws[1]]
+        assert headers == [h for h, _ in report.DETAIL_COLS]   # 列序与模板一致
+        col = {k: i + 1 for i, (_, k) in enumerate(report.DETAIL_COLS)}   # 字段键 → 列号
+        from openpyxl.utils import get_column_letter as gcl
+        hidden = lambda k: ws.column_dimensions[gcl(col[k])].hidden
+        check("全空列隐藏(蓝牙MAC/PKID/回传错误)", hidden("bluetooth") and hidden("product_key_id")
+              and hidden("upload_error"))
+        check("非空列可见(SN/判型/有线MAC)", not hidden("sn") and not hidden("detected_type")
+              and not hidden("lan"))
+        check("冻结 C2(表头+序号/文件)", ws.freeze_panes == "C2")
+        check("SHA-256 列宽固定偏好", ws.column_dimensions[gcl(col["hardware_hash_sha256"])].width == 20)
+        check("自适应宽度不超上限", ws.column_dimensions[gcl(col["sn"])].width <= 40)
+
+
 # ---------- 3) dry-run 与判定/重试（注入桩，不碰网） ----------
 def _fields_of_first():
     p = sample_files("Ift")[0]
@@ -356,6 +404,7 @@ def main() -> int:
     test_auto_toml()
     test_default_toml_generation()
     test_shared_options()
+    test_excel_template()
     test_dry_run_and_judge()
     fails = [n for n, ok, _ in _results if not ok]
     print()

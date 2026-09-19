@@ -14,22 +14,44 @@ from typing import Dict, List
 
 _ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
+# 统一模板：35 列固定集合，按 6 组逻辑排序（识别→设备→网络→OA3→原始→结果）。
+# 导出时「整列全空自动隐藏」——模板统一，视图按批次自适应。
 DETAIL_COLS = [
+    # 识别
     ("序号", "idx"), ("文件", "log_file"), ("目录", "dir_name"), ("相对路径", "rel_path"),
-    ("工位", "station"), ("判型", "detected_type"), ("SN", "sn"),
-    ("OA3结果", "oa3_result"), ("ProductKeyID", "product_key_id"), ("PKState", "product_key_state"),
-    ("Hash长度", "hardware_hash_len"), ("Hash SHA-256", "hardware_hash_sha256"),
-    ("注入开始", "inject_start_at"), ("注入结束", "inject_end_at"), ("ProductKey", "product_key"),
-    ("Baseboard", "baseboard_product"), ("批次号", "mo_lot_no"), ("工位任务", "task_tag"),
-    ("JSON状态", "json_state"), ("JSON res_value", "json_res_value"),
-    ("项目版本", "project_version"),
-    ("生产编号", "production_num"), ("系统SN", "system_sn"), ("板卡SN", "board_sn"),
+    ("工位", "station"), ("判型", "detected_type"),
+    # 设备
+    ("SN", "sn"), ("生产编号", "production_num"), ("系统SN", "system_sn"), ("板卡SN", "board_sn"),
     ("UUID", "uuid"), ("BIOS版本", "bios_version"), ("OS激活码", "os_key"),
+    # 网络
     ("有线MAC", "lan"), ("无线MAC", "wifilan"), ("蓝牙MAC", "bluetooth"),
+    # OA3
+    ("OA3结果", "oa3_result"), ("ProductKeyID", "product_key_id"), ("PKState", "product_key_state"),
+    ("ProductKey", "product_key"), ("Hash长度", "hardware_hash_len"), ("Hash SHA-256", "hardware_hash_sha256"),
+    ("注入开始", "inject_start_at"), ("注入结束", "inject_end_at"),
+    ("Baseboard", "baseboard_product"), ("批次号", "mo_lot_no"), ("工位任务", "task_tag"),
+    # 原始
+    ("JSON状态", "json_state"), ("JSON res_value", "json_res_value"), ("项目版本", "project_version"),
+    # 结果
     ("提取状态", "extract_state"),
     ("回传状态", "upload_state"), ("退出码", "upload_code"), ("request_id", "request_id"),
     ("回传错误", "upload_error"),
 ]
+
+# 固定宽度偏好（未列出的按内容自适应，上限 40）
+COL_WIDTHS = {
+    "idx": 6, "log_file": 42, "dir_name": 10, "rel_path": 46, "detected_type": 14,
+    "sn": 34, "system_sn": 34, "production_num": 34, "uuid": 38, "os_key": 30,
+    "hardware_hash_sha256": 20, "product_key": 30, "request_id": 22, "upload_error": 40,
+}
+
+
+def _col_width(key: str, header: str, samples) -> float:
+    base = COL_WIDTHS.get(key)
+    if base is None:
+        longest = max([len(header)] + [len(str(s)) for s in samples[:80]])
+        base = min(max(longest + 2, 9), 40)
+    return base
 AUDIT_COLS = ["时间", "SN", "日志文件", "回传状态", "退出码", "resp_status", "request_id", "尝试次数", "耗时s", "错误"]
 
 
@@ -73,9 +95,16 @@ def export_filter_excel(path: str, rows: List[Dict], summary_text: str) -> str:
     for i, r in enumerate(rows, start=1):
         vals = [i] + [_cell(r.get(k, "")) for _, k in DETAIL_COLS[1:]]
         ws.append(vals)
-    for i, wdt in enumerate([6, 42, 10, 46, 8, 12, 34, 18, 16, 9, 9, 68, 22, 22, 30, 14, 20, 10, 10, 18, 18, 10, 10, 8, 40, 40], start=1):
-        ws.column_dimensions[get_column_letter(i)].width = wdt
-    ws.freeze_panes = "A2"
+    # 统一模板 + 批次自适应：整列全空 → 隐藏；宽度 = 固定偏好或按内容自适应
+    for j, (header, key) in enumerate(DETAIL_COLS, start=1):
+        letter = get_column_letter(j)
+        samples = [str(r.get(key, "")) for r in rows if r.get(key) not in (None, "")]
+        if not samples and key != "idx":
+            ws.column_dimensions[letter].hidden = True      # 本批未命中的字段整列隐藏
+            continue
+        ws.column_dimensions[letter].width = _col_width(key, header, samples)
+        ws.column_dimensions[letter].hidden = False
+    ws.freeze_panes = "C2"   # 冻结表头 + 序号/文件两列，横向滚动不迷路
 
     ws2 = book.create_sheet(title="摘要")
     ws2.append(["项目", "内容"])
