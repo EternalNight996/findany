@@ -427,21 +427,17 @@ class MainWindow(QMainWindow):
         sub = QLabel(APP_NAME, objectName="sub")
         self.theme_btn = QPushButton("浅色")
         self.theme_btn.setObjectName("ghost")
-        self.cfg_btn = QPushButton("收起配置")
-        self.cfg_btn.setObjectName("ghost")
         log_btn = QPushButton("日志")
         log_btn.setObjectName("ghost")
         open_btn = QPushButton("打开输出目录")
         open_btn.setObjectName("ghost")
         self.theme_btn.clicked.connect(self._toggle_theme)
-        self.cfg_btn.clicked.connect(self._toggle_panel)
         log_btn.clicked.connect(self._open_log)
         open_btn.clicked.connect(self._open_outdir)
         tl.addWidget(brand)
         tl.addWidget(sub)
         tl.addStretch(1)
         tl.addWidget(self.theme_btn)
-        tl.addWidget(self.cfg_btn)
         tl.addWidget(log_btn)
         tl.addWidget(open_btn)
         root.addWidget(top)
@@ -459,10 +455,25 @@ class MainWindow(QMainWindow):
         pv.setContentsMargins(14, 12, 14, 12)
         pv.setSpacing(10)
 
+        head = QHBoxLayout()
         h2 = QLabel("扫描配置", objectName="h2")
-        pv.addWidget(h2)
-        self._build_config(panel, pv)
-        self._build_filter_group(panel, pv)
+        head.addWidget(h2)
+        head.addStretch(1)
+        self.fold_btn = QPushButton("收")          # 收/展：两字表达
+        self.fold_btn.setObjectName("ghost")
+        self.fold_btn.setFixedWidth(34)
+        self.fold_btn.setToolTip("收起 / 展开配置")
+        self.fold_btn.clicked.connect(self._toggle_panel)
+        head.addWidget(self.fold_btn)
+        pv.addLayout(head)
+
+        self._panel_content = QWidget()
+        cv = QVBoxLayout(self._panel_content)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(10)
+        self._build_config(panel, cv)
+        self._build_filter_group(panel, cv)
+        pv.addWidget(self._panel_content)
         pv.addStretch(1)
         bl.addWidget(panel)
 
@@ -896,10 +907,10 @@ class MainWindow(QMainWindow):
         self._rerender_log()
 
     def _toggle_panel(self):
-        """收起/展开左侧配置面板：给结果区腾位；再点恢复。"""
-        vis = self.panel.isVisible()
-        self.panel.setVisible(not vis)
-        self.cfg_btn.setText("展开配置" if vis else "收起配置")
+        """折叠/展开配置内容（标题行常驻）：「收」收起、「展」展开。"""
+        vis = self._panel_content.isVisible()
+        self._panel_content.setVisible(not vis)
+        self.fold_btn.setText("展" if vis else "收")
 
     def _toggle_theme(self):
         self.dark = not self.dark
