@@ -252,5 +252,6 @@ findany/
 | 日志标准 | CLI/TOML 自动化→logs/findany.log；GUI→logs/findany-gui.log（启动时按模式路由，5MB 轮转）；旧 run/startup/crash 散文件并入 | 双模式端到端：cli 模式自退出且仅 findany.log；gui 模式仅 findany-gui.log |
 | 回传收尾 | 真传全部成功→界面 PASS+倒计时关；有失败/冲突→FAIL+弹窗列异常设备、不关；dry-run/未启用维持原行为 | GUI 五场景冒烟（桩注入 run_upload） |
 | 配置保存 | 新增「保存配置」按钮（绿色已保存✓闪烁1.2s/失败红）+ closeEvent 兜底落盘 | 保存/关窗双通道冒烟 |
+| toml 同步 | 保存按钮双写 config.json + findany.toml：按节合并（受管键改值/缺失追加），保留注释与 run.auto_start；tomllib 往返一致 | 8 断言 + 按钮联动冒烟 |
 | 自动化交互 | auto_pending 时完成不弹询问框；auto_close=false 保持界面 | GUI 双方案离屏冒烟 |
 

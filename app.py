@@ -923,11 +923,17 @@ class MainWindow(QMainWindow):
         self.save_btn.setStyleSheet("")
 
     def _save_cfg_now(self):
-        """手动保存当前界面配置（不依赖点开始）。"""
+        """手动保存当前界面配置（不依赖点开始）：config.json + findany.toml 双写。"""
         try:
-            save_config(APP_DIR, self._collect_cfg())
+            cfg = self._collect_cfg()
+            save_config(APP_DIR, cfg)
+            try:
+                autoconfig.sync_toml(os.path.join(APP_DIR, "findany.toml"), cfg)
+                toml_msg = "，findany.toml 已同步"
+            except Exception as e2:
+                toml_msg = f"，toml 同步失败：{e2}"
             self._flash_save_btn(True)
-            self._push_log("ok", "配置已保存到 config.json")
+            self._push_log("ok", "配置已保存到 config.json" + toml_msg)
         except Exception as e:
             self._flash_save_btn(False)
             self._push_log("err", f"配置保存失败：{e}")

@@ -367,6 +367,52 @@ def test_excel_template():
 
 
 
+# ---------- 2.11) 保存配置 → toml 同步（合并写，注释/auto_start 保留） ----------
+def test_toml_sync():
+    import tempfile
+    from sonar.logfilter import autoconfig as ac
+    from sonar.config import SearchConfig
+
+    toml = """# 手工注释头
+[filter]
+root_dir = "D:\\old"          # 扫描目录注释
+[run]
+auto_start = true              # 自动化开关不动
+countdown_sec = 30
+[upload]
+dry_run = true
+[scheme]
+mode = "sn_dir"
+sn = "OLD-SN"
+"""
+    td = tempfile.mkdtemp(); p = os.path.join(td, "findany.toml")
+    open(p, "w", encoding="utf-8").write(toml)
+    cfg = SearchConfig()
+    cfg.root_dir = "F:\\logs\\new"
+    cfg.filter_countdown = 3
+    cfg.filter_auto_close = False
+    cfg.upload_dry_run = False
+    cfg.upload_secret_key = "sk-abc"
+    cfg.filter_sn = "MT71-0017"
+    ac.sync_toml(p, cfg)
+    raw = open(p, encoding="utf-8").read()
+    d = tomllib.loads(raw)
+    check("同步: 注释保留", "# 手工注释头" in raw and "# 扫描目录注释" in raw)
+    check("同步: auto_start 未动", d["run"]["auto_start"] is True)
+    check("同步: 路径字面量串更新", d["filter"]["root_dir"] == "F:\\logs\\new")
+    check("同步: 倒计时/关窗", d["run"]["countdown_sec"] == 3 and d["run"]["auto_close"] is False)
+    check("同步: dry_run/secret_key 追加", d["upload"]["dry_run"] is False
+          and d["upload"].get("secret_key") == "sk-abc")
+    check("同步: SN 更新", d["scheme"]["sn"] == "MT71-0017")
+    p2 = os.path.join(td, "sub", "new.toml")
+    ac.sync_toml(p2, cfg)
+    d2 = tomllib.loads(open(p2, encoding="utf-8").read())
+    check("缺失 toml 生成并同步", d2["filter"]["root_dir"] == "F:\\logs\\new")
+    cfg2 = SearchConfig(); ac.apply_to_config(ac.parse_auto(ac.load_toml(p)), cfg2)
+    check("同步后 GUI 侧可还原", cfg2.root_dir == "F:\\logs\\new" and cfg2.filter_sn == "MT71-0017"
+          and cfg2.upload_dry_run is False)
+
+
 # ---------- 3) dry-run 与判定/重试（注入桩，不碰网） ----------
 def _fields_of_first():
     p = sample_files("Ift")[0]
@@ -426,6 +472,7 @@ def main() -> int:
     test_default_toml_generation()
     test_shared_options()
     test_excel_template()
+    test_toml_sync()
     test_dry_run_and_judge()
     fails = [n for n, ok, _ in _results if not ok]
     print()

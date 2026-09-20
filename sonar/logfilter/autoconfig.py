@@ -192,6 +192,86 @@ def apply_to_config(auto: AutoRun, cfg) -> None:
         cfg.filter_sn, cfg.filter_file = auto.sn, ""
 
 
+# ---------- GUI「保存配置」→ TOML 同步（按节合并，保留注释与 auto_start） ----------
+
+
+def _toml_value(v) -> str:
+    """Python 值 → TOML 右值。字符串优先用字面量串（Windows 路径免双反斜杠）。"""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(_toml_value(x) for x in v) + "]"
+    s = str(v)
+    if "'" not in s and "\n" not in s:
+        return f"'{s}'"                     # 字面量串：路径/密钥原样
+    e = s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return f'"{e}"'
+
+
+_TOML_MANAGED = {
+    "filter": {"root_dir": "root_dir", "log_type": "filter_log_type", "recursive": "recursive",
+               "extensions": "extensions"},
+    "run": {"countdown_sec": "filter_countdown", "auto_close": "filter_auto_close"},
+    "upload": {"enabled": "upload_enabled", "dry_run": "upload_dry_run", "types": "upload_types",
+               "cli_path": "upload_cli_path", "secret_key": "upload_secret_key", "args": "upload_args",
+               "timeout_sec": "upload_timeout", "max_retries": "upload_retries"},
+    "scheme": {"mode": "_scheme_mode", "sn": "filter_sn", "file": "filter_file"},
+}
+
+
+def sync_toml(path: str, cfg) -> str:
+    """把 GUI 配置合并回 toml：受管键改右值/缺则追加，保留注释与未管键（如 run.auto_start）。
+    文件不存在则先落默认模板。返回路径。"""
+    if not os.path.isfile(path):
+        _write_default(path)
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.read().split("\n")
+    # cfg → 受管值表（scheme.mode 由 sn/file 推导）
+    vals = {}
+    for section, keys in _TOML_MANAGED.items():
+        for tk, ck in keys.items():
+            if tk == "mode":
+                vals[(section, tk)] = "single" if getattr(cfg, "filter_file", "") else "sn_dir"
+            elif tk == "types":
+                vals[(section, tk)] = [t.strip() for t in str(getattr(cfg, ck, "")).split(",") if t.strip()]
+            else:
+                vals[(section, tk)] = getattr(cfg, ck, "")
+    section = ""
+    out = []
+    written = set()
+    last_idx = {}          # 节名 → out 中该节最后一行索引
+    for ln in lines:
+        s = ln.strip()
+        if s.startswith("[") and s.endswith("]"):
+            section = s[1:-1].strip()
+        if "=" in s and not s.startswith("#"):
+            key = s.split("=", 1)[0].strip()
+            if (section, key) in vals:
+                comment = ""
+                h = s.find("#", s.find("="))
+                if h > 0:
+                    comment = "  " + s[h:]
+                out.append(f"{key} = {_toml_value(vals[(section, key)])}{comment}")
+                written.add((section, key))
+                last_idx[section] = len(out) - 1
+                continue
+        out.append(ln)
+        if section:
+            last_idx[section] = len(out) - 1
+    # 缺失的受管键：插入对应节内（自下而上插，索引不漂移）
+    missing = {}
+    for (sec, key), v in vals.items():
+        if (sec, key) not in written and sec in last_idx:
+            missing.setdefault(sec, []).append(f"{key} = {_toml_value(v)}")
+    for sec in sorted(missing, key=lambda x: last_idx.get(x, 0), reverse=True):
+        out[last_idx[sec] + 1: last_idx[sec] + 1] = missing[sec]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(out))
+    return path
+
+
 def find_sn_logs(root: str, sn: str, recursive: bool = True, extensions: Optional[List[str]] = None) -> List[str]:
     """方案一：SN 关联日志检索。文件名或内容命中即纳入（多文件）。
     extensions：扩展名白名单（共享项，如 ["log"]）；None/空 = 不限。"""
