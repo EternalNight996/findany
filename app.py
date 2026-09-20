@@ -508,11 +508,11 @@ class MainWindow(QMainWindow):
         self.dir_edit = QLineEdit()
         self.dir_edit.setProperty("mono", "true")
         self.dir_edit.setPlaceholderText("目录或单个文件均可")
-        browse_dir = QPushButton("目录…")
-        browse_dir.setFixedWidth(52)
+        browse_dir = QPushButton("目录")
+        browse_dir.setFixedWidth(46)
         browse_dir.clicked.connect(self._pick_dir)
-        browse_file = QPushButton("文件…")
-        browse_file.setFixedWidth(52)
+        browse_file = QPushButton("文件")
+        browse_file.setFixedWidth(46)
         browse_file.clicked.connect(self._pick_file)
         dir_row.addWidget(self.dir_edit, 1)
         dir_row.addWidget(browse_dir)
@@ -766,16 +766,22 @@ class MainWindow(QMainWindow):
             self.table.setColumnWidth(c, w)
 
     # ---------- 配置读写 ----------
+    def _set_target(self, p: str):
+        """设置扫描目标并保证可看全：悬浮 tooltip 显示完整路径，光标置尾优先露出文件名。"""
+        self.dir_edit.setText(p)
+        self.dir_edit.setToolTip(p)
+        self.dir_edit.setCursorPosition(len(p))
+
     def _pick_file(self):
         p, _ = QFileDialog.getOpenFileName(self, "选择扫描文件", self.dir_edit.text() or APP_DIR,
                                            "日志/文本 (*.log *.txt *.csv *.md *.json *.xml *.ini);;全部文件 (*)")
         if p:
-            self.dir_edit.setText(p)
+            self._set_target(p)
 
     def _pick_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择扫描目录", self.dir_edit.text() or ".")
         if d:
-            self.dir_edit.setText(d)
+            self._set_target(d)
 
     def _pick_cli(self):
         f, _ = QFileDialog.getOpenFileName(self, "选择回传 CLI", self.cli_edit.text() or APP_DIR,
@@ -849,7 +855,7 @@ class MainWindow(QMainWindow):
         return cfg
 
     def _apply_cfg(self, cfg: SearchConfig):
-        self.dir_edit.setText(cfg.root_dir)
+        self._set_target(cfg.root_dir)
         self.kw_edit.setText(cfg.keyword)
         self._set_mode(cfg.mode)
         self.thread_spin.setValue(cfg.threads)
