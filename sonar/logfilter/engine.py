@@ -147,6 +147,7 @@ class FilterEngine:
             item.update({k: fields.get(k, "") for k in
                          ("log_file", "station", "sn", "oa3_result", "product_key_id",
                           "product_key_state", "hardware_hash_len", "hardware_hash_sha256",
+                          "hardware_hash",
                           "inject_start_at", "inject_end_at", "product_key",
                           "baseboard_product", "mo_lot_no", "task_tag", "json_state",
                           "json_res_value", "project_version",

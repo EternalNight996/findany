@@ -311,19 +311,19 @@ def test_excel_template():
     # 键集合不变（仅重排）：与旧 35 键逐一对应
     old_keys = {"idx", "log_file", "dir_name", "rel_path", "station", "detected_type", "sn",
                 "oa3_result", "product_key_id", "product_key_state", "hardware_hash_len",
-                "hardware_hash_sha256", "inject_start_at", "inject_end_at", "product_key",
+                "hardware_hash_sha256", "hardware_hash", "inject_start_at", "inject_end_at", "product_key",
                 "baseboard_product", "mo_lot_no", "task_tag", "json_state", "json_res_value",
                 "project_version", "production_num", "system_sn", "board_sn", "uuid",
                 "bios_version", "os_key", "lan", "wifilan", "bluetooth", "extract_state",
                 "upload_state", "upload_code", "request_id", "upload_error"}
-    check("模板 35 键集合不变", {k for _, k in report.DETAIL_COLS} == old_keys)
+    check("模板 36 键集合(增HardwareHash)", {k for _, k in report.DETAIL_COLS} == old_keys)
     check("分组顺序: 设备紧随识别", [k for _, k in report.DETAIL_COLS][:12]
           == ["idx", "log_file", "dir_name", "rel_path", "station", "detected_type",
               "sn", "production_num", "system_sn", "board_sn", "uuid", "bios_version"])
 
     rows = [{"log_file": "0015.log", "sn": "SN0015", "detected_type": "etest(OA3)",
              "extract_state": "成功", "upload_state": "dry_run",
-             "hardware_hash_sha256": "A" * 64},
+             "hardware_hash_sha256": "A" * 64, "hardware_hash": "H" * 4000},
             {"log_file": "BURN.log", "sn": "SNBURN", "detected_type": "海格旧测试3",
              "extract_state": "成功", "lan": "AA-BB-CC-DD-EE-01"}]
     with tempfile.TemporaryDirectory() as td:
@@ -344,6 +344,10 @@ def test_excel_template():
         check("冻结 C2(表头+序号/文件)", ws.freeze_panes == "C2")
         check("SHA-256 列宽固定偏好", ws.column_dimensions[gcl(col["hardware_hash_sha256"])].width == 20)
         check("自适应宽度不超上限", ws.column_dimensions[gcl(col["sn"])].width <= 40)
+        check("HardwareHash 本体列可见且全值在格", not hidden("hardware_hash")
+              and ws.cell(row=2, column=col["hardware_hash"]).value == "H" * 4000)
+        check("OA3 专属sheet含HardwareHash键", "hardware_hash" in report.TYPE_TEMPLATES["etest(OA3)"][0:1]
+              or "hardware_hash" in [k for _, k in report.TYPE_TEMPLATES["etest(OA3)"]])
 
         # 类型专属 sheet：按判型动态生成
         check("类型sheet按需生成", book.sheetnames == ["明细", "etest(OA3)", "海格旧测试3", "摘要"])

@@ -99,7 +99,7 @@ py -3 app.py
 **回传判定**（移植 etest-core `check_result` 思路，规则可配）：退出码 0 且 stdout `status∈{accepted, duplicate_accepted}` 双确认=成功；退出码 12=冲突转人工（黄）；其余=失败（红）。结果审计落 `out/<时间>/upload-result.csv`（不含 Hash 与 SecretKey）。
 
 **产物**：`out/<YYYY-MM-DD_HH-MM>/` 下 `filter_result.xlsx`、`upload-result.csv`（回传审计）、命中日志留存。
-Excel 明细为**统一模板 35 列**（6 组逻辑排序：识别→设备→网络→OA3→原始→结果）+ 摘要 sheet；**批次自适应**：本批整列全空自动隐藏、列宽按内容自适应、冻结表头+序号/文件列（openpyxl 缺失降级 CSV）。
+Excel 明细为**统一模板 36 列**（6 组逻辑排序：识别→设备→网络→OA3→原始→结果，OA3 组含 **HardwareHash 本体** 4000 字符全值）+ 摘要 sheet；**批次自适应**：本批整列全空自动隐藏、列宽按内容自适应、冻结表头+序号/文件列（openpyxl 缺失降级 CSV）。
 另有**按判型动态生成的专属 sheet**（etest(OA3)/etest/e-autotest/海格旧测试2/海格旧测试3 各用各的列集，批内没有的类型不生成；未知类型只落总表兜底）。新判型在 `report.py TYPE_TEMPLATES` 登记即获得专属模板。
 
 **自校验**（对 doc/etest-log 6 份生产样例，71 条断言）：

@@ -255,5 +255,6 @@ findany/
 | toml 同步 | 保存按钮双写 config.json + findany.toml：按节合并（受管键改值/缺失追加），保留注释与 run.auto_start；tomllib 往返一致 | 8 断言 + 按钮联动冒烟 |
 | 空数据拦截 | 扫描 0 文件或提取 0 条 → FAIL 红标 + 弹窗拦截：不判成功、不倒计时不关（自动化空跑必被看到） | 空目录/对照批次冒烟 |
 | 自开始扫描 | 工具栏「自开始扫描」勾选随 config.json 持久化；无 TOML 自动化时启动即自动开跑 | 勾选落盘断言 |
+| HardwareHash 落表 | 明细/OA3 专属 sheet 增列 HardwareHash 本体（4000 字符全值，列宽锁 20）；修引擎导出字段拷贝清单缺项 | 真批次双 sheet 全值断言 |
 | 自动化交互 | auto_pending 时完成不弹询问框；auto_close=false 保持界面 | GUI 双方案离屏冒烟 |
 

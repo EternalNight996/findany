@@ -28,6 +28,7 @@ DETAIL_COLS = [
     # OA3
     ("OA3结果", "oa3_result"), ("ProductKeyID", "product_key_id"), ("PKState", "product_key_state"),
     ("ProductKey", "product_key"), ("Hash长度", "hardware_hash_len"), ("Hash SHA-256", "hardware_hash_sha256"),
+    ("HardwareHash", "hardware_hash"),
     ("注入开始", "inject_start_at"), ("注入结束", "inject_end_at"),
     ("Baseboard", "baseboard_product"), ("批次号", "mo_lot_no"), ("工位任务", "task_tag"),
     # 原始
@@ -42,7 +43,7 @@ DETAIL_COLS = [
 COL_WIDTHS = {
     "idx": 6, "log_file": 42, "dir_name": 10, "rel_path": 46, "detected_type": 14,
     "sn": 34, "system_sn": 34, "production_num": 34, "uuid": 38, "os_key": 30,
-    "hardware_hash_sha256": 20, "product_key": 30, "request_id": 22, "upload_error": 40,
+    "hardware_hash_sha256": 20, "hardware_hash": 20, "product_key": 30, "request_id": 22, "upload_error": 40,
 }
 
 
@@ -62,8 +63,8 @@ _DEVICE = [("生产编号", "production_num"), ("系统SN", "system_sn"), ("板�
            ("有线MAC", "lan"), ("无线MAC", "wifilan"), ("蓝牙MAC", "bluetooth")]
 _OA3_FULL = [("OA3结果", "oa3_result"), ("ProductKeyID", "product_key_id"), ("PKState", "product_key_state"),
              ("ProductKey", "product_key"), ("Hash长度", "hardware_hash_len"),
-             ("Hash SHA-256", "hardware_hash_sha256"), ("注入开始", "inject_start_at"),
-             ("注入结束", "inject_end_at"), ("Baseboard", "baseboard_product")]
+             ("Hash SHA-256", "hardware_hash_sha256"), ("HardwareHash", "hardware_hash"),
+             ("注入开始", "inject_start_at"), ("注入结束", "inject_end_at"), ("Baseboard", "baseboard_product")]
 _OA3_CORE = [("ProductKeyID", "product_key_id"), ("PKState", "product_key_state"),
              ("ProductKey", "product_key")]
 _RAW = [("批次号", "mo_lot_no"), ("工位任务", "task_tag"), ("JSON状态", "json_state"),
