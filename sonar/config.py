@@ -42,6 +42,7 @@ class SearchConfig:
     filter_auto_close: bool = False   # 倒计时归零自动关闭程序
     filter_sn: str = ""               # 方案一：SN 关联日志检索（多文件回传）
     filter_file: str = ""             # 方案二：单文件筛选回传
+    auto_start_scan: bool = False     # 启动即自动开始扫描/筛选（勾选持久化）
 
     def validate(self) -> List[str]:
         errs: List[str] = []

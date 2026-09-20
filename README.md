@@ -92,7 +92,8 @@ py -3 app.py
 | SecretKey | 存 `config.json`（已 gitignore，不进源码/日志，按交付 SOP 第 6 条） | 空 |
 | 参数模板 | 占位符 `~key~`：`~secret_key~` / `~payload~` / 提取字段；含 `~payload~` 走参数否则写 stdin | `upload --stdin --secret-key ~secret_key~` |
 | 超时 / 重试 | 单台 CLI 超时；退出码 21 自动重试（1/2/4s 退避），10/12/20/30 不重试 | 60s / 3 次 |
-| 倒计时自动关 | 完成后倒计时归零自动退出程序；弹窗可取消 / 延时 30s / 打开输出目录 | 3s，默认关 |
+| 倒计时自动关 | 完成后倒计时归零自动退出程序；弹窗可取消 / 延时 30s / 打开输出目录；**数据为空或回传异常时不关** | 3s，默认关 |
+| 自开始扫描 | 工具栏勾选「自开始扫描」（随配置保存）：下次启动程序自动开始扫描/筛选，无需点击 | 默认关 |
 | 回传方案 | 方案一 `sn_dir`：SN 关联日志（文件名或内容命中，**多文件**回传）；方案二 `single`：单文件筛选回传。由 TOML 配置或 CLI 参数指定 | — |
 
 **回传判定**（移植 etest-core `check_result` 思路，规则可配）：退出码 0 且 stdout `status∈{accepted, duplicate_accepted}` 双确认=成功；退出码 12=冲突转人工（黄）；其余=失败（红）。结果审计落 `out/<时间>/upload-result.csv`（不含 Hash 与 SecretKey）。

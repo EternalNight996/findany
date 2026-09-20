@@ -698,6 +698,8 @@ class MainWindow(QMainWindow):
         self.go_btn = QPushButton("开始扫描", objectName="primary")
         self.stop_btn = QPushButton("停止", objectName="stop")
         self.save_btn = QPushButton("保存配置")
+        self.autostart_check = QCheckBox("自开始扫描")
+        self.autostart_check.setToolTip("勾选后：下次启动程序自动开始扫描/筛选（随配置保存）")
         self.stop_btn.setEnabled(False)
         self.go_btn.clicked.connect(self._start)
         self.stop_btn.clicked.connect(self._stop)
@@ -705,6 +707,7 @@ class MainWindow(QMainWindow):
         tl.addWidget(self.go_btn)
         tl.addWidget(self.stop_btn)
         tl.addWidget(self.save_btn)
+        tl.addWidget(self.autostart_check)
         rv.addWidget(toolbar)
 
         # 回传进度行（日志筛选模式显示）
@@ -829,6 +832,7 @@ class MainWindow(QMainWindow):
         # TOML 自动化方案（SN 关联 / 单文件）：无对应控件，挂窗口属性回填
         cfg.filter_sn = getattr(self, "_auto_sn", "")
         cfg.filter_file = getattr(self, "_auto_file", "")
+        cfg.auto_start_scan = self.autostart_check.isChecked()
         return cfg
 
     def _apply_cfg(self, cfg: SearchConfig):
@@ -848,6 +852,7 @@ class MainWindow(QMainWindow):
         self.work_combo.setCurrentIndex(idx_w if idx_w >= 0 else 0)
         idx_t = self.type_combo.findData(cfg.filter_log_type)
         self.type_combo.setCurrentIndex(idx_t if idx_t >= 0 else 0)
+        self.autostart_check.setChecked(cfg.auto_start_scan)
         self.upload_check.setChecked(cfg.upload_enabled)
         self.dry_check.setChecked(cfg.upload_dry_run)
         self.cli_edit.setText(cfg.upload_cli_path)
@@ -1038,6 +1043,21 @@ class MainWindow(QMainWindow):
                              f"回传 成功 {summary.upload_ok} / 冲突 {summary.upload_conflict} / 失败 {summary.upload_fail}")
         self._last_output_dir = summary.batch_dir
         self._worker = None
+        # 数据为空：报错拦截——不判 PASS、不倒计时不关（自动化空跑必须有人看到）
+        if summary.total == 0 or summary.extracted == 0:
+            theme = "dark" if self.dark else "light"
+            self.up_text.setText(f"FAIL　数据为空（文件 {summary.total} / 提取 {summary.extracted}）")
+            self.up_text.setStyleSheet(f"color:{COLORS[theme]['err']};font-size:12px;font-weight:bold;")
+            self._push_log("err", f"数据为空拦截：目录 {cfg.root_dir} 内可处理日志为 0"
+                                  f"（文件 {summary.total}，提取 {summary.extracted}），程序保持打开")
+            if getattr(self, "_auto_pending", False) or cfg.filter_auto_close:
+                QMessageBox.warning(self, "数据为空",
+                                    f"未发现可处理的日志文件。\n\n扫描目录：{cfg.root_dir}\n"
+                                    f"（文件 {summary.total}，提取成功 {summary.extracted}）\n"
+                                    f"已拦截：不执行自动关闭，请检查目录/扩展名后重试。")
+            if self.isVisible():
+                self.log_dialog.show()
+            return
         # 回传收尾语义（真传时生效）：全部成功 → 界面 PASS + 倒计时关；
         # 有失败/冲突 → 弹窗提醒、不倒计时不关，程序保持打开待人工处理
         upload_on = cfg.upload_enabled and not cfg.upload_dry_run
@@ -1188,6 +1208,7 @@ def main():
         try:
             ns = autoconfig.parse_args(sys.argv[1:])
             auto = autoconfig.resolve_auto(ns, APP_DIR)
+            _auto_started = False
             if auto is not None:
                 if auto.generated:
                     _toml_path = ns.config or os.path.join(APP_DIR, "findany.toml")
@@ -1196,6 +1217,11 @@ def main():
                                       f"（编辑 root_dir / scheme 后把 run.auto_start 改为 true 即自动开跑）")
                 if w.apply_auto(auto) and auto.auto_start:
                     QTimer.singleShot(300, w._start)   # 等 UI 布局稳定后自动开跑
+                    _auto_started = True
+            if not _auto_started and w._collect_cfg().auto_start_scan:
+                _mark("auto start via checkbox")
+                w._push_log("info", "已勾选「自开始扫描」，即将自动开始…")
+                QTimer.singleShot(300, w._start)
         except SystemExit:
             raise
         except Exception:
