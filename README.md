@@ -159,6 +159,7 @@ file = ""                      # 方案二：单文件路径（--file 可覆盖�
 | 配置项 | 说明 | 默认值 |
 | --- | --- | --- |
 | `root_dir` | 扫描根目录 | 空 |
+| `scan_file` | 指定单个文件（GUI「扫描文件(可选)」）：非空时优先于扫描目录，两种工作模式通用 | 空 |
 | `keyword` | 要检索的关键字 | `IT6563` |
 | `mode` | `inc` 包含 / `exc` 不包含 | `inc` |
 | `threads` | 并发线程数 1~64 | `8` |
@@ -186,13 +187,12 @@ file = ""                      # 方案二：单文件路径（--file 可覆盖�
 
 ## 日志
 
-程序日志统一写入 `logs/` 目录（以项目名命名，`logs/` 已 gitignore）：
+程序日志统一写入 `logs/`（`logs/` 已 gitignore），按运行方式分文件（5MB 自动轮转）：
 
 ```
 logs/
- ├─ findany-startup.log   # 启动过程（main→窗口显示，用于定位启动失败）
- ├─ findany-run.log       # 每次扫描/操作的运行日志（超 5MB 自动轮换为 .1）
- └─ findany-crash.log     # 启动/运行异常堆栈
+ ├─ findany.log          # CLI / TOML 自动化运行
+ └─ findany-gui.log      # GUI 人工操作
 ```
 
 ## 一键打包 EXE

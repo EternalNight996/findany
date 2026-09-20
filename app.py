@@ -239,6 +239,8 @@ class FilterWorker(QThread):
                                       + "、".join(os.path.basename(p) for p in file_list))
             elif self.cfg.filter_file:
                 file_list = [self.cfg.filter_file]
+            elif self.cfg.scan_file:
+                file_list = [self.cfg.scan_file]   # 单文件模式（GUI「扫描文件」）
             rcfg = FilterRunCfg(
                 root_dir=self.cfg.root_dir,
                 out_dir=self.cfg.out_dir,
@@ -512,16 +514,34 @@ class MainWindow(QMainWindow):
         dir_row.addWidget(browse)
         grid.addLayout(dir_row, 0, 1)
 
+        # 单文件（可选；非空优先于目录，两种模式通用）
+        grid.addWidget(QLabel("扫描文件(可选)"), 1, 0)
+        sf_row = QHBoxLayout()
+        sf_row.setSpacing(6)
+        self.scan_file_edit = QLineEdit()
+        self.scan_file_edit.setProperty("mono", "true")
+        self.scan_file_edit.setPlaceholderText("指定单个文件；留空则按目录扫描")
+        sf_file = QPushButton("文件…")
+        sf_file.setFixedWidth(52)
+        sf_file.clicked.connect(self._pick_scan_file)
+        sf_clear = QPushButton("清除")
+        sf_clear.setFixedWidth(44)
+        sf_clear.clicked.connect(self.scan_file_edit.clear)
+        sf_row.addWidget(self.scan_file_edit, 1)
+        sf_row.addWidget(sf_file)
+        sf_row.addWidget(sf_clear)
+        grid.addLayout(sf_row, 1, 1)
+
         # 关键字（仅通用扫描）
         self._kw_label = QLabel("关键字 / 字符串")
-        grid.addWidget(self._kw_label, 1, 0)
+        grid.addWidget(self._kw_label, 2, 0)
         self.kw_edit = QLineEdit()
         self.kw_edit.setProperty("mono", "true")
-        grid.addWidget(self.kw_edit, 1, 1)
+        grid.addWidget(self.kw_edit, 2, 1)
 
         # 模式（仅通用扫描）
         self._mode_label = QLabel("匹配模式")
-        grid.addWidget(self._mode_label, 2, 0)
+        grid.addWidget(self._mode_label, 3, 0)
         mode_row = QHBoxLayout()
         mode_row.setSpacing(6)
         self.mode_inc = QPushButton("包含")
@@ -533,10 +553,10 @@ class MainWindow(QMainWindow):
             b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         mode_row.addWidget(self.mode_inc)
         mode_row.addWidget(self.mode_exc)
-        grid.addLayout(mode_row, 2, 1)
+        grid.addLayout(mode_row, 3, 1)
 
         # 线程
-        grid.addWidget(QLabel("并发线程数"), 3, 0)
+        grid.addWidget(QLabel("并发线程数"), 4, 0)
         thr_row = QHBoxLayout()
         thr_row.setSpacing(8)
         self.thread_slider = QSlider(Qt.Orientation.Horizontal)
@@ -547,25 +567,25 @@ class MainWindow(QMainWindow):
         self.thread_spin.valueChanged.connect(self.thread_slider.setValue)
         thr_row.addWidget(self.thread_slider, 1)
         thr_row.addWidget(self.thread_spin)
-        grid.addLayout(thr_row, 3, 1)
+        grid.addLayout(thr_row, 4, 1)
 
         # 扩展名
-        grid.addWidget(QLabel("文件扩展名"), 4, 0)
+        grid.addWidget(QLabel("文件扩展名"), 5, 0)
         self.ext_edit = QLineEdit()
         self.ext_edit.setProperty("mono", "true")
         self.ext_edit.setPlaceholderText("txt,log,csv,md,…（留空=全部）")
-        grid.addWidget(self.ext_edit, 4, 1)
+        grid.addWidget(self.ext_edit, 5, 1)
 
         # 编码
-        grid.addWidget(QLabel("编码"), 5, 0)
+        grid.addWidget(QLabel("编码"), 6, 0)
         self.enc_combo = QComboBox()
         for label, val in [("自动探测 (UTF-8 / GBK)", "auto"), ("UTF-8", "utf-8"),
                            ("GBK / GB2312", "gbk"), ("UTF-16", "utf-16"), ("ASCII", "ascii")]:
             self.enc_combo.addItem(label, val)
-        grid.addWidget(self.enc_combo, 5, 1)
+        grid.addWidget(self.enc_combo, 6, 1)
 
         # 选项
-        grid.addWidget(QLabel("选项"), 6, 0)
+        grid.addWidget(QLabel("选项"), 7, 0)
         opt_box = QWidget()
         ov = QVBoxLayout(opt_box)
         ov.setContentsMargins(0, 0, 0, 0)
@@ -578,13 +598,13 @@ class MainWindow(QMainWindow):
         self.record_check.setChecked(True)
         for cb in (self.case_check, self.rec_check, self.copy_check, self.record_check):
             ov.addWidget(cb)
-        grid.addWidget(opt_box, 6, 1)
+        grid.addWidget(opt_box, 7, 1)
 
         # 输出目录
-        grid.addWidget(QLabel("输出目录"), 7, 0)
+        grid.addWidget(QLabel("输出目录"), 8, 0)
         self.out_edit = QLineEdit()
         self.out_edit.setProperty("mono", "true")
-        grid.addWidget(self.out_edit, 7, 1)
+        grid.addWidget(self.out_edit, 8, 1)
 
         pv.addLayout(grid)
         # 日志筛选模式下隐藏的通用扫描专属控件（共享项：扫描/输出目录、线程数、编码、扩展名、递归、复制命中）
@@ -759,6 +779,12 @@ class MainWindow(QMainWindow):
             self.table.setColumnWidth(c, w)
 
     # ---------- 配置读写 ----------
+    def _pick_scan_file(self):
+        p, _ = QFileDialog.getOpenFileName(self, "选择扫描文件", self.dir_edit.text() or APP_DIR,
+                                           "日志/文本 (*.log *.txt *.csv *.md *.json *.xml *.ini);;全部文件 (*)")
+        if p:
+            self.scan_file_edit.setText(p)
+
     def _pick_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择扫描目录", self.dir_edit.text() or ".")
         if d:
@@ -805,6 +831,7 @@ class MainWindow(QMainWindow):
     def _collect_cfg(self) -> SearchConfig:
         cfg = SearchConfig()
         cfg.root_dir = self.dir_edit.text().strip()
+        cfg.scan_file = self.scan_file_edit.text().strip()
         cfg.keyword = self.kw_edit.text().strip()
         cfg.mode = "inc" if self.mode_inc.isChecked() else "exc"
         cfg.threads = self.thread_spin.value()
@@ -837,6 +864,7 @@ class MainWindow(QMainWindow):
 
     def _apply_cfg(self, cfg: SearchConfig):
         self.dir_edit.setText(cfg.root_dir)
+        self.scan_file_edit.setText(cfg.scan_file)
         self.kw_edit.setText(cfg.keyword)
         self._set_mode(cfg.mode)
         self.thread_spin.setValue(cfg.threads)

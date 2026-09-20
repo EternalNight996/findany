@@ -14,6 +14,7 @@ APP_NAME = "findany"
 class SearchConfig:
     """一次扫描的完整配置。"""
     root_dir: str = ""
+    scan_file: str = ""               # 单文件模式（非空时优先于 root_dir）
     keyword: str = "IT6563"
     mode: str = "inc"                 # 'inc' 包含 | 'exc' 不包含
     threads: int = 8                  # 并发线程 1..64
@@ -46,7 +47,10 @@ class SearchConfig:
 
     def validate(self) -> List[str]:
         errs: List[str] = []
-        if not self.root_dir or not os.path.isdir(self.root_dir):
+        if self.scan_file:
+            if not os.path.isfile(self.scan_file):
+                errs.append("扫描文件不存在")
+        elif not self.root_dir or not os.path.isdir(self.root_dir):
             errs.append("扫描目录不存在")
         if not (1 <= self.threads <= 64):
             errs.append("线程数需在 1~64 之间")

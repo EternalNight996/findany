@@ -233,7 +233,7 @@ class ScanEngine:
     def scan(self) -> Tuple[List[ScanItem], ScanSummary]:
         cfg = self.cfg
         t0 = time.time()
-        files = walk_files(cfg.root_dir, cfg.extensions, cfg.recursive)
+        files = [cfg.scan_file] if cfg.scan_file else walk_files(cfg.root_dir, cfg.extensions, cfg.recursive)
         # 排除输出目录（若输出在扫描根内，避免重复扫自己产物）
         out_abs = os.path.abspath(cfg.out_dir) if cfg.out_dir else ""
         if out_abs:
@@ -242,8 +242,9 @@ class ScanEngine:
         summary = ScanSummary(total_files=total, dir=cfg.root_dir)
         items: List[ScanItem] = []
 
-        self._on_log("info", "扫描目录：%s，共 %d 个文件，线程 %d，关键字「%s」，模式：%s" % (
-            cfg.root_dir, total, cfg.threads, cfg.keyword,
+        self._on_log("info", "%s，共 %d 个文件，线程 %d，关键字「%s」，模式：%s" % (
+            ("扫描文件：%s" % cfg.scan_file) if cfg.scan_file else ("扫描目录：%s" % cfg.root_dir),
+            total, cfg.threads, cfg.keyword,
             "包含" if cfg.mode == "inc" else "不包含"))
         self._progress(0, total, 0, 0, 0)
 
