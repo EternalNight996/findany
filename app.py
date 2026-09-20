@@ -239,8 +239,8 @@ class FilterWorker(QThread):
                                       + "、".join(os.path.basename(p) for p in file_list))
             elif self.cfg.filter_file:
                 file_list = [self.cfg.filter_file]
-            elif self.cfg.scan_file:
-                file_list = [self.cfg.scan_file]   # 单文件模式（GUI「扫描文件」）
+            elif os.path.isfile(self.cfg.root_dir):
+                file_list = [self.cfg.root_dir]    # 扫描目标为单文件
             rcfg = FilterRunCfg(
                 root_dir=self.cfg.root_dir,
                 out_dir=self.cfg.out_dir,
@@ -501,36 +501,23 @@ class MainWindow(QMainWindow):
         grid.setVerticalSpacing(8)
         grid.setHorizontalSpacing(10)
 
-        # 目录
-        grid.addWidget(QLabel("扫描目录"), 0, 0)
+        # 目录 / 单文件（二选一：指向目录按目录扫，指向文件按单文件处理）
+        grid.addWidget(QLabel("扫描目录/文件"), 0, 0)
         dir_row = QHBoxLayout()
         dir_row.setSpacing(6)
         self.dir_edit = QLineEdit()
         self.dir_edit.setProperty("mono", "true")
-        browse = QPushButton("…")
-        browse.setFixedWidth(30)
-        browse.clicked.connect(self._pick_dir)
+        self.dir_edit.setPlaceholderText("目录或单个文件均可")
+        browse_dir = QPushButton("目录…")
+        browse_dir.setFixedWidth(52)
+        browse_dir.clicked.connect(self._pick_dir)
+        browse_file = QPushButton("文件…")
+        browse_file.setFixedWidth(52)
+        browse_file.clicked.connect(self._pick_file)
         dir_row.addWidget(self.dir_edit, 1)
-        dir_row.addWidget(browse)
+        dir_row.addWidget(browse_dir)
+        dir_row.addWidget(browse_file)
         grid.addLayout(dir_row, 0, 1)
-
-        # 单文件（可选；非空优先于目录，两种模式通用）
-        grid.addWidget(QLabel("扫描文件(可选)"), 1, 0)
-        sf_row = QHBoxLayout()
-        sf_row.setSpacing(6)
-        self.scan_file_edit = QLineEdit()
-        self.scan_file_edit.setProperty("mono", "true")
-        self.scan_file_edit.setPlaceholderText("指定单个文件；留空则按目录扫描")
-        sf_file = QPushButton("文件…")
-        sf_file.setFixedWidth(52)
-        sf_file.clicked.connect(self._pick_scan_file)
-        sf_clear = QPushButton("清除")
-        sf_clear.setFixedWidth(44)
-        sf_clear.clicked.connect(self.scan_file_edit.clear)
-        sf_row.addWidget(self.scan_file_edit, 1)
-        sf_row.addWidget(sf_file)
-        sf_row.addWidget(sf_clear)
-        grid.addLayout(sf_row, 1, 1)
 
         # 关键字（仅通用扫描）
         self._kw_label = QLabel("关键字 / 字符串")
@@ -779,11 +766,11 @@ class MainWindow(QMainWindow):
             self.table.setColumnWidth(c, w)
 
     # ---------- 配置读写 ----------
-    def _pick_scan_file(self):
+    def _pick_file(self):
         p, _ = QFileDialog.getOpenFileName(self, "选择扫描文件", self.dir_edit.text() or APP_DIR,
                                            "日志/文本 (*.log *.txt *.csv *.md *.json *.xml *.ini);;全部文件 (*)")
         if p:
-            self.scan_file_edit.setText(p)
+            self.dir_edit.setText(p)
 
     def _pick_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择扫描目录", self.dir_edit.text() or ".")
@@ -831,7 +818,6 @@ class MainWindow(QMainWindow):
     def _collect_cfg(self) -> SearchConfig:
         cfg = SearchConfig()
         cfg.root_dir = self.dir_edit.text().strip()
-        cfg.scan_file = self.scan_file_edit.text().strip()
         cfg.keyword = self.kw_edit.text().strip()
         cfg.mode = "inc" if self.mode_inc.isChecked() else "exc"
         cfg.threads = self.thread_spin.value()
@@ -864,7 +850,6 @@ class MainWindow(QMainWindow):
 
     def _apply_cfg(self, cfg: SearchConfig):
         self.dir_edit.setText(cfg.root_dir)
-        self.scan_file_edit.setText(cfg.scan_file)
         self.kw_edit.setText(cfg.keyword)
         self._set_mode(cfg.mode)
         self.thread_spin.setValue(cfg.threads)

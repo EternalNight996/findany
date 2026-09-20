@@ -257,12 +257,12 @@ findany/
 | 自开始扫描 | 工具栏「自开始扫描」勾选随 config.json 持久化；无 TOML 自动化时启动即自动开跑 | 勾选落盘断言 |
 | HardwareHash 落表 | 明细/OA3 专属 sheet 增列 HardwareHash 本体（4000 字符全值，列宽锁 20）；修引擎导出字段拷贝清单缺项 | 真批次双 sheet 全值断言 |
 
-### 10.7 v1.8 增补：GUI 单文件扫描
+### 10.7 v1.8 增补：GUI 单文件扫描（定稿：单行双按钮）
 
 | 项 | 内容 | 验证 |
 |---|---|---|
-| 扫描文件行 | 共享区新增「扫描文件(可选)」：文件…选择/清除；非空优先于扫描目录（validate 校验存在性） | 持久化断言 |
-| 双模式通用 | 通用扫描：ScanEngine walk 旁路（关键字匹配照常）；日志筛选：FilterWorker 走 file_list 通道（判型/回传照常） | 双模式冒烟各 1 行 |
-| 与方案关系 | TOML scheme.file（方案二）不变；GUI scan_file 为通用入口，优先级 sn > filter_file > scan_file > 目录遍历 | 冒烟 |
+| 单行双按钮 | 「扫描目录/文件」一行：输入框 + 「目录…」+「文件…」；指向目录按目录扫，指向文件按单文件处理（isfile 判定，字段仍为 root_dir，无额外字段） | 双模式冒烟 |
+| 双模式通用 | 通用扫描：ScanEngine walk 旁路（关键字匹配照常）；日志筛选：FilterWorker 走 file_list 通道（判型/回传照常） | 单文件 1 行 / 目录 6 行 PASS 冒烟 |
+| 持久化 | root_dir 原样落盘 config.json；scan_file 临时字段已回收 | 无残留键断言 |
 | 自动化交互 | auto_pending 时完成不弹询问框；auto_close=false 保持界面 | GUI 双方案离屏冒烟 |
 
