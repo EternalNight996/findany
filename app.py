@@ -427,17 +427,21 @@ class MainWindow(QMainWindow):
         sub = QLabel(APP_NAME, objectName="sub")
         self.theme_btn = QPushButton("浅色")
         self.theme_btn.setObjectName("ghost")
+        self.cfg_btn = QPushButton("收起配置")
+        self.cfg_btn.setObjectName("ghost")
         log_btn = QPushButton("日志")
         log_btn.setObjectName("ghost")
         open_btn = QPushButton("打开输出目录")
         open_btn.setObjectName("ghost")
         self.theme_btn.clicked.connect(self._toggle_theme)
+        self.cfg_btn.clicked.connect(self._toggle_panel)
         log_btn.clicked.connect(self._open_log)
         open_btn.clicked.connect(self._open_outdir)
         tl.addWidget(brand)
         tl.addWidget(sub)
         tl.addStretch(1)
         tl.addWidget(self.theme_btn)
+        tl.addWidget(self.cfg_btn)
         tl.addWidget(log_btn)
         tl.addWidget(open_btn)
         root.addWidget(top)
@@ -449,6 +453,8 @@ class MainWindow(QMainWindow):
         bl.setSpacing(0)
 
         panel = QWidget(objectName="panel")
+        panel.setMinimumWidth(440)   # 加宽：路径行等长字段不再被挤压
+        self.panel = panel
         pv = QVBoxLayout(panel)
         pv.setContentsMargins(14, 12, 14, 12)
         pv.setSpacing(10)
@@ -890,6 +896,12 @@ class MainWindow(QMainWindow):
         QApplication.instance().setStyleSheet(build_qss(self.dark))
         self.theme_btn.setText("浅色" if self.dark else "深色")
         self._rerender_log()
+
+    def _toggle_panel(self):
+        """收起/展开左侧配置面板：给结果区腾位；再点恢复。"""
+        vis = self.panel.isVisible()
+        self.panel.setVisible(not vis)
+        self.cfg_btn.setText("展开配置" if vis else "收起配置")
 
     def _toggle_theme(self):
         self.dark = not self.dark
