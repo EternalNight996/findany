@@ -456,8 +456,8 @@ class MainWindow(QMainWindow):
         pv.setSpacing(10)
 
         head = QHBoxLayout()
-        h2 = QLabel("扫描配置", objectName="h2")
-        head.addWidget(h2)
+        self.h2 = QLabel("扫描配置", objectName="h2")
+        head.addWidget(self.h2)
         head.addStretch(1)
         self.fold_btn = QPushButton("收")          # 收/展：两字表达
         self.fold_btn.setObjectName("ghost")
@@ -466,8 +466,8 @@ class MainWindow(QMainWindow):
         self.fold_btn.clicked.connect(self._toggle_panel)
         head.addWidget(self.fold_btn)
         pv.addLayout(head)
-        # 收起时面板收缩到标题行宽（标题+按钮都完整可见）
-        self._panel_fold_w = head.sizeHint().width() + 28
+        # 收起时面板收缩到只剩「展」按钮（边距28+按钮56）
+        self._panel_fold_w = self.fold_btn.minimumWidth() + 28
 
         self._panel_content = QWidget()
         cv = QVBoxLayout(self._panel_content)
@@ -914,6 +914,7 @@ class MainWindow(QMainWindow):
         """折叠/展开配置内容：「收」收起并把面板缩到标题行宽；「展」恢复。"""
         vis = self._panel_content.isVisible()
         self._panel_content.setVisible(not vis)
+        self.h2.setVisible(not vis)          # 标题文本随内容一起藏
         self.fold_btn.setText("展" if vis else "收")
         if vis:
             self.panel.setFixedWidth(self._panel_fold_w)      # 至少保留标题+按钮宽度
