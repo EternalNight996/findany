@@ -888,12 +888,26 @@ class MainWindow(QMainWindow):
             self._push_log("warn", f"无法打开输出目录：{d}")
 
     # ---------- 扫描 ----------
+    def _flash_save_btn(self, ok: bool):
+        """保存按钮即时反馈：成功绿「已保存 ✓」/ 失败红，1.2s 后还原。"""
+        theme = "dark" if self.dark else "light"
+        color = COLORS[theme]["ok" if ok else "err"]
+        self.save_btn.setText("已保存 ✓" if ok else "保存失败")
+        self.save_btn.setStyleSheet(f"color:{color};border-color:{color};font-weight:bold;")
+        QTimer.singleShot(1200, self._restore_save_btn)
+
+    def _restore_save_btn(self):
+        self.save_btn.setText("保存配置")
+        self.save_btn.setStyleSheet("")
+
     def _save_cfg_now(self):
         """手动保存当前界面配置（不依赖点开始）。"""
         try:
             save_config(APP_DIR, self._collect_cfg())
+            self._flash_save_btn(True)
             self._push_log("ok", "配置已保存到 config.json")
         except Exception as e:
+            self._flash_save_btn(False)
             self._push_log("err", f"配置保存失败：{e}")
 
     def _start(self):
