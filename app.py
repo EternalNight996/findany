@@ -461,11 +461,13 @@ class MainWindow(QMainWindow):
         head.addStretch(1)
         self.fold_btn = QPushButton("收")          # 收/展：两字表达
         self.fold_btn.setObjectName("ghost")
-        self.fold_btn.setFixedWidth(34)
+        self.fold_btn.setMinimumWidth(56)           # 至少两字宽
         self.fold_btn.setToolTip("收起 / 展开配置")
         self.fold_btn.clicked.connect(self._toggle_panel)
         head.addWidget(self.fold_btn)
         pv.addLayout(head)
+        # 收起时面板收缩到标题行宽（标题+按钮都完整可见）
+        self._panel_fold_w = head.sizeHint().width() + 28
 
         self._panel_content = QWidget()
         cv = QVBoxLayout(self._panel_content)
@@ -526,8 +528,10 @@ class MainWindow(QMainWindow):
         self.dir_edit.setProperty("mono", "true")
         self.dir_edit.setPlaceholderText("目录或单个文件均可")
         browse_dir = QPushButton("目录")
+        browse_dir.setMinimumWidth(56)   # 至少两字宽，杜绝截断
         browse_dir.clicked.connect(self._pick_dir)
         browse_file = QPushButton("文件")
+        browse_file.setMinimumWidth(56)
         browse_file.clicked.connect(self._pick_file)
         dir_row.addWidget(self.dir_edit, 1)
         dir_row.addWidget(browse_dir)
@@ -907,10 +911,15 @@ class MainWindow(QMainWindow):
         self._rerender_log()
 
     def _toggle_panel(self):
-        """折叠/展开配置内容（标题行常驻）：「收」收起、「展」展开。"""
+        """折叠/展开配置内容：「收」收起并把面板缩到标题行宽；「展」恢复。"""
         vis = self._panel_content.isVisible()
         self._panel_content.setVisible(not vis)
         self.fold_btn.setText("展" if vis else "收")
+        if vis:
+            self.panel.setFixedWidth(self._panel_fold_w)      # 至少保留标题+按钮宽度
+        else:
+            self.panel.setMinimumWidth(440)
+            self.panel.setMaximumWidth(16777215)
 
     def _toggle_theme(self):
         self.dark = not self.dark
