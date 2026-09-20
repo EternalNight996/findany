@@ -985,7 +985,27 @@ class MainWindow(QMainWindow):
                              f"回传 成功 {summary.upload_ok} / 冲突 {summary.upload_conflict} / 失败 {summary.upload_fail}")
         self._last_output_dir = summary.batch_dir
         self._worker = None
-        if cfg.filter_auto_close:
+        # 回传收尾语义（真传时生效）：全部成功 → 界面 PASS + 倒计时关；
+        # 有失败/冲突 → 弹窗提醒、不倒计时不关，程序保持打开待人工处理
+        upload_on = cfg.upload_enabled and not cfg.upload_dry_run
+        upload_ran = (summary.upload_ok + summary.upload_conflict + summary.upload_fail) > 0
+        all_ok = upload_ran and summary.upload_fail == 0 and summary.upload_conflict == 0
+        if upload_on and upload_ran:
+            mark = "PASS" if all_ok else "FAIL"
+            color = COLORS["dark" if self.dark else "light"]["ok" if all_ok else "err"]
+            self.up_text.setText(f"{mark}　成功 {summary.upload_ok} / 冲突 {summary.upload_conflict}"
+                                 f" / 失败 {summary.upload_fail}")
+            self.up_text.setStyleSheet(f"color:{color};font-size:12px;font-weight:bold;")
+        if upload_on and upload_ran and not all_ok:
+            bad = [i for i in items if str(i.get("upload_state", "")) in ("失败", "冲突(人工)")]
+            lines = "\n".join(f"· {i.get('sn', '') or i.get('rel_path', '')}：{i.get('upload_state', '')}"
+                               f" {str(i.get('upload_error', '') or '')[:80]}" for i in bad[:8])
+            more = f"\n· …等共 {len(bad)} 条" if len(bad) > 8 else ""
+            self._push_log("err", f"回传存在异常 {summary.upload_fail + summary.upload_conflict} 台，程序保持打开待处理")
+            QMessageBox.warning(self, "回传存在异常，未自动关闭",
+                                f"以下设备回传异常，请处理后重试：\n\n{lines}{more}"
+                                f"\n\n输出目录：{summary.batch_dir}")
+        elif cfg.filter_auto_close:
             dlg = CountdownDialog(self, cfg.filter_countdown, summary.batch_dir)
             if dlg.exec():
                 self.close()       # 倒计时归零 → 退出程序
