@@ -675,11 +675,14 @@ class MainWindow(QMainWindow):
 
         self.go_btn = QPushButton("开始扫描", objectName="primary")
         self.stop_btn = QPushButton("停止", objectName="stop")
+        self.save_btn = QPushButton("保存配置")
         self.stop_btn.setEnabled(False)
         self.go_btn.clicked.connect(self._start)
         self.stop_btn.clicked.connect(self._stop)
+        self.save_btn.clicked.connect(self._save_cfg_now)
         tl.addWidget(self.go_btn)
         tl.addWidget(self.stop_btn)
+        tl.addWidget(self.save_btn)
         rv.addWidget(toolbar)
 
         # 回传进度行（日志筛选模式显示）
@@ -885,6 +888,14 @@ class MainWindow(QMainWindow):
             self._push_log("warn", f"无法打开输出目录：{d}")
 
     # ---------- 扫描 ----------
+    def _save_cfg_now(self):
+        """手动保存当前界面配置（不依赖点开始）。"""
+        try:
+            save_config(APP_DIR, self._collect_cfg())
+            self._push_log("ok", "配置已保存到 config.json")
+        except Exception as e:
+            self._push_log("err", f"配置保存失败：{e}")
+
     def _start(self):
         if self._running:
             return
@@ -1090,6 +1101,10 @@ class MainWindow(QMainWindow):
         if self._worker and self._worker.isRunning():
             self._worker.cancel()
             self._worker.wait(2000)
+        try:
+            save_config(APP_DIR, self._collect_cfg())   # 关窗兜底：界面改动不丢失
+        except Exception:
+            pass
         super().closeEvent(ev)
 
 
