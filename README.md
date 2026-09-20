@@ -107,6 +107,15 @@ Excel 明细为**统一模板 35 列**（6 组逻辑排序：识别→设备→�
 py -3 tests\\test_logfilter.py    # 输出 ALL PASS，退出码 0
 ```
 
+## 日志标准
+
+| 运行方式 | 日志文件 | 内容 |
+|---|---|---|
+| CLI / TOML 自动化（auto_start=true 或 --sn/--file） | logs/findany.log | 启动模式、会话横幅、自动化全流程、异常堆栈 |
+| GUI 人工操作 | logs/findany-gui.log | 同上 + 全部界面操作日志（筛选/回传/保存等） |
+
+5MB 自动轮转（.log.1）；旧的 findany-run/startup/crash 散文件已并入标准日志。
+
 ## TOML 自动化（检测 → 回传 → 倒计时关）
 
 程序目录放 **`findany.toml`**（或 `findany.exe --config 路径.toml`），`run.auto_start = true` 即启动后自动开跑，完成按倒计时自动关——产线无人值守。

@@ -244,5 +244,13 @@ findany/
 | 动态生成 | 批内出现的类型才建 sheet（标题=判型名）；未知类型只落总表；新类型登记模板即生效 | sheetnames 断言 |
 | 混合批次 | 真样例 6 文件三类型 → 总表 6 行 + 3 个专属 sheet，各列集/空列隐藏独立 | 端到端脚本 |
 | 共用渲染 | `write_sheet` 统一表头样式/空列隐藏/宽度/冻结，总表与类型表同源 | 复用重构 |
+
+### 10.6 v1.7 增补：日志标准化 + 回传收尾语义 + 配置保存
+
+| 项 | 内容 | 验证 |
+|---|---|---|
+| 日志标准 | CLI/TOML 自动化→logs/findany.log；GUI→logs/findany-gui.log（启动时按模式路由，5MB 轮转）；旧 run/startup/crash 散文件并入 | 双模式端到端：cli 模式自退出且仅 findany.log；gui 模式仅 findany-gui.log |
+| 回传收尾 | 真传全部成功→界面 PASS+倒计时关；有失败/冲突→FAIL+弹窗列异常设备、不关；dry-run/未启用维持原行为 | GUI 五场景冒烟（桩注入 run_upload） |
+| 配置保存 | 新增「保存配置」按钮（绿色已保存✓闪烁1.2s/失败红）+ closeEvent 兜底落盘 | 保存/关窗双通道冒烟 |
 | 自动化交互 | auto_pending 时完成不弹询问框；auto_close=false 保持界面 | GUI 双方案离屏冒烟 |
 

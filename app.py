@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import time
@@ -26,6 +27,27 @@ except Exception:
 
 def _log_path(name: str) -> str:
     return os.path.join(LOGS_DIR, name)
+
+
+LOG = logging.getLogger("findany")
+_LOG_CLI = "findany.log"        # CLI / TOML 自动化（无人值守）
+_LOG_GUI = "findany-gui.log"    # GUI 人工操作
+
+
+def _setup_logging(cli_mode: bool) -> str:
+    """标准日志：CLI → logs/findany.log；GUI → logs/findany-gui.log。5MB 轮转。"""
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    if not LOG.handlers:
+        try:
+            from logging.handlers import RotatingFileHandler
+            h = RotatingFileHandler(_log_path(_LOG_CLI if cli_mode else _LOG_GUI),
+                                    maxBytes=5 * 1024 * 1024, backupCount=1, encoding="utf-8")
+            h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+            LOG.addHandler(h)
+            LOG.setLevel(logging.INFO)
+        except Exception:
+            pass
+    return _log_path(_LOG_CLI if cli_mode else _LOG_GUI)
 
 
 def _write_file(name: str, text: str, mode: str = "a") -> None:
@@ -59,10 +81,10 @@ try:
     from sonar.logfilter.types import LogType
     from sonar.logfilter import autoconfig
 except Exception:
-    # 任何导入失败（pythonw 下无控制台）→ logs/findany-crash.log + 本机弹窗 + stderr
+    # 任何导入失败（pythonw 下无控制台）→ logs/findany-gui.log + 本机弹窗 + stderr
     _err = traceback.format_exc()
     try:
-        _write_file("findany-crash.log", _err, "w")
+        _write_file(_LOG_GUI, _err, "a")
     except Exception:
         pass
     try:
@@ -859,8 +881,8 @@ class MainWindow(QMainWindow):
     # ---------- 日志 ----------
     def _push_log(self, level: str, line: str):
         self._logs.append([time.strftime("%H:%M:%S"), level, line])
-        # 落盘到 logs/findany-run.log
-        _write_file("findany-run.log", time.strftime("%Y-%m-%d %H:%M:%S") + "  [" + level.upper() + "]  " + line + "\n")
+        # 落盘到标准日志：CLI→logs/findany.log / GUI→logs/findany-gui.log
+        LOG.log({"err": logging.ERROR, "warn": logging.WARNING}.get(level, logging.INFO), line)
         # 弹窗着色
         self.log_dialog.append(level, line)
         # 底部状态条
@@ -1123,13 +1145,25 @@ class MainWindow(QMainWindow):
 
 
 def _mark(msg: str):
-    """逐步启动日志，便于定位 python app.py 在哪一步失败。写入 logs/findany-startup.log。"""
-    _write_file("findany-startup.log", time.strftime("%Y-%m-%d %H:%M:%S") + "  " + msg + "\n")
+    """逐步启动日志，便于定位 python app.py 在哪一步失败。写入标准日志（CLI→findany.log / GUI→findany-gui.log）。"""
+    LOG.info(msg)
 
 
 def main():
     global app
-    _mark("main start | python=" + sys.executable + " | appdir=" + APP_DIR)
+    # 先定运行模式再建日志：TOML 自动化/CLI 覆盖 → findany.log；纯 GUI → findany-gui.log
+    _cli_mode = False
+    try:
+        _ns = autoconfig.parse_args(sys.argv[1:])
+        _pre = autoconfig.resolve_auto(_ns, APP_DIR)
+        _cli_mode = bool(_pre and _pre.enabled) or bool(_ns.sn or _ns.file)
+    except SystemExit:
+        raise
+    except Exception:
+        _cli_mode = False
+    _log_file = _setup_logging(_cli_mode)
+    _mark("main start | mode=" + ("cli" if _cli_mode else "gui") + " | log=" + _log_file
+          + " | python=" + sys.executable + " | appdir=" + APP_DIR)
     try:
         app = QApplication(sys.argv)
         app.setApplicationName(APP_NAME)
@@ -1160,17 +1194,14 @@ def main():
             raise
         except Exception:
             _err2 = traceback.format_exc()
-            _mark("auto config error: " + _err2.replace("\n", " | "))
-            _write_file("findany-crash.log", _err2, "a")
-        _write_file("findany-run.log", "\n===== findany 会话开始 " + time.strftime("%Y-%m-%d %H:%M:%S") + " =====\n")
+            LOG.exception("auto config error")
+        LOG.info("===== findany 会话开始 %s（%s 模式）=====", time.strftime("%Y-%m-%d %H:%M:%S"),
+                 "cli" if _cli_mode else "gui")
         sys.exit(app.exec())
     except Exception:
         err = traceback.format_exc()
+        LOG.exception("启动失败")
         _mark("EXCEPTION: " + err.replace("\n", " | "))
-        try:
-            _write_file("findany-crash.log", err, "w")
-        except Exception:
-            pass
         try:
             QMessageBox.critical(None, f"{APP_NAME} 启动失败", err)
         except Exception:
