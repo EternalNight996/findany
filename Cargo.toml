@@ -1,0 +1,61 @@
+[package]
+name = "findany"
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.80"
+description = "目录内容扫描器 / 产线日志筛选回传（Rust + egui，etest 同技术栈）"
+authors = ["Eternal(梦游) <EternalNightYeah2@yeah.net>"]
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+egui_extras = "0.36"
+e-utils = { version = "0.5", path = "../e-utils", features = ["fs", "encode", "dialog", "chrono", "cmd"] }
+# 注：崩溃处理（logs/crash.txt + 弹窗）见 src/main.rs::install_panic_hook，
+# 复用 e-utils 的 rfd 弹窗（与 etest / e-log 同源），故不额外依赖 e-log。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+regex = "1"
+rayon = "1.10"
+encoding_rs = "0.8"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "time"] }
+umya-spreadsheet = "2.3"
+anyhow = "1"
+chrono = "0.4"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+# 保留符号（只去调试信息）：崩溃 backtrace 才有函数名，排障才看得懂
+strip = "debuginfo"
+debug = 1
+
+# ---- Windows MSI 安装包（cargo-wix；需 WiX Toolset v3，骨架照 etest 抄）----
+# upgrade-guid / path-guid 一经发布勿改（升级安装靠它识别同一产品）
+[package.metadata.wix]
+name = "findany"
+upgrade-guid = "B75EAC49-CAC0-4069-9BED-122C5A1228D3"
+path-guid = "4789A04F-D94E-442A-B1BC-523EF896158E"
+license = false
+eula = false
+
+# ---- Linux deb 安装包（cargo-deb；依赖清单照 etest/gpu-test 同款 eframe 栈）----
+# 装完的布局：/usr/lib/findany/findany.bin（本体）+ /usr/bin/findany（启动器：把配置/日志/产物
+# 落到用户目录，安装目录是只读的）+ 桌面入口 + 默认 findany.toml 模板 + 文档
+[package.metadata.deb]
+name = "findany"
+maintainer = "HEG Technology"
+copyright = "2026 HEG Technology"
+section = "utils"
+priority = "optional"
+depends = "libc6 (>= 2.27), libgl1, libegl1, libxcursor1, libxi6, libxrandr2, libxinerama1, libxkbcommon0, libxkbcommon-x11-0"
+extended-description = "目录内容扫描器 / 产线日志筛选回传；支持 Kylin V10 / UOS V20 / Ubuntu 18.04+"
+assets = [
+    ["target/release/findany", "usr/lib/findany/findany.bin", "755"],
+    ["target/packaging/findany-wrapper.sh", "usr/bin/findany", "755"],
+    ["target/packaging/findany.desktop", "usr/share/applications/", "644"],
+    ["target/packaging/findany.toml", "usr/lib/findany/", "644"],
+    ["README.md", "usr/share/doc/findany/", "644"],
+]
