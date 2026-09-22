@@ -38,6 +38,8 @@ pub fn filter_cfg_from_cfg(cfg: &SearchConfig, app_dir: &str) -> FilterRunCfg {
         ui_refresh_ms: cfg.ui_refresh_ms,
         name_filter: cfg.name_filter.clone(),
         mem_limit_mb: cfg.mem_limit_mb,
+        batch_dirs: cfg.batch_dirs,
+        batch_name_filter: cfg.batch_name_filter.clone(),
         throttle_ms: cfg.throttle_ms,
         max_files: cfg.max_files,
     }

@@ -86,6 +86,10 @@ pub struct SearchConfig {
     pub name_filter: String,
     /// 内存上限（MB）：超过就主动安全停止；0=自动取物理内存的 90%
     pub mem_limit_mb: i64,
+    /// 按 root_dir 的一级子目录分批跑（大目录推荐：内存只跟最大子目录有关）
+    pub batch_dirs: bool,
+    /// 只挑名字含这段的一级子目录（空=全部）
+    pub batch_name_filter: String,
     /// 每批之间的休眠（毫秒）：服务器上跑时用它在 CPU/磁盘/网络盘之间让路；0=不让
     pub throttle_ms: i64,
     /// 最多处理多少个文件（0=不限）：防目录跑飞，超了记警告并按上限收尾
@@ -136,6 +140,8 @@ impl Default for SearchConfig {
             ui_refresh_ms: default_ui_refresh_ms(),
             name_filter: String::new(),
             mem_limit_mb: 0,
+            batch_dirs: false,
+            batch_name_filter: String::new(),
             throttle_ms: 0,
             max_files: 0,
             enabled: false,

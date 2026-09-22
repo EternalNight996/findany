@@ -41,6 +41,10 @@ pub struct FilterRunCfg {
     pub name_filter: String,
     /// 内存上限（MB）：超了主动安全停；0=物理内存 90%
     pub mem_limit_mb: i64,
+    /// 按一级子目录分批跑
+    pub batch_dirs: bool,
+    /// 分批时只挑名字含这段的子目录
+    pub batch_name_filter: String,
     /// 每批之间的休眠（毫秒）：服务器上让路用
     pub throttle_ms: i64,
     /// 最多处理多少文件（0=不限）
@@ -67,6 +71,8 @@ impl Default for FilterRunCfg {
             ui_refresh_ms: 200,
             name_filter: String::new(),
             mem_limit_mb: 0,
+            batch_dirs: false,
+            batch_name_filter: String::new(),
             throttle_ms: 0,
             max_files: 0,
         }
@@ -90,6 +96,10 @@ pub struct FilterSummary {
     pub upload_note: String,
     /// 内存到上限被主动安全停止的原因（空=没停）；会写进 R 结论
     pub mem_stop: String,
+    /// 分批模式：总批次数 / 通过批次数 / 失败批次名
+    pub batches_total: usize,
+    pub batches_pass: usize,
+    pub batch_fail_names: Vec<String>,
     pub elapsed: f64,
     pub batch_dir: String,
     pub excel_path: String,
@@ -270,8 +280,8 @@ pub fn run_filter(cfg: &FilterRunCfg, events: Option<&Sender<FilterEvent>>, canc
     run_filter_shared(cfg, events, cancel, &handle)
 }
 
-/// 带共享句柄的筛选（GUI 用它读实时计数）
-pub fn run_filter_shared(
+/// 单目录筛选（分批模式里每批走一遍这里）
+pub fn run_filter_one(
     cfg: &FilterRunCfg,
     events: Option<&Sender<FilterEvent>>,
     cancel: &AtomicBool,
@@ -527,6 +537,82 @@ pub fn run_filter_shared(
     (items, s)
 }
 
+/// 入口：`batch_dirs=true` 且 root 下超过一个一级子目录时**逐子目录跑**（内存只跟最大子目录有关）；
+/// 关掉时直通单目录流程，行为与以前完全一致。每批各出产物、各判 PASS/FAIL，汇总计数给 R 结论。
+pub fn run_filter_shared(
+    cfg: &FilterRunCfg,
+    events: Option<&Sender<FilterEvent>>,
+    cancel: &AtomicBool,
+    handle: &FilterHandle,
+) -> (Vec<Map<String, Value>>, FilterSummary) {
+    if cfg.batch_dirs {
+        let mut subs: Vec<String> = std::fs::read_dir(&cfg.root_dir)
+            .map(|rd| {
+                let mut v: Vec<String> = rd
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|n| !n.starts_with('.'))
+                    .filter(|n| {
+                        let f = cfg.batch_name_filter.trim();
+                        f.is_empty() || n.contains(f)
+                    })
+                    .collect();
+                v.sort();
+                v
+            })
+            .unwrap_or_default();
+        if subs.len() > 1 {
+            let total_subs = subs.len();
+            let mut agg = FilterSummary::default();
+            let mut last_items: Vec<Map<String, Value>> = Vec::new();
+            for (i, name) in subs.drain(..).enumerate() {
+                if cancel.load(Ordering::SeqCst) {
+                    break;
+                }
+                let mut c = cfg.clone();
+                c.root_dir = Path::new(&cfg.root_dir).join(&name).to_string_lossy().to_string();
+                c.batch_dirs = false;
+                if let Some(tx) = events {
+                    let _ = tx.send(FilterEvent::Log(
+                        "info".to_string(),
+                        format!("批次 {}/{}：{}", i + 1, total_subs, c.root_dir),
+                    ));
+                }
+                let (items_i, s_i) = run_filter_one(&c, events, cancel, handle);
+                let ok = filter_verdict(&s_i, c.upload_enabled, c.dry_run).1;
+                agg.batches_total += 1;
+                if ok {
+                    agg.batches_pass += 1;
+                } else {
+                    agg.batch_fail_names.push(name);
+                }
+                agg.total += s_i.total;
+                agg.extracted += s_i.extracted;
+                agg.unknown += s_i.unknown;
+                agg.skipped += s_i.skipped;
+                agg.upload_ok += s_i.upload_ok;
+                agg.upload_conflict += s_i.upload_conflict;
+                agg.upload_fail += s_i.upload_fail;
+                agg.upload_dry += s_i.upload_dry;
+                agg.upload_skip += s_i.upload_skip;
+                agg.upload_targets += s_i.upload_targets;
+                agg.elapsed += s_i.elapsed;
+                if agg.batch_dir.is_empty() {
+                    agg.batch_dir = s_i.batch_dir.clone();
+                }
+                if agg.mem_stop.is_empty() {
+                    agg.mem_stop = s_i.mem_stop.clone();
+                }
+                // 只留最后一批给界面：内存有界正是这个模式的意义
+                last_items = items_i;
+            }
+            return (last_items, agg);
+        }
+    }
+    run_filter_one(cfg, events, cancel, handle)
+}
+
 /// Excel 降级阈值：超过这个行数只出 CSV（umya 生成 xlsx 时整本驻留内存）
 pub const EXCEL_MAX_ROWS: usize = 50_000;
 
@@ -654,6 +740,25 @@ pub fn upload_anomaly(summary: &FilterSummary, upload_enabled: bool, dry_run: bo
 
 /// 筛选结论：空数据 / 回传异常 → status=false（GUI 与 --auto 共用一套判定）
 pub fn filter_verdict(summary: &FilterSummary, upload_enabled: bool, dry_run: bool) -> (String, bool) {
+    // 分批模式：结论里必须写清批次（否则只看一行结论的人不知道跑了几批、哪批挂了）
+    if summary.batches_total > 1 {
+        let fails = if summary.batch_fail_names.is_empty() {
+            String::new()
+        } else {
+            format!("，失败批次：{}", summary.batch_fail_names.join("/"))
+        };
+        return (
+            format!(
+                "分批 {} 批（PASS {} / FAIL {}），文件 {}，提取 {}（未知 {}，跳过 {}），回传 成功 {}/冲突 {}/失败 {}{}，耗时 {}s，产物 {}{}",
+                summary.batches_total, summary.batches_pass, summary.batches_total - summary.batches_pass,
+                summary.total, summary.extracted, summary.unknown, summary.skipped,
+                summary.upload_ok, summary.upload_conflict, summary.upload_fail,
+                if upload_enabled && dry_run { format!("（dry-run {}）", summary.upload_dry) } else { String::new() },
+                summary.elapsed, summary.batch_dir, fails
+            ),
+            summary.batches_pass == summary.batches_total,
+        );
+    }
     // 内存到上限被主动停：一定要出现在结论里（否则看日志的人以为是程序崩了）
     if !summary.mem_stop.is_empty() {
         return (
