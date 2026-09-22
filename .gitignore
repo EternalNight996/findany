@@ -24,3 +24,10 @@ venv/
 
 # just msi 按 mesa/ 实际 dll 列表生成的 WiX 片段（勿入库）
 /wix/mesa.generated.wxi
+
+# 运行产出的批次目录（out/YYYY-MM-DD_HH-MM 之类跑飞的产物，不入库）
+/20??-??-??_??-??/
+/20??-??-??_??-??_*/
+
+# Mesa 软件 OpenGL 交付材料（59MB 第三方 DLL，随包分发不入库）
+/mesa/
