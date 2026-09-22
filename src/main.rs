@@ -690,6 +690,40 @@ fn run_selftest(dir: &str) -> i32 {
         let no_name = core::scanner::walk_files_filtered(&mix, &["log".to_string()], false, "").len();
         check("文件名过滤留空=不过滤", no_name == 5, &format!("n={no_name}"));
 
+        // 分批模式（batch_dirs）：3 个子目录 -> 3 批；R 结论要带批次汇总
+        {
+            let bdir = std::env::temp_dir().join("findany-batch-selftest");
+            let _ = std::fs::remove_dir_all(&bdir);
+            for n in ["a", "b", "c"] {
+                let _ = std::fs::create_dir_all(bdir.join(n));
+                let _ = std::fs::write(bdir.join(n).join("x.log"), b"HardwareHash\n");
+            }
+            let mut bcfg = core::logfilter::engine::FilterRunCfg::default();
+            bcfg.root_dir = bdir.to_string_lossy().to_string();
+            bcfg.out_dir = bdir.join("out").to_string_lossy().to_string();
+            bcfg.extensions = vec!["log".into()];
+            bcfg.upload_enabled = false;
+            bcfg.recursive = true;
+            bcfg.batch_dirs = true;
+            bcfg.ui_refresh_ms = 0;
+            let bh = core::logfilter::engine::FilterHandle::default();
+            let (bitems, bs) = core::logfilter::engine::run_filter_shared(&bcfg, None, &bh.cancel, &bh);
+            check(
+                "分批模式：3 个子目录 = 3 批全 PASS",
+                bs.batches_total == 3 && bs.batches_pass == 3,
+                &format!("total={} pass={}", bs.batches_total, bs.batches_pass),
+            );
+            // 界面只拿**最后一批**的行（内存有界正是分批的意义）；全量在各自的批次产物里
+            check(
+                "分批模式：提取 3 条、界面只留最后一批",
+                bs.extracted == 3 && bitems.len() == 1,
+                &format!("extracted={} items={}", bs.extracted, bitems.len()),
+            );
+            let (bcontent, bok) = core::logfilter::engine::filter_verdict(&bs, false, true);
+            check("分批模式：R 结论含批次汇总", bok && bcontent.contains("分批 3 批"), &bcontent);
+            let _ = std::fs::remove_dir_all(&bdir);
+        }
+
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = core::scanner::spawn_scan(lcfg, tx);
         let mut batches = 0usize;
