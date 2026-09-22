@@ -1259,6 +1259,20 @@ impl FindanyApp {
                 }
                 ui.label(theme::dim("到上限主动安全停止（不会被系统挤爆）", p));
             });
+            // 分批模式：root_dir 下每个一级子目录各跑一批（百万级目录推荐：内存只跟最大子目录有关）
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut self.cfg.batch_dirs, RichText::new("按子目录分批").size(SIZE_BODY));
+                ui.label(theme::dim("批次名含", p));
+                let mut bf = self.cfg.batch_name_filter.clone();
+                if ui
+                    .add(egui::TextEdit::singleline(&mut bf).desired_width(120.0).hint_text("空=全部"))
+                    .changed()
+                {
+                    self.cfg.batch_name_filter = bf;
+                }
+            })
+            .response
+            .on_hover_text("勾上：root_dir 下每个一级子目录各跑一批（整轮一条 R 结论，带批次汇总）；右框只挑名字含该段的子目录");
             ui.horizontal_wrapped(|ui| {
                 row_label(ui, p, "进程优先级");
                 egui::ComboBox::from_id_salt("prio")
