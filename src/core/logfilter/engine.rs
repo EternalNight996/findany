@@ -286,21 +286,18 @@ pub fn run_filter_shared(
 
     let t0 = std::time::Instant::now();
     let mut s = FilterSummary::default();
-    let files: Vec<String> = walk_filter(cfg);
-    s.total = files.len();
-    handle.total.store(files.len(), Ordering::Relaxed);
+    // ①-a 不再预先遍历成清单（百万级目录会先吃 1GB 路径）：总数边遍历边累加
     log(
         "info",
         &format!(
-            "日志筛选：{} 共 {} 个文件，类型={}，回传={}{}",
+            "日志筛选：{} 类型={}，回传={}{}（遍历中，边遍历边处理）",
             cfg.root_dir,
-            files.len(),
             if cfg.log_type.is_empty() { "auto" } else { &cfg.log_type },
             if cfg.upload_enabled { "开" } else { "关" },
             if cfg.upload_enabled && cfg.dry_run { "（dry-run）" } else { "" }
         ),
     );
-    send(FilterEvent::Progress { phase: "extract", done: 0, total: files.len(), pct: 0.0 });
+    send(FilterEvent::Progress { phase: "extract", done: 0, total: 0, pct: 0.0 });
 
     let extract_batch = |batch: &[String]| -> Vec<Map<String, Value>> {
         batch
@@ -326,7 +323,8 @@ pub fn run_filter_shared(
     let interval = std::time::Duration::from_millis(cfg.ui_refresh_ms.clamp(0, 5000) as u64);
     let throttle_ms = cfg.throttle_ms.clamp(0, 5000) as u64;
     let mut last_emit = std::time::Instant::now();
-    let mut items: Vec<Map<String, Value>> = Vec::with_capacity(files.len());
+    // ①-a：不再按文件总数预留（总数未知）；①-b 会把行改成边跑边落 CSV
+    let mut items: Vec<Map<String, Value>> = Vec::new();
     let pool = if cfg.threads <= 1 {
         None
     } else {
@@ -338,9 +336,15 @@ pub fn run_filter_shared(
     let mem_limit_mb = crate::core::mem_guard::effective_limit_mb(cfg.mem_limit_mb);
     let mut mem_check = std::time::Instant::now();
     let mut heartbeat = std::time::Instant::now();
-    for chunk in files.chunks(BATCH) {
+    // ①-a 流式遍历：边遍历边处理，不再先把百万条路径全收进内存（那是大目录的第一块 GB 级分配）
+    let mut discovered = 0usize;
+    let mut walk_stopped = false;
+    crate::core::scanner::walk_files_each(Path::new(&cfg.root_dir), &cfg.extensions, cfg.recursive, &cfg.name_filter, BATCH, |chunk| {
+        discovered += chunk.len();
+        handle.total.store(discovered, Ordering::Relaxed);
         if cancel.load(Ordering::SeqCst) {
-            break;
+            walk_stopped = true;
+            return false;
         }
         let run = || extract_batch(chunk);
         let got = match &pool {
@@ -351,28 +355,32 @@ pub fn run_filter_shared(
         // 条数够了就发（chunk 本身就是一批），否则按间隔发 —— 小数据量也要分批，界面才看得见增长
         if got.len() >= BATCH || interval.is_zero() || last_emit.elapsed() >= interval {
             last_emit = std::time::Instant::now();
-            emit_batch(&send, &got, files.len(), &handle);
+            emit_batch(&send, &got, discovered, &handle);
             emitted = items.len();
         }
         // 内存看门狗：到上限主动安全停止（百万级目录被系统挤爆时，进程内既没 panic 也没弹窗）
         {
             let done_now = handle.done.load(Ordering::Relaxed);
-            if !crate::core::mem_guard::tick(&mem, mem_limit_mb, &mut mem_check, "筛选", done_now, files.len(), &mut heartbeat) {
+            if !crate::core::mem_guard::tick(&mem, mem_limit_mb, &mut mem_check, "筛选", done_now, discovered, &mut heartbeat) {
                 handle.exceeded.store(true, Ordering::Relaxed);
                 cancel.store(true, Ordering::SeqCst);
-                break;
+                walk_stopped = true;
+                return false;
             }
         }
         // 资源节流：每批之间让一让（服务器上跑时给生产任务留 CPU/磁盘）
         if throttle_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(throttle_ms));
         }
-    }
+        true
+    });
+    let _ = walk_stopped;
     // 尾批：循环里可能因为没到间隔而没发出去，这里补发，保证界面拿到全部行
     if emitted < items.len() {
         let tail: Vec<Map<String, Value>> = items[emitted..].to_vec();
-        emit_batch(&send, &tail, files.len(), &handle);
+        emit_batch(&send, &tail, discovered, &handle);
     }
+    s.total = discovered;
 
     for it in &items {
         if it.get("extract_ok").and_then(|v| v.as_bool()) == Some(true) {

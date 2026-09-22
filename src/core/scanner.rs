@@ -568,6 +568,93 @@ pub fn walk_files_filtered(root: &Path, extensions: &[String], recursive: bool, 
     result
 }
 
+/// 流式遍历：每攒够 batch 个文件就回调一次；回调返回 false 立即停止。
+/// 返回 (发现总数, 是否被 max_files 之外的调用方截断=回调喊停)。
+/// 与 walk_files_filtered 的区别：**不把百万条路径全收进内存**（那是大目录的第一块 GB 级分配）。
+pub fn walk_files_each(
+    root: &Path,
+    extensions: &[String],
+    recursive: bool,
+    name_filter: &str,
+    batch: usize,
+    mut on_chunk: impl FnMut(&[String]) -> bool,
+) -> (usize, bool) {
+    let exts = ext_set(extensions);
+    let needle = name_filter.trim().to_string();
+    let batch = batch.max(1);
+    let mut buf: Vec<String> = Vec::with_capacity(batch);
+    let mut total = 0usize;
+    let mut stopped = false;
+    let mut flush = |buf: &mut Vec<String>, total: &mut usize| -> bool {
+        if buf.is_empty() {
+            return true;
+        }
+        *total += buf.len();
+        let ok = on_chunk(buf);
+        buf.clear();
+        ok
+    };
+    let mut visit = |p: String, buf: &mut Vec<String>, total: &mut usize| -> bool {
+        buf.push(p);
+        if buf.len() >= batch {
+            return flush(buf, total);
+        }
+        true
+    };
+
+    if recursive {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let rd = match std::fs::read_dir(&dir) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+            entries.sort_by_key(|e| e.file_name());
+            for e in &entries {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    continue;
+                }
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if matches_ext(&name, &exts) && matches_name(&name, &needle) {
+                    let s = p.to_string_lossy().to_string();
+                    if !visit(s, &mut buf, &mut total) {
+                        stopped = true;
+                        break;
+                    }
+                }
+            }
+            if stopped {
+                break;
+            }
+        }
+    } else if let Ok(rd) = std::fs::read_dir(root) {
+        let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let p = e.path();
+            if p.is_file() && matches_ext(&name, &exts) && matches_name(&name, &needle) {
+                let s = p.to_string_lossy().to_string();
+                if !visit(s, &mut buf, &mut total) {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !stopped {
+        let _ = flush(&mut buf, &mut total);
+    }
+    (total, stopped)
+}
+
 /// 老签名（不带文件名过滤）—— 自检 / 压测等内部调用用
 pub fn walk_files(root: &Path, extensions: &[String], recursive: bool) -> Vec<PathBuf> {
     walk_files_filtered(root, extensions, recursive, "")
