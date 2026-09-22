@@ -519,6 +519,9 @@ pub fn run_filter_shared(
     (items, s)
 }
 
+/// Excel 降级阈值：超过这个行数只出 CSV（umya 生成 xlsx 时整本驻留内存）
+pub const EXCEL_MAX_ROWS: usize = 50_000;
+
 /// 把一批结果推给界面：附实时计数，同批也会发进度事件
 fn emit_batch(send: &impl Fn(FilterEvent), batch: &[Map<String, Value>], total: usize, handle: &FilterHandle) {
     if batch.is_empty() {
@@ -582,8 +585,16 @@ pub fn export_products(
         ("耗时(秒)", format!("{}", ((t0.elapsed().as_secs_f64()) * 100.0).round() / 100.0)),
         ("导出时间", chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
     ];
-    let excel = report::export_filter_excel(&PathBuf::from(&batch_dir).join("filter_result.xlsx").to_string_lossy(), &rows, &summary_rows)?;
+    // 行数超阈值：Excel 要在内存里拿全表（umya 整本都驻留），几万行以上就顶出几 GB —— 大任务只出 CSV，
+    // 并把这件事写进 R 结论（看日志的人必须知道"为什么没有 xlsx"）
     let audit = report::write_upload_audit(&PathBuf::from(&batch_dir).join("upload-result.csv").to_string_lossy(), &rows)?;
+    let excel = if rows.len() > EXCEL_MAX_ROWS {
+        // 大任务降级：不生成 xlsx（umya 整本驻留内存，几万行以上会顶出几 GB），明细看审计 CSV；
+        // 这里返回一句说明，会被打进运行日志与「产物」提示里
+        format!("（行数 {} 超阈值 {}，已跳过 Excel，明细见 upload-result.csv）", rows.len(), EXCEL_MAX_ROWS)
+    } else {
+        report::export_filter_excel(&PathBuf::from(&batch_dir).join("filter_result.xlsx").to_string_lossy(), &rows, &summary_rows)?
+    };
     let kept = if cfg.keep_logs { report::copy_logs(&rows, &batch_dir) } else { 0 };
     Ok((batch_dir, excel, audit, kept))
 }
