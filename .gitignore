@@ -21,3 +21,6 @@ venv/
 /target/
 # 参考资料：v1 Python 实现（git archive 导出，非源码，不入库）
 /legacy/
+
+# just msi 按 mesa/ 实际 dll 列表生成的 WiX 片段（勿入库）
+/wix/mesa.generated.wxi

@@ -86,10 +86,17 @@ pub enum ScanEvent {
     Done(Box<ScanOutcome>, String, String, usize),
 }
 
+/// 没配 max_files 时的硬上限：百万级目录光是把路径收进内存就能吃掉几个 GB
+pub const HARD_MAX_FILES: usize = 1_000_000;
+
 /// 扫描引擎：rayon 线程池 + 实时计数（界面共享同一份计数，读它就知道进度）
 pub struct ScanEngine {
     pub cfg: SearchConfig,
     cancel: AtomicBool,
+    /// 内存看门狗（超限主动停，别等系统杀进程）
+    pub mem: crate::core::mem_guard::Guard,
+    /// 生效的内存上限（MB，0=不限）
+    pub mem_limit_mb: u64,
     hit_n: AtomicUsize,
     miss_n: AtomicUsize,
     skip_n: AtomicUsize,
@@ -100,7 +107,9 @@ pub struct ScanEngine {
 impl ScanEngine {
     pub fn new(cfg: SearchConfig) -> Self {
         Self {
+            mem_limit_mb: crate::core::mem_guard::effective_limit_mb(cfg.mem_limit_mb),
             cfg,
+            mem: crate::core::mem_guard::new_guard(),
             cancel: AtomicBool::new(false),
             hit_n: AtomicUsize::new(0),
             miss_n: AtomicUsize::new(0),
@@ -147,9 +156,10 @@ impl ScanEngine {
         let t0 = std::time::Instant::now();
         let root = PathBuf::from(&cfg.root_dir);
         let mut files = if root.is_file() {
+            // 单文件：用户已经点名了它，不再按文件名过滤
             vec![root.clone()]
         } else {
-            walk_files(&root, &cfg.extensions, cfg.recursive)
+            walk_files_filtered(&root, &cfg.extensions, cfg.recursive, &cfg.name_filter)
         };
         // 遍历结果统一归一化：TEMP 可能给 8.3 短名（ADMINI~1），输出根/界面拿到的是长名，
         // 不归一会出现「同一目录两种写法」——输出目录排除与后续比对全会误判。
@@ -172,9 +182,18 @@ impl ScanEngine {
             let out_abs = canonical(Path::new(&cfg.out_dir));
             files.retain(|p| !under(p, &out_abs));
         }
-        // 文件数上限（0=不限）：防目录跑飞；超了按上限收尾（界面/日志会看到总数被截）
-        let cap = cfg.max_files.max(0) as usize;
-        if cap > 0 && files.len() > cap {
+        // 文件数上限：配置值优先；没配也有一个硬上限（百万级目录直接内存爆掉/跑飞）
+        let cap = if cfg.max_files > 0 {
+            cfg.max_files as usize
+        } else {
+            HARD_MAX_FILES
+        };
+        if files.len() > cap {
+            crate::core::app_dir::log_line(
+                "findany-run.log",
+                "warn",
+                &format!("目录里有 {} 个文件，超过上限 {cap}（filter.max_files，0 时默认 {HARD_MAX_FILES}），只处理前 {cap} 个", files.len()),
+            );
             files.truncate(cap);
         }
         let total = files.len();
@@ -188,6 +207,9 @@ impl ScanEngine {
         const BATCH_MAX: usize = 64;
 
         let mut aborted = false;
+        // 看门狗状态（两个分支共用）
+        let mut mem_check = std::time::Instant::now();
+        let mut heartbeat = std::time::Instant::now();
         {
             // 关键：pending 里的结果必须**同时**留一份给总结论（all），再发一份给界面 ——
             // 界面拿到的是增量，结束时还要靠 all 落 Excel（漏了就会出现「有命中但产物为空」）
@@ -237,6 +259,15 @@ impl ScanEngine {
                     }
                     if pending.len() >= BATCH_MAX || (!interval.is_zero() && last_flush.elapsed() >= interval) {
                         last_flush = std::time::Instant::now();
+                        // 内存看门狗：到上限就主动停（别等系统杀进程 —— 那样没有任何痕迹）
+                        {
+                            let done_now = self.done_n.load(Ordering::Relaxed);
+                            if !crate::core::mem_guard::tick(&self.mem, self.mem_limit_mb, &mut mem_check, "扫描", done_now, total, &mut heartbeat) {
+                                self.cancel.store(true, Ordering::SeqCst);
+                                aborted = true;
+                                break;
+                            }
+                        }
                         if !flush(&mut pending, &mut all, &mut on_batch) {
                             aborted = true;
                             break;
@@ -268,6 +299,15 @@ impl ScanEngine {
                     }
                     if pending.len() >= BATCH_MAX || (!interval.is_zero() && last_flush.elapsed() >= interval) {
                         last_flush = std::time::Instant::now();
+                        // 内存看门狗：到上限就主动停（别等系统杀进程 —— 那样没有任何痕迹）
+                        {
+                            let done_now = self.done_n.load(Ordering::Relaxed);
+                            if !crate::core::mem_guard::tick(&self.mem, self.mem_limit_mb, &mut mem_check, "扫描", done_now, total, &mut heartbeat) {
+                                self.cancel.store(true, Ordering::SeqCst);
+                                aborted = true;
+                                break;
+                            }
+                        }
                         if !flush(&mut pending, &mut all, &mut on_batch) {
                             aborted = true;
                             break;
@@ -475,9 +515,19 @@ fn matches_ext(name: &str, exts: &std::collections::HashSet<String>) -> bool {
     }
 }
 
-/// 收集待扫描文件路径（按扩展名过滤，空扩展名列表=全部；跳过 `.` 开头的目录与文件）。
-pub fn walk_files(root: &Path, extensions: &[String], recursive: bool) -> Vec<PathBuf> {
+/// 文件名包含过滤（子串、不分大小写）；needle 为空 = 不过滤
+fn matches_name(name: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    name.to_lowercase().contains(&needle.to_lowercase())
+}
+
+/// 收集待扫描文件路径（按扩展名 + 文件名子串过滤，都为空=全部；跳过 `.` 开头的目录与文件）。
+/// name_filter：“搜索框”那个文件名包含条件，空串不过滤。
+pub fn walk_files_filtered(root: &Path, extensions: &[String], recursive: bool, name_filter: &str) -> Vec<PathBuf> {
     let exts = ext_set(extensions);
+    let needle = name_filter.trim().to_string();
     let mut result = Vec::new();
     if recursive {
         let mut stack = vec![root.to_path_buf()];
@@ -496,7 +546,7 @@ pub fn walk_files(root: &Path, extensions: &[String], recursive: bool) -> Vec<Pa
                 let p = e.path();
                 if p.is_dir() {
                     stack.push(p);
-                } else if matches_ext(&name, &exts) {
+                } else if matches_ext(&name, &exts) && matches_name(&name, &needle) {
                     result.push(p);
                 }
             }
@@ -510,12 +560,17 @@ pub fn walk_files(root: &Path, extensions: &[String], recursive: bool) -> Vec<Pa
                 continue;
             }
             let p = e.path();
-            if p.is_file() && matches_ext(&name, &exts) {
+            if p.is_file() && matches_ext(&name, &exts) && matches_name(&name, &needle) {
                 result.push(p);
             }
         }
     }
     result
+}
+
+/// 老签名（不带文件名过滤）—— 自检 / 压测等内部调用用
+pub fn walk_files(root: &Path, extensions: &[String], recursive: bool) -> Vec<PathBuf> {
+    walk_files_filtered(root, extensions, recursive, "")
 }
 
 pub fn abs_path(p: &Path) -> PathBuf {

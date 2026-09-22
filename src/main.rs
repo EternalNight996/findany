@@ -20,6 +20,18 @@
 mod core;
 mod ui;
 
+// Windows 软件 OpenGL 兜底(服务器/RDP 上系统只有 OpenGL 1.1 时,改用随包 Mesa 重启;
+// 见 soft_gl.rs 顶部说明)。非 Windows 是空实现。
+#[cfg(windows)]
+mod soft_gl;
+#[cfg(not(windows))]
+mod soft_gl {
+    /// 非 Windows 不存在「WGL 只有 1.1」这回事,不兜底
+    pub fn relaunch_with_mesa() -> bool {
+        false
+    }
+}
+
 /// 崩溃处理（对齐 etest / e-log 的 panic 契约）。
 ///
 /// 一个钩子里做完三件事（不能拆成两个钩子：后装的会整体替换先装的）：
@@ -368,12 +380,16 @@ fn run_uitest() -> bool {
 }
 
 /// 输出扫描总耗时、事件批次数、单帧最坏消费耗时（界面卡不卡就看这个）
-fn run_bench(dir: &str, keyword: &str) {
+fn run_bench(dir: &str, keyword: &str, threads: i64) {
     let cfg = core::config::SearchConfig {
         root_dir: dir.to_string(),
         keyword: keyword.to_string(),
         out_dir: std::env::temp_dir().join("findany-bench-out").to_string_lossy().to_string(),
-        threads: std::cmp::max(4, std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as i64),
+        threads: if threads > 0 {
+            threads.clamp(1, 64)
+        } else {
+            std::cmp::max(4, std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as i64)
+        },
         copy_files: false,
         ..Default::default()
     };
@@ -469,6 +485,7 @@ fn run_selftest(dir: &str) -> i32 {
         cfg.throttle_ms = 150;
         cfg.max_files = 777;
         cfg.process_priority = "idle".into();
+        cfg.name_filter = "MT71".into();
         let saved = core::logfilter::autoconfig::save_config(&tmp, &cfg).unwrap_or_default();
         let back = core::logfilter::autoconfig::load_config(&tmp);
         check("配置往返一致", back.keyword == "IT6563" && back.threads == 16 && back.out_dir == "D:/out-test", &saved);
@@ -478,6 +495,7 @@ fn run_selftest(dir: &str) -> i32 {
             back.throttle_ms == 150 && back.max_files == 777 && back.process_priority == "idle",
             &format!("throttle={} max_files={} prio={}", back.throttle_ms, back.max_files, back.process_priority),
         );
+        check("文件名搜索框往返一致", back.name_filter == "MT71", &back.name_filter);
         let text = std::fs::read_to_string(&tmp).unwrap_or_default();
         check("保留模板注释", text.contains("# 改 true：启动即自动"), "");
         check("保留 auto_start 键", text.contains("auto_start = false"), "");
@@ -661,6 +679,17 @@ fn run_selftest(dir: &str) -> i32 {
         let multi = core::scanner::walk_files(&mix, &["log".to_string(), "txt".to_string()], false).len();
         check("类型过滤：log+txt 多选 = 3", multi == 3, &format!("n={multi}"));
 
+        // 文件名搜索框：子串、不分大小写；留空=不过滤；与扩展名过滤是「与」
+        for n in ["MT71.log", "backup_Mt71_A.log", "other.log"] {
+            let _ = std::fs::write(mix.join(n), b"x");
+        }
+        let by_name = core::scanner::walk_files_filtered(&mix, &["log".to_string()], false, "mt71").len();
+        check("文件名过滤：不分大小写命中 2", by_name == 2, &format!("n={by_name}"));
+        let by_name_ext = core::scanner::walk_files_filtered(&mix, &["txt".to_string()], false, "mt71").len();
+        check("文件名过滤与类型过滤是「与」", by_name_ext == 0, &format!("n={by_name_ext}"));
+        let no_name = core::scanner::walk_files_filtered(&mix, &["log".to_string()], false, "").len();
+        check("文件名过滤留空=不过滤", no_name == 5, &format!("n={no_name}"));
+
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = core::scanner::spawn_scan(lcfg, tx);
         let mut batches = 0usize;
@@ -820,6 +849,7 @@ fn main() -> eframe::Result<()> {
             run_bench(
                 argv.get(1).map(|s| s.as_str()).unwrap_or("."),
                 argv.get(2).map(|s| s.as_str()).unwrap_or("HardwareHash"),
+                argv.get(3).and_then(|s| s.parse().ok()).unwrap_or(0),
             );
             return Ok(());
         }
@@ -870,5 +900,31 @@ fn main() -> eframe::Result<()> {
             cfg.auto_start, cfg.work_mode, cfg.root_dir, auto_mode
         ),
     );
-    ui::app::run(cfg, proc_dir, auto_mode)
+    // catch_unwind:GL 初始化失败既可能是 Err(eframe 的 Error::NoGlutinConfigs),也可能是
+    // panic,两种都要能落到下面的软件渲染兜底。panic 仍会先走 install_panic_hook 写 crash.txt。
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ui::app::run(cfg, proc_dir, auto_mode)
+    }));
+    match res {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            core::app_dir::log_line("findany-gui.log", "error", &format!("GUI 启动失败：{e}"));
+            // Windows 服务器/RDP 上系统 OpenGL 只有 1.1、glow 建不出上下文 —— 用随包的 Mesa 软件渲染重启
+            if soft_gl::relaunch_with_mesa() {
+                core::app_dir::log_line("findany-gui.log", "info", "已改用软件渲染(Mesa)重启");
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+        Err(payload) => {
+            core::app_dir::log_line("findany-gui.log", "error", "GUI 启动时 panic");
+            if soft_gl::relaunch_with_mesa() {
+                core::app_dir::log_line("findany-gui.log", "info", "已改用软件渲染(Mesa)重启");
+                Ok(())
+            } else {
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
 }

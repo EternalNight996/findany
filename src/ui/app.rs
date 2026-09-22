@@ -100,6 +100,8 @@ pub struct FindanyApp {
     /// 待落盘的界面日志（攒一批交给写线程：每行都开关文件会把 UI 线程拖卡）
     log_pending: Vec<(String, String)>,
     log_flush_at: Option<Instant>,
+    /// 表格截断提示只出一次
+    ui_truncated_note: bool,
     /// 日志写线程的队列（UI 线程只 send，不碰文件）
     log_tx: std::sync::mpsc::Sender<Vec<(String, String)>>,
     /// 后台任务（导出 / 打开目录）结果：(给人看的消息, 产物目录)。UI 线程只 try_recv
@@ -148,6 +150,7 @@ impl FindanyApp {
             last_dirty_check: None,
             dirty_now: false,
             root_kind: std::sync::Arc::new(std::sync::Mutex::new((String::new(), PathKind::Missing))),
+            ui_truncated_note: false,
             log_pending: Vec::new(),
             log_flush_at: None,
             log_tx: make_log_writer(),
@@ -203,7 +206,7 @@ impl FindanyApp {
         }
     }
 
-    /// 把缓冲的日志交给写线程（最多每 250ms 一次；超过 65 条立刻投，别让日志迟到）。
+    /// 把缓冲的日志交给写线程（最多每 250ms 一次；超过 69 条立刻投，别让日志迟到）。
     /// UI 线程只做 send，不碰文件。
     fn flush_logs(&mut self) {
         if self.log_pending.is_empty() {
@@ -475,6 +478,17 @@ impl FindanyApp {
         }
     }
 
+    /// 表格截断只提示一次（避免刷屏）
+    fn note_ui_truncated(&mut self) {
+        if !self.ui_truncated_note {
+            self.ui_truncated_note = true;
+            let msg = format!(
+                "表格只保留最近 {UI_ROW_CAP} 行（防内存翻倍）；明细与导出仍是全量，不受影响"
+            );
+            self.push_log("warn", &msg);
+        }
+    }
+
     /// 按 rel_path 就地更新：同一份日志只留一行，状态类字段直接改这一行（etest 那种状态刷新）
     fn upsert_filter_row(&mut self, row: &Map<String, Value>) {
         let key = row.get("rel_path").and_then(|v| v.as_str()).unwrap_or_default().to_string();
@@ -563,6 +577,9 @@ impl FindanyApp {
             for b in pending {
                 self.items.extend(b.items);
             }
+            if trim_rows(&mut self.items) {
+                self.note_ui_truncated();
+            }
             if self.starting && !self.items.is_empty() {
                 self.starting = false;
                 self.feedback("info", format!("扫描进行中：已出 {} 行", self.items.len()));
@@ -595,6 +612,9 @@ impl FindanyApp {
                     FilterEvent::Progress { .. } => {}
                     FilterEvent::Batch(batch) => {
                         self.filter_items.extend(batch.items);
+                        if trim_rows(&mut self.filter_items) {
+                            self.note_ui_truncated();
+                        }
                     }
                     FilterEvent::Row(row) => self.upsert_filter_row(&row),
                     FilterEvent::Upload { index, total, sn, status, pct } => {
@@ -624,6 +644,9 @@ impl FindanyApp {
             Shot::Scan(outcome, batch_dir, xlsx, copied) => {
                 self.scan_summary = outcome.summary.clone();
                 self.items = outcome.items;
+                if trim_rows(&mut self.items) {
+                    self.note_ui_truncated();
+                }
                 self.push_log(
                     "ok",
                     &format!(
@@ -658,6 +681,9 @@ impl FindanyApp {
                 // 收尾也走就地归并：表里已经是这些行，只更新字段（不再整表替换 -> 不会出现「最后清空重建」）
                 for r in &outcome.items {
                     self.upsert_filter_row(r);
+                }
+                if trim_rows(&mut self.filter_items) {
+                    self.note_ui_truncated();
                 }
                 self.summary = outcome.summary.clone();
                 let line = {
@@ -934,6 +960,28 @@ impl FindanyApp {
                     let _ = open_path(&self.cfg.root_dir);
                 }
             });
+            // 搜索框：按文件名子串筛（不分大小写），留空=不过滤。和「文件类型」是「与」关系
+            let mut enter_start = false;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("🔍").size(SIZE_BODY).color(p.text2));
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.cfg.name_filter)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("搜索文件名包含（留空=不过滤，回车=开始）"),
+                );
+                resp.clone().on_hover_text("只处理文件名里含这段文字的文件，不分大小写；和下面的「文件类型」同时生效；按回车直接开始");
+                // 回车 = 开始（和顶栏那颗按钮同一条路）
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    enter_start = true;
+                }
+            });
+            if enter_start {
+                if self.mode == WorkMode::Scan {
+                    self.start_scan();
+                } else {
+                    self.start_filter();
+                }
+            }
             // 一眼看出填的是「文件」还是「目录」——两种走的是不同分支，选错了要当场知道。
             // 关键：**绝不在 UI 线程做 stat**。扫描目标是 UNC/网络盘时，一次 stat 就是一次网络往返，
             // 每帧 stat 会把界面卡死（用户报的「启动中界面卡死」）。路径变了才发一次后台检测。
@@ -1197,7 +1245,20 @@ impl FindanyApp {
                 }
             })
             .response
-            .on_hover_text("最多处理多少个文件，0=不限：防目录跑飞的保险丝");
+            .on_hover_text("最多处理多少个文件，0=不限：防目录跑飞的保险丝（没配时程序自己也有一道 100 万的硬上限）");
+            // 内存上限：百万级目录最怕被系统挤爆（那种死法没有 panic、没有弹窗、日志停在半截）
+            ui.horizontal_wrapped(|ui| {
+                row_label(ui, p, "内存上限");
+                let mut mem = self.cfg.mem_limit_mb;
+                let dv = egui::DragValue::new(&mut mem)
+                    .range(0..=1_000_000)
+                    .suffix(" MB")
+                    .custom_formatter(|v, _| if v == 0.0 { "自动(物理内存90%)".to_string() } else { format!("{v:.0} MB") });
+                if ui.add(dv).changed() {
+                    self.cfg.mem_limit_mb = mem;
+                }
+                ui.label(theme::dim("到上限主动安全停止（不会被系统挤爆）", p));
+            });
             ui.horizontal_wrapped(|ui| {
                 row_label(ui, p, "进程优先级");
                 egui::ComboBox::from_id_salt("prio")
@@ -1522,6 +1583,22 @@ fn make_log_writer() -> std::sync::mpsc::Sender<Vec<(String, String)>> {
         }
     });
     tx
+}
+
+/// 表格保留的最近行数：界面那一份复制要有界。
+/// 产物/导出不受影响 —— 明细是引擎侧自己写的（scan/export 在交界面之前就落盘了），
+/// 这里只裁「显示用的那一份」，几十万行也不会再把内存翻倍。
+pub const UI_ROW_CAP: usize = 50_000;
+
+/// 超过上限就丢掉最旧的（返回 true=发生了截断）
+fn trim_rows<T>(rows: &mut Vec<T>) -> bool {
+    if rows.len() > UI_ROW_CAP {
+        let cut = rows.len() - UI_ROW_CAP;
+        rows.drain(0..cut);
+        true
+    } else {
+        false
+    }
 }
 
 /// 扫描目标的类型（识别在后台线程做，UI 线程只读缓存结果）
@@ -1943,13 +2020,44 @@ impl eframe::App for FindanyApp {
     }
 }
 
+/// 从多个候选位置找 assets/icon.png 作为窗口图标(覆盖 .exe 资源图标的运行时 HICON):
+/// 1. exe 同级 assets/icon.png(zip 解压布局: findany.exe 与 assets/ 同目录)
+/// 2. exe 同级 assets/etest-256.png(etest 品牌 fallback —— 不依赖 icon.png 是否就位)
+/// 3. cwd/assets/icon.png(产机从快捷方式/服务方式启动时 cwd 可能不是 exe 目录)
+/// 全部找不到 → 返回 None(viewport.with_icon 不调用 → 用 .exe 资源图标,即 winres 嵌入的 etest.ico,
+/// 已经是新品牌图标 —— 保证窗口标题栏始终是新的)
+fn load_window_icon() -> Option<eframe::egui::IconData> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let cwd = std::env::current_dir().ok();
+    let candidates: [std::path::PathBuf; 4] = [
+        exe_dir.join("assets").join("icon.png"),
+        exe_dir.join("assets").join("etest-256.png"),
+        cwd.as_deref().map(|c| c.join("assets").join("icon.png")).unwrap_or_default(),
+        cwd.as_deref().map(|c| c.join("assets").join("etest-256.png")).unwrap_or_default(),
+    ];
+    for path in &candidates {
+        if path.as_os_str().is_empty() { continue; }
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Ok(icon) = eframe::icon_data::from_png_bytes(&bytes) {
+                return Some(icon);
+            }
+        }
+    }
+    None
+}
+
 /// 启动 GUI（auto_mode=true 时首帧自动开跑并按 TOML 倒计时关窗）
 pub fn run(cfg: SearchConfig, proc_dir: std::path::PathBuf, auto_mode: bool) -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1360.0, 860.0])
+        .with_min_inner_size([1040.0, 660.0])
+        .with_title("findany — 目录内容扫描器");
+    if let Some(icon) = load_window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1360.0, 860.0])
-            .with_min_inner_size([1040.0, 660.0])
-            .with_title("findany — 目录内容扫描器"),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(

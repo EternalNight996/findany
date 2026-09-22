@@ -4,5 +4,6 @@ pub mod auto_run;
 pub mod config;
 pub mod exporter;
 pub mod logfilter;
+pub mod mem_guard;
 pub mod result;
 pub mod scanner;

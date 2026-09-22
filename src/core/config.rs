@@ -82,6 +82,10 @@ pub struct SearchConfig {
     pub log_type: String,
     /// 界面实时渲染间隔（毫秒）：每满这么久推一批结果给表格；0=不推送（仅结束时一次）
     pub ui_refresh_ms: i64,
+    /// 文件名包含（子串，不分大小写）：空=不过滤。用来在目录里只挑名字带某段的文件
+    pub name_filter: String,
+    /// 内存上限（MB）：超过就主动安全停止；0=自动取物理内存的 90%
+    pub mem_limit_mb: i64,
     /// 每批之间的休眠（毫秒）：服务器上跑时用它在 CPU/磁盘/网络盘之间让路；0=不让
     pub throttle_ms: i64,
     /// 最多处理多少个文件（0=不限）：防目录跑飞，超了记警告并按上限收尾
@@ -130,6 +134,8 @@ impl Default for SearchConfig {
             out_dir: String::new(),
             log_type: default_log_type(),
             ui_refresh_ms: default_ui_refresh_ms(),
+            name_filter: String::new(),
+            mem_limit_mb: 0,
             throttle_ms: 0,
             max_files: 0,
             enabled: false,

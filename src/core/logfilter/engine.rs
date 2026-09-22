@@ -6,7 +6,7 @@ use super::extractors::{extract, read_text};
 use super::report;
 use super::types::{detect_log_type, file_name, LogType};
 use super::uploader::{resolve_cli, run_upload, UploadProfile, ST_CONFLICT, ST_DRY_RUN, ST_FAIL, ST_OK};
-use crate::core::scanner::{pathdiff, walk_files};
+use crate::core::scanner::{pathdiff, walk_files_filtered};
 use rayon::prelude::*;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
@@ -37,6 +37,10 @@ pub struct FilterRunCfg {
     pub app_dir: String,
     /// 界面实时渲染间隔（毫秒）：每满这么久推一批给表格
     pub ui_refresh_ms: i64,
+    /// 文件名包含（子串，不分大小写）：空=不过滤
+    pub name_filter: String,
+    /// 内存上限（MB）：超了主动安全停；0=物理内存 90%
+    pub mem_limit_mb: i64,
     /// 每批之间的休眠（毫秒）：服务器上让路用
     pub throttle_ms: i64,
     /// 最多处理多少文件（0=不限）
@@ -61,6 +65,8 @@ impl Default for FilterRunCfg {
             profile: UploadProfile::default(),
             app_dir: String::new(),
             ui_refresh_ms: 200,
+            name_filter: String::new(),
+            mem_limit_mb: 0,
             throttle_ms: 0,
             max_files: 0,
         }
@@ -82,6 +88,8 @@ pub struct FilterSummary {
     pub upload_targets: usize,
     /// 没回传的原因（例如回传 CLI 未配置），用于拦截消息说清为什么
     pub upload_note: String,
+    /// 内存到上限被主动安全停止的原因（空=没停）；会写进 R 结论
+    pub mem_stop: String,
     pub elapsed: f64,
     pub batch_dir: String,
     pub excel_path: String,
@@ -209,7 +217,7 @@ pub fn walk_filter(cfg: &FilterRunCfg) -> Vec<String> {
     let mut out: Vec<String> = if root.is_file() {
         vec![root.to_string_lossy().to_string()]
     } else {
-        walk_files(root, &cfg.extensions, cfg.recursive)
+        walk_files_filtered(root, &cfg.extensions, cfg.recursive, &cfg.name_filter)
             .into_iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect()
@@ -237,6 +245,8 @@ pub struct FilterHandle {
     pub upload_fail: AtomicUsize,
     pub upload_dry: AtomicUsize,
     pub cancel: AtomicBool,
+    /// 内存到上限被主动停（界面/结论用来写清原因）
+    pub exceeded: AtomicBool,
 }
 
 impl FilterHandle {
@@ -323,6 +333,11 @@ pub fn run_filter_shared(
         rayon::ThreadPoolBuilder::new().num_threads(cfg.threads.clamp(1, 64) as usize).build().ok()
     };
     let mut emitted = 0usize;
+    // 看门狗状态（每批一次采样）
+    let mem = crate::core::mem_guard::new_guard();
+    let mem_limit_mb = crate::core::mem_guard::effective_limit_mb(cfg.mem_limit_mb);
+    let mut mem_check = std::time::Instant::now();
+    let mut heartbeat = std::time::Instant::now();
     for chunk in files.chunks(BATCH) {
         if cancel.load(Ordering::SeqCst) {
             break;
@@ -338,6 +353,15 @@ pub fn run_filter_shared(
             last_emit = std::time::Instant::now();
             emit_batch(&send, &got, files.len(), &handle);
             emitted = items.len();
+        }
+        // 内存看门狗：到上限主动安全停止（百万级目录被系统挤爆时，进程内既没 panic 也没弹窗）
+        {
+            let done_now = handle.done.load(Ordering::Relaxed);
+            if !crate::core::mem_guard::tick(&mem, mem_limit_mb, &mut mem_check, "筛选", done_now, files.len(), &mut heartbeat) {
+                handle.exceeded.store(true, Ordering::Relaxed);
+                cancel.store(true, Ordering::SeqCst);
+                break;
+            }
         }
         // 资源节流：每批之间让一让（服务器上跑时给生产任务留 CPU/磁盘）
         if throttle_ms > 0 {
@@ -611,6 +635,16 @@ pub fn upload_anomaly(summary: &FilterSummary, upload_enabled: bool, dry_run: bo
 
 /// 筛选结论：空数据 / 回传异常 → status=false（GUI 与 --auto 共用一套判定）
 pub fn filter_verdict(summary: &FilterSummary, upload_enabled: bool, dry_run: bool) -> (String, bool) {
+    // 内存到上限被主动停：一定要出现在结论里（否则看日志的人以为是程序崩了）
+    if !summary.mem_stop.is_empty() {
+        return (
+            format!(
+                "{}，提取 {}/{}，产物 {}",
+                summary.mem_stop, summary.extracted, summary.total, summary.batch_dir
+            ),
+            false,
+        );
+    }
     if summary.total == 0 || summary.extracted == 0 {
         return (format!("数据为空：文件 {}，提取 {}", summary.total, summary.extracted), false);
     }

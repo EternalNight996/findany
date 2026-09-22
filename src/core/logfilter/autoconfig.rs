@@ -71,6 +71,8 @@ root_dir = ""                  # 方案一：SN 检索根目录；必填
 log_type = "auto"              # auto | etest(OA3) | etest | e-autotest | 海格旧测试2 | 海格旧测试3
 recursive = true
 ui_refresh_ms = 200            # 界面实时渲染间隔(ms)：每满这么久推一批给表格；0=只在结束时出结果
+name_filter = ""                # 文件名包含（子串，不分大小写）：空=不过滤（只挑名字带某段的文件）
+mem_limit_mb = 0               # 内存上限(MB)：超过就主动安全停止（不会无声无息挂掉）；0=自动取物理内存的 90%
 threads = 8                    # 并发线程 1~64：服务器上跑就调小（1~4），别抢生产任务
 throttle_ms = 0                # 每批之间的休眠(ms, 0~5000)：给 CPU/磁盘/网络盘让路，服务器上建议 20~200
 max_files = 0                  # 最多处理多少个文件(0=不限)：防目录跑飞
@@ -147,6 +149,8 @@ pub fn parse_config(text: &str) -> SearchConfig {
     let d = SearchConfig::default();
     SearchConfig {
         root_dir: str_of(&doc, "filter", "root_dir", &d.root_dir),
+        name_filter: str_of(&doc, "filter", "name_filter", &d.name_filter),
+        mem_limit_mb: int_of(&doc, "filter", "mem_limit_mb", d.mem_limit_mb).max(0),
         keyword: str_of(&doc, "filter", "keyword", &d.keyword),
         mode: str_of(&doc, "filter", "mode", &d.mode),
         threads: int_of(&doc, "filter", "threads", d.threads),
@@ -228,6 +232,8 @@ fn managed_keys() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("max_file_mb", "max_file_mb"),
                 ("out_dir", "out_dir"),
                 ("ui_refresh_ms", "ui_refresh_ms"),
+                ("name_filter", "name_filter"),
+                ("mem_limit_mb", "mem_limit_mb"),
                 ("throttle_ms", "throttle_ms"),
                 ("max_files", "max_files"),
             ],
@@ -273,6 +279,8 @@ fn cfg_value(cfg: &SearchConfig, key: &str) -> Value {
         "max_file_mb" => Value::Number(serde_json::Number::from_f64(cfg.max_file_mb).unwrap_or_else(|| 20.into())),
         "out_dir" => Value::String(cfg.out_dir.clone()),
         "ui_refresh_ms" => Value::Number(cfg.ui_refresh_ms.into()),
+        "name_filter" => Value::String(cfg.name_filter.clone()),
+        "mem_limit_mb" => Value::Number(cfg.mem_limit_mb.into()),
         "throttle_ms" => Value::Number(cfg.throttle_ms.into()),
         "max_files" => Value::Number(cfg.max_files.into()),
         "process_priority" => Value::String(cfg.process_priority.clone()),

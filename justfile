@@ -38,6 +38,8 @@ root_dir = ""                  # 方案一：SN 检索根目录；必填
 log_type = "auto"              # auto | etest(OA3) | etest | e-autotest | 海格旧测试2 | 海格旧测试3
 recursive = true
 ui_refresh_ms = 200            # 界面实时渲染间隔(ms)：每满这么久推一批给表格；0=只在结束时出结果
+name_filter = ""                # 文件名包含（子串，不分大小写）：空=不过滤（只挑名字带某段的文件）
+mem_limit_mb = 0               # 内存上限(MB)：超过就主动安全停止（不会无声无息挂掉）；0=自动取物理内存的 90%
 threads = 8                    # 并发线程 1~64：服务器上跑就调小（1~4），别抢生产任务
 throttle_ms = 0                # 每批之间的休眠(ms, 0~5000)：给 CPU/磁盘/网络盘让路，服务器上建议 20~200
 max_files = 0                  # 最多处理多少个文件(0=不限)：防目录跑飞
@@ -62,7 +64,7 @@ default:
     @just --list
     @Write-Host ''
     @Write-Host '=== 验证(最常用) ==='
-    @Write-Host '  just selftest   端到端自检(65 条断言,对 doc/etest-log 生产样例)'
+    @Write-Host '  just selftest   端到端自检(69 条断言,对 doc/etest-log 生产样例)'
     @Write-Host '  just parity     移植对拍(Rust vs v1 Python:字段 + 批次产物结构)'
     @Write-Host '  just check      编译检查 + 测试'
     @Write-Host ''
@@ -92,7 +94,7 @@ gen-toml:
 # 复制分发包资源:文档 + findany.toml 模板(+ intunehelper_cli.exe 有则带)
 [private]
 pack-resources dest: gen-toml
-    @$d = '{{dest}}'; New-Item -ItemType Directory -Force -Path $d | Out-Null; foreach ($f in @('README.md','LICENSE')) { if (Test-Path $f) { Copy-Item $f $d -Force; Write-Host ('  + ' + $f) } }; Copy-Item 'target/packaging/findany.toml' $d -Force; Write-Host '  + findany.toml'; if (Test-Path '{{cli_exe}}') { Copy-Item '{{cli_exe}}' $d -Force; Write-Host '  + intunehelper_cli.exe' } else { Write-Host '  [提示] 未找到 {{cli_exe}},分发包含回传功能时需自行放入' }
+    @$d = '{{dest}}'; New-Item -ItemType Directory -Force -Path $d | Out-Null; foreach ($f in @('README.md','LICENSE')) { if (Test-Path $f) { Copy-Item $f $d -Force; Write-Host ('  + ' + $f) } }; Copy-Item 'target/packaging/findany.toml' $d -Force; Write-Host '  + findany.toml'; if (Test-Path '{{cli_exe}}') { Copy-Item '{{cli_exe}}' $d -Force; Write-Host '  + intunehelper_cli.exe' } else { Write-Host '  [提示] 未找到 {{cli_exe}},分发包含回传功能时需自行放入' }; if (Test-Path 'assets') { Copy-Item 'assets' $d -Recurse -Force; Write-Host '  + assets/(含 icon.png 供运行时窗口图标兜底)' }
 
 # 生成 deb 打包资源:启动器 + 桌面入口(骨架照 etest;WriteAllText 用 UTF-8 无 BOM)
 # 说明:这行写成单行(不用 just 的 \ 续行),避免 just 报「recipe line has extra leading whitespace」
@@ -189,7 +191,7 @@ patch-linux:
 
 # ---- 验证 ----
 
-# 端到端自检(release 二进制,65 条断言:判型/字段/Excel 产物/dry-run 组包)
+# 端到端自检(release 二进制,69 条断言:判型/字段/Excel 产物/dry-run 组包)
 [group('1 验证')]
 selftest: ensure-fixtures
     cargo build --{{profile}} --quiet
@@ -233,7 +235,7 @@ parity-release: ensure-fixtures parity-init build-win
 # 打 Windows 包:dist/findany-v<版本>.zip(程序 + findany.toml 模板 + 文档)
 [group('3 打包')]
 dist: build-win
-    @$v = (just version | Select-Object -Last 1).Trim(); $d = '{{dist_dir}}/findany-v' + $v; if (Test-Path $d) { Remove-Item -Recurse -Force $d }; New-Item -ItemType Directory -Force -Path ($d + '/windows') | Out-Null; Copy-Item {{win_exe}} ($d + '/windows/'); just pack-resources ($d + '/windows'); $zip = '{{dist_dir}}/findany-v' + $v + '.zip'; if (Test-Path $zip) { Remove-Item -Force $zip }; Compress-Archive -Path $d -DestinationPath $zip; Write-Host ('打包完成: ' + (Resolve-Path $zip).Path)
+    @$v = (just version | Select-Object -Last 1).Trim(); $d = '{{dist_dir}}/findany-v' + $v; if (Test-Path $d) { Remove-Item -Recurse -Force $d }; New-Item -ItemType Directory -Force -Path ($d + '/windows') | Out-Null; Copy-Item {{win_exe}} ($d + '/windows/'); just pack-resources ($d + '/windows'); if (Test-Path 'mesa') { $md = $d + '/windows/mesa'; New-Item -ItemType Directory -Force -Path $md | Out-Null; Copy-Item 'mesa/*.dll' $md -Force; Write-Host ('  + windows/mesa/ (软件 OpenGL 兜底: ' + (Get-ChildItem $md -Filter '*.dll').Count + ' 个 dll)') } else { Write-Host '  [提示] 无 mesa/:不含软件 OpenGL 兜底(服务器/RDP 上可能起不来界面)' }; $zip = '{{dist_dir}}/findany-v' + $v + '.zip'; if (Test-Path $zip) { Remove-Item -Force $zip }; Compress-Archive -Path $d -DestinationPath $zip; Write-Host ('打包完成: ' + (Resolve-Path $zip).Path)
 
 # 打 Linux 包:dist/findany-v<版本>-linux.tar.gz(需在 Linux 上先 just build-linux)
 [group('3 打包')]
@@ -246,7 +248,7 @@ dist-linux:
 msi: build-win
     @just ensure-wix
     @if (-not (Test-Path wix/main.wxs)) { cargo wix init }
-    $env:PATH = '{{wix_bin}};' + $env:PATH; cargo wix --nocapture
+    $env:PATH = '{{wix_bin}};' + $env:PATH; $bin = 'target/{{profile}}'; $ms = 'mesa'; $dlls = @(Get-ChildItem $ms -Filter '*.dll' -ErrorAction SilentlyContinue); Remove-Item Env:FINDANY_MESA -ErrorAction SilentlyContinue; Remove-Item -Force 'wix/mesa.generated.wxi' -ErrorAction SilentlyContinue; if ($dlls.Count -gt 0) { $md = Join-Path $bin 'mesa'; New-Item -ItemType Directory -Force -Path $md | Out-Null; $dlls | ForEach-Object { Copy-Item $_.FullName $md -Force }; $i = 0; $files = @($dlls | ForEach-Object { $i++; $id = 'mesaFile' + $i + '_' + ($_.BaseName -replace '[^A-Za-z0-9]', '_'); $kp = if ($i -eq 1) { " KeyPath='yes'" } else { '' }; '        <File Id="' + $id + '" Name="' + $_.Name + '" Source="$(var.CargoTargetBinDir)\mesa\' + $_.Name + '"' + $kp + '/>' }); $body = @('<!-- generated by "just msi": dll list of mesa/ (file names vary by Mesa release, so it cannot be hardcoded) -->', '<Include>', '<Directory Id="MesaDir" Name="mesa">', '    <Component Id="MesaGL" Guid="B3D7F204-6A15-4E88-9C42-5F1B8E7A3D60" DiskId="1">') + $files + @('    </Component>', '</Directory>', '</Include>'); [IO.File]::WriteAllLines((Join-Path $PWD 'wix/mesa.generated.wxi'), $body, (New-Object System.Text.UTF8Encoding($false))); $env:FINDANY_MESA = '1'; Write-Host ('  + MSI 含软件 OpenGL 兜底: ' + $dlls.Count + ' 个 dll 装到 bin/mesa/') } else { Write-Host '  [提示] 无 mesa/*.dll:MSI 不含软件 OpenGL 兜底(服务器/RDP 上可能起不来界面)' }; if (Test-Path 'assets/icon.ico') { Copy-Item 'assets/icon.ico' 'wix/icon.ico' -Force; Write-Host '  + MSI 含产品图标' }; cargo wix --nocapture -L "-ice:!ICE38,!ICE43,!ICE57"
     @New-Item -ItemType Directory -Force -Path {{dist_dir}} | Out-Null; Copy-Item target/wix/*.msi {{dist_dir}}/ -Force; Get-ChildItem {{dist_dir}}/*.msi | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,2)}}
 
 # 打 Linux deb 安装包(需先有 Linux 产物:本机 just build-linux,或 cargo zigbuild 交叉)

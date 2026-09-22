@@ -22,7 +22,7 @@ findany 是一个跨平台桌面程序，用 **Rust + egui（eframe）** 编写�
 ## 功能特性
 
 - `🦀` **单文件零依赖**：Rust 静态编译，一个 exe 双击即用，无需 Python / Node / 浏览器。
-- `📁` **全目录递归**：扫描根目录下所有子目录与文件，按扩展名过滤。
+- `📁` **全目录递归 + 搜索框**：扫描根目录下所有子目录与文件；「扫描目标」里的搜索框按**文件名子串**再筛一道（不分大小写，留空=不过滤），与「文件类型」是「与」关系。
 - `🔍` **包含 / 不包含**：两种匹配模式，一次看清「谁命中了 IT6563 / 谁没有」。
 - `⚡` **并发扫描**：线程 1~64 可配，I/O 密集。
 - `📊` **表格实时渲染**：扫描 / 筛选**边跑边出表**——worker 每批结果（24 条或 250ms，先到先发）即时 append 到表格，不必等全部跑完；顶部统计与进度条读共享计数器，始终跟手。
@@ -43,6 +43,9 @@ findany 是一个跨平台桌面程序，用 **Rust + egui（eframe）** 编写�
 - `🧷` **状态就地刷新**：回传过程中同一份日志的那一行只改状态（回传状态/退出码/request_id），不重复追加、不整表替换 —— 表格只有一轮的数据，收尾也不重排。
 - `💾` **一键导出**：结果表上「导出当前数据」把表里现有数据写成正式产物（批次目录 + Excel + 审计 CSV），中途停止后照样能留档；导出在**后台线程**跑，界面不卡。
 - `🖥` **服务器友好**：`throttle_ms`（每批休眠）/ `max_files`（文件数上限）/ `threads`（并发）/**`process_priority`**（进程优先级，仅 Windows）四项都在「运行参数」里可调，也写在 toml 里；`--auto` 无人值守时进程优先级同样生效。
+- `🧯` **不会被大目录挤爆**：内存看门狗每 5s 采样、每 30s 写一条心跳日志（`进度 3.2M/7.0M，内存 4.1GB（上限 4.0GB）`），到上限**主动安全停止**并把原因写进 R 结论 —— 百万级目录被系统杀进程时既没 panic 也没弹窗，日志只会停在半截；现在不会了。
+- `🪟` **表格有界**：结果表只保留最近 5 万行（防界面那一份复制把内存翻倍），明细/导出/产物仍是全量。
+- `⏎` **回车即开跑**：搜索框里按回车 = 点「开始」（走同一条路）。
 - `🚫` **无控制台黑框**：release 是 Windows GUI 子系统（与 gpu-test 同款 `windows_subsystem`），双击不闪命令行窗口；CLI 模式 `AttachConsole` 借父控制台，cmd/计划任务/管道下 stdout 照旧（重定向句柄会先存后还，`--auto > run.txt` 也能拿到输出）。
 - `📦` **安装包**：`just msi`（cargo-wix + WiX v3）/ `just deb`（cargo-deb）；装完自动把配置/日志/产物落到用户目录（`FINDANY_HOME` > exe 目录可写 > 用户目录）。
 - `🎨` **深 / 浅主题**：一键切换。
@@ -64,7 +67,7 @@ just                  # 列出全部命令
 just doctor           # 环境自检（工具链 / 样例 / 交付材料）
 just run              # 本机跑 GUI（debug）
 just run-auto         # 无窗口自动化（读程序目录 findany.toml）
-just selftest         # 端到端自检 65 条断言（对 doc/etest-log 生产样例）
+just selftest         # 端到端自检 69 条断言（对 doc/etest-log 生产样例）
 just parity           # 移植对拍：Rust vs v1 Python（字段 + 批次产物结构）
 just check            # cargo check + cargo test
 just verify           # 一键全验证：编译检查+自检+界面虚拟化+对拍+产物结构
@@ -89,7 +92,7 @@ cargo build --release
 findany                                 # GUI（控制台隐藏）
 findany --config x.toml                  # GUI + 按 TOML 自动跑「检测→回传→倒计时关」（等价 auto_start=true）
 findany --auto --config x.toml           # 无窗口跑完即退（产线无人值守；退出码 0=成功，2=首次生成模板）
-findany --selftest doc/etest-log         # 自检 65 条断言（对生产样例，无 GUI）
+findany --selftest doc/etest-log         # 自检 69 条断言（对生产样例，无 GUI）
 findany --qa doc/etest-log               # 导出提取结果为 JSON（移植对拍用）
 findany --qa-filter doc/etest-log tmp/   # 跑一遍筛选并打印批次目录（产物结构对拍用）
 findany --bench D:/logs                  # 压测：目录规模 vs 扫描耗时 vs 界面单帧最坏耗时
@@ -163,7 +166,7 @@ R<{"content":"提取 6/6（未知 0，跳过 0），回传 成功 6/冲突 0/失
 **自校验 / 移植对拍**（对 doc/etest-log 6 份生产样例）：
 
 ```bash
-findany --selftest doc/etest-log     # 65 条端到端断言（判型/字段/Excel 产物/dry-run 组包）
+findany --selftest doc/etest-log     # 69 条端到端断言（判型/字段/Excel 产物/dry-run 组包）
 powershell -File qa_parity.ps1       # Rust 版 vs v1 Python 版提取结果逐字段对拍
 ```
 
@@ -238,8 +241,10 @@ max_retries = 3
 | `out_dir` | 输出根目录 | 程序目录下 `out/` |
 | `max_file_mb` | 超过视为超大/二进制并跳过 | `20` |
 | `ui_refresh_ms` | 界面实时渲染间隔(ms)，0=只在结束时出结果 | `200` |
+| `name_filter` | **文件名包含**（子串，不分大小写）：空=不过滤，和 `extensions` 是「与」关系 | 空 |
 | `throttle_ms` | **每批之间的休眠(ms, 0~5000)**：给 CPU/磁盘/网络盘让路 | `0` |
-| `max_files` | **最多处理多少个文件(0=不限)**：防目录跑飞 | `0` |
+| `max_files` | **最多处理多少个文件(0=不限)**：防目录跑飞（没配时程序自己也有一道 100 万硬上限） | `0` |
+| `mem_limit_mb` | **内存上限(MB)**：到上限**主动安全停止**（不是被系统挤爆）；`0`=自动取物理内存 90% | `0` |
 | `process_priority` | **进程优先级** `normal` / `below_normal` / `idle`（仅 Windows 生效） | `normal` |
 
 ### 服务器上跑：压资源的三档开关

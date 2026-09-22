@@ -75,8 +75,7 @@
             Languages='1033'
             Compressed='yes'
             InstallScope='perMachine'
-            SummaryCodepage='1252'
-            />
+            SummaryCodepage='1252' />
 
         <MajorUpgrade
             Schedule='afterInstallInitialize'
@@ -128,7 +127,53 @@
                                 Source='$(var.CargoTargetBinDir)\findany.exe'
                                 KeyPath='yes'/>
                         </Component>
+                        <?ifdef env.FINDANY_MESA ?>
+                        <!-- 软件 OpenGL 兜底(Mesa3D llvmpipe):给只有 OpenGL 1.1 的 Windows Server /
+                             RDP 会话用。装在 bin/mesa/ 而**不是** exe 同目录 —— 由 src/soft_gl.rs
+                             在硬件 GL 起不来时按绝对路径加载;放 exe 旁会强制所有机器软件渲染。
+                             没有 mesa/ 时 just msi 不会定义该变量,整块跳过 -->
+                        <?include mesa.generated.wxi ?>
+                        <?endif ?>
                     </Directory>
+                </Directory>
+            </Directory>
+
+            <!-- 桌面 + 开始菜单快捷方式(perMachine install 装到 Public Desktop
+                 和公共开始菜单,Target 仍指向 APPLICATIONFOLDER\bin\findany.exe) -->
+            <Directory Id='DesktopFolder' Name='Desktop'>
+                <Component Id='DesktopShortcut' Guid='B41F5A92-8E2D-4B7C-A9F6-3E8D7C5B1A2E'>
+                    <Shortcut Id='DesktopExe'
+                              Name='findany'
+                              Target='[APPLICATIONFOLDER]bin\findany.exe'
+                              WorkingDirectory='APPLICATIONFOLDER'
+                              Description='findany — 目录内容扫描器 / 产线日志筛选回传'
+                              Icon='ProductICO' />
+                    <RemoveFolder Id='RemoveDesktopFolder' On='uninstall' />
+                    <RegistryValue Root='HKLM'
+                                   Key='Software\Eternal\findany'
+                                   Name='DesktopShortcutInstalled'
+                                   Type='integer'
+                                   Value='1'
+                                   KeyPath='yes' />
+                </Component>
+            </Directory>
+            <Directory Id='ProgramMenuFolder' Name='Menu'>
+                <Directory Id='ApplicationProgramsFolder' Name='findany'>
+                    <Component Id='StartMenuShortcut' Guid='C65A8B3F-7D4E-4A9C-B1E2-9F5D8C6A3B7D'>
+                        <Shortcut Id='StartMenuExe'
+                                  Name='findany'
+                                  Target='[APPLICATIONFOLDER]bin\findany.exe'
+                                  WorkingDirectory='APPLICATIONFOLDER'
+                                  Description='findany — 目录内容扫描器 / 产线日志筛选回传'
+                                  Icon='ProductICO' />
+                        <RemoveFolder Id='RemoveStartMenuFolder' On='uninstall' />
+                        <RegistryValue Root='HKLM'
+                                       Key='Software\Eternal\findany'
+                                       Name='StartMenuShortcutInstalled'
+                                       Type='integer'
+                                       Value='1'
+                                       KeyPath='yes' />
+                    </Component>
                 </Directory>
             </Directory>
         </Directory>
@@ -150,6 +195,20 @@
             <!--<ComponentRef Id='License'/>-->
 
             <ComponentRef Id='binary0'/>
+            <?ifdef env.FINDANY_MESA ?>
+            <ComponentRef Id='MesaGL'/>
+            <?endif ?>
+
+            <!-- 桌面 / 开始菜单快捷方式(可在 CustomizeDlg 里取消) -->
+            <Feature
+                Id='Shortcuts'
+                Title='桌面 / 开始菜单快捷方式'
+                Description='在桌面和公共开始菜单创建 findany 快捷方式'
+                Level='1'
+                Absent='allow'>
+                <ComponentRef Id='DesktopShortcut'/>
+                <ComponentRef Id='StartMenuShortcut'/>
+            </Feature>
 
             <Feature
                 Id='Environment'
@@ -170,8 +229,10 @@
           The product icon is the graphic that appears in the Add/Remove
           Programs control panel for the application.
         -->
-        <!--<Icon Id='ProductICO' SourceFile='wix\Product.ico'/>-->
-        <!--<Property Id='ARPPRODUCTICON' Value='ProductICO' />-->
+        <!-- 产品图标:控制面板"添加删除程序"列表显示 + 桌面/开始菜单快捷方式图标
+             源文件由 just msi 从 assets/icon.ico 同步到 wix/icon.ico -->
+        <Icon Id='ProductICO' SourceFile='wix\icon.ico'/>
+        <Property Id='ARPPRODUCTICON' Value='ProductICO' />
 
         
         <!--
@@ -185,8 +246,10 @@
         -->
         <!--<Property Id='ARPHELPLINK' Value='ChangeMe'/>-->
 
+        <!-- 暴露安装路径(默认 PFiles\findany),允许用户在 InstallDirDlg 里改 -->
+        <Property Id='WIXUI_INSTALLDIR' Value='APPLICATIONFOLDER' />
         <UI>
-            <UIRef Id='WixUI_FeatureTree'/>
+            <UIRef Id='WixUI_InstallDir'/>
             
             <!--
               Enabling the EULA dialog in the installer is a three step process:
@@ -198,9 +261,6 @@
                    the path to a RTF file that will be used as the EULA and
                    displayed in the license agreement dialog.
             -->
-            <Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
-            <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>
-
         </UI>
 
         
