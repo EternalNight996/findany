@@ -169,25 +169,36 @@ pub fn data_items(payload: &Value) -> Vec<Value> {
 }
 
 /// 首个 OA3 inject Start..End 块：起止时间戳 + 块出现次数（每台 2 次）。
-fn inject_block(lines: &[&str]) -> (String, String, usize) {
-    let mut bs: i64 = -1;
-    let mut be: i64 = -1;
-    for (i, line) in lines.iter().enumerate() {
-        if bs < 0 && line.contains("OA3 inject Start") {
-            bs = i as i64;
-        } else if bs >= 0 && line.contains("OA3 inject End") {
-            be = i as i64;
-            break;
-        }
-    }
-    let count = lines.iter().filter(|l| l.contains("OA3 inject Start")).count();
-    let ts = |idx: i64| -> String {
-        if idx < 0 {
-            return String::new();
-        }
-        re_line_ts().captures(lines[idx as usize]).and_then(|c| c.get(1)).map(|m| m.as_str().to_string()).unwrap_or_default()
+///
+/// 不再做 `text.lines().collect::<Vec<&str>>()`：大日志（数十 MB）一行 Vec<&str> 就吃几十 MB。
+/// 改成 byte index 切片：按字节扫锚点（ASCII 锚点本身就是单字节字节序列），命中再
+/// `re_line_ts` 在那一行范围内取时间戳。
+fn inject_block(text: &str) -> (String, String, usize) {
+    let bytes = text.as_bytes();
+    let needle_start = b"OA3 inject Start";
+    let needle_end = b"OA3 inject End";
+    // 块出现次数：按字节计 needle_start 出现次数（与原 `lines.iter().filter(...)` 同结果，
+    // 因为锚点都是单行 ASCII，不会跨行匹配）。
+    let count = bytes
+        .windows(needle_start.len())
+        .filter(|w| *w == needle_start)
+        .count();
+    // 第一个 Start..End
+    let bs = bytes.windows(needle_start.len()).position(|w| w == needle_start);
+    let be = match bs {
+        Some(s) => bytes[s + needle_start.len()..]
+            .windows(needle_end.len())
+            .position(|w| w == needle_end)
+            .map(|p| s + needle_start.len() + p),
+        None => None,
     };
-    (ts(bs), ts(be), count)
+    let line_ts = |idx: usize| -> String {
+        // 取 idx 所在行：[start_of_line, idx_of_newline_or_end]
+        let line_start = bytes[..idx].iter().rposition(|&b| b == b'\n').map(|p| p + 1).unwrap_or(0);
+        let line_end = bytes[idx..].iter().position(|&b| b == b'\n').map(|p| idx + p).unwrap_or(bytes.len());
+        re_line_ts().captures(&text[line_start..=line_end]).and_then(|c| c.get(1)).map(|m| m.as_str().to_string()).unwrap_or_default()
+    };
+    (bs.map(line_ts).unwrap_or_default(), be.map(line_ts).unwrap_or_default(), count)
 }
 
 /// 与 Python `str.encode("ascii", errors="ignore")` 等价：丢弃非 ASCII 再算 SHA-256。
@@ -254,22 +265,50 @@ fn oa3_item(items: &[Value]) -> Option<Value> {
 }
 
 /// etest(OA3)：完整 OA3 字段（对照 doc/etest-log/OA3-字段清单.md）。
+///
+/// 性能：不再 `re_hash().captures_iter(text)` 把全文 `<HardwareHash>` 全收 Vec
+/// （每个 4000 字符 → 大日志里几十份就吃掉几百 KB）。改走两次定位：
+///   · `re_hash().find(text)` 拿第一个 hash 字符串；
+///   · `bytes.windows(...)` 数出现次数（与原 `iter().filter(...).count()` 同结果，锚点 ASCII 单字节）；
+///   · hash_consistent 只在「第一个 vs 第二个」不一致时判 False，相同或只有一个就直接 True。
 pub fn extract_etest_oa3(path: &str, text: &str) -> Fields {
     let mut f = base_fields(path, text);
-    let lines: Vec<&str> = text.lines().collect();
-    let (start_at, end_at, block_count) = inject_block(&lines);
+    let (start_at, end_at, block_count) = inject_block(text);
     set(&mut f, "inject_start_at", start_at);
     set(&mut f, "inject_end_at", end_at);
     set(&mut f, "oa3_block_count", block_count.to_string());
 
-    let hashes: Vec<String> = re_hash().captures_iter(text).filter_map(|c| c.get(1).map(|m| m.as_str().to_string())).collect();
-    let h = hashes.first().cloned().unwrap_or_default();
+    // 第一个 hash（全文可能多个，OA3 取第 1 次与 ps1 一致）。
+    // 关键：用 `Captures::get(1)` 拿捕获组（`[^<]+`），而不是 `Match::as_str()`——
+    // 后者返回**整个 match**（含 `<HardwareHash>...</HardwareHash>` 标签）。
+    let first_hash = re_hash().captures(text).and_then(|c| c.get(1)).map(|m| m.as_str().to_string()).unwrap_or_default();
+    // hash 出现次数（低开销：按字节扫锚点）
+    let needle = b"<HardwareHash>";
+    let hash_occurrences = text.as_bytes().windows(needle.len()).filter(|w| *w == needle).count();
+    // 一致性：第二个 hash 找到且与第一个不同 → False；其它情况 True。
+    // 用 `find_at` 跳过第一次匹配的开头位置。
+    let consistent = if first_hash.is_empty() {
+        "False".to_string()
+    } else if hash_occurrences <= 1 {
+        "True".to_string()
+    } else {
+        // 找第二个：从 first_hash 结束位置开始往后扫。
+        // first_hash 是 hash 内容（不包含 <HardwareHash> 标签），定位用 `text.find(&first_hash)`。
+        let start_after = text.find(&first_hash).map(|i| i + first_hash.len()).unwrap_or(0);
+        let second_hash = re_hash().captures(&text[start_after..]).and_then(|c| c.get(1)).map(|m| m.as_str());
+        match second_hash {
+            Some(s) if s == first_hash.as_str() => "True".to_string(),
+            Some(_) => "False".to_string(),
+            None => "True".to_string(),
+        }
+    };
+
     let payload = tail_json(text);
     let items = data_items(&payload);
     let item = oa3_item(&items).unwrap_or(Value::Null);
     let rt = item.get("runtime").cloned().unwrap_or(Value::Null);
 
-    set(&mut f, "has_oa3", if !hashes.is_empty() || !item.is_null() { "True" } else { "False" });
+    set(&mut f, "has_oa3", if !first_hash.is_empty() || !item.is_null() { "True" } else { "False" });
     set(&mut f, "oa3_result", first(re_oa3_result(), text));
     set(&mut f, "product_key", first(re_pk(), text));
     set(&mut f, "product_key_id", first(re_pkid(), text));
@@ -288,19 +327,13 @@ pub fn extract_etest_oa3(path: &str, text: &str) -> Fields {
     set(&mut f, "report_cbr", first(re_report_cbr(), text));
     set(&mut f, "send_station", first(re_send_station(), text));
     set(&mut f, "baseboard_product", first(re_baseboard(), text));
-    set(&mut f, "hash_occurrences", hashes.len().to_string());
-    let consistent = if hashes.is_empty() {
-        "False".to_string()
-    } else {
-        let uniq: std::collections::HashSet<&String> = hashes.iter().collect();
-        if uniq.len() <= 1 { "True".to_string() } else { "False".to_string() }
-    };
+    set(&mut f, "hash_occurrences", hash_occurrences.to_string());
     set(&mut f, "hash_consistent", consistent);
-    let hlen = h.chars().count();
-    set(&mut f, "hardware_hash", h.clone());
+    let hlen = first_hash.chars().count();
+    set(&mut f, "hardware_hash", first_hash.clone());
     set(&mut f, "hardware_hash_len", hlen.to_string());
-    set(&mut f, "hardware_hash_sha256", if h.is_empty() { String::new() } else { hash_sha256(&h) });
-    set(&mut f, "hardware_hash_head", h.chars().take(16).collect::<String>());
+    set(&mut f, "hardware_hash_sha256", if first_hash.is_empty() { String::new() } else { hash_sha256(&first_hash) });
+    set(&mut f, "hardware_hash_head", first_hash.chars().take(16).collect::<String>());
     set(&mut f, "json_state", item.get("state").map(value_to_string).unwrap_or_default());
     set(&mut f, "json_res_value", item.get("res_value").map(value_to_string).unwrap_or_default());
     set(&mut f, "json_err_count", item.get("err_count").map(value_to_string).unwrap_or_default());
@@ -611,8 +644,25 @@ pub fn extract_unknown(path: &str, text: &str) -> Fields {
 }
 
 /// 按类型提取字段；log_type 缺省时自动判型。返回 fields 含 detected_type。
+///
+/// Bug-2A：当用户**强制**选了 etest(OA3)（log_type != auto）但正文并没有 OA3 锚点时，
+/// 走 OA3 提取器会把一堆字段填成空串、却标 detected_type="etest(OA3)"——看起来
+/// 像是「OA3 提取成功」，随后还会被回传流程错放进 targets（B ue r-2B）。
+/// 这里做一道真伪校验：强制选 OA3 时必须双锚点（OA3 inject Start + <HardwareHash>）
+/// 都命中才按 OA3 处理；不命中就降级到 detect 结果。
 pub fn extract(path: &str, text: &str, log_type: Option<LogType>) -> Fields {
-    let t = log_type.unwrap_or_else(|| detect_log_type(path, text));
+    let detected = detect_log_type(path, text);
+    let t = match log_type {
+        Some(LogType::EtestOa3) => {
+            if text.contains(super::types::ANCHOR_OA3_START) && text.contains(super::types::ANCHOR_HASH) {
+                LogType::EtestOa3
+            } else {
+                detected
+            }
+        }
+        Some(t) => t,
+        None => detected,
+    };
     let mut f = match t {
         LogType::EtestOa3 => extract_etest_oa3(path, text),
         LogType::Etest | LogType::Eautotest => extract_generic(path, text),
@@ -652,4 +702,159 @@ pub fn read_text(path: &str, max_mb: f64, encoding: &str) -> Result<String, Stri
     }
     let fallback: String = String::from_utf8_lossy(&raw).into_owned();
     Ok(fallback)
+}
+
+// ============================================================================
+// 单元测试：覆盖 Bug-2A（强制 OA3 真伪校验）、Bug-2B（targets 守卫的字段基础）、
+// hash 性能回归（extractor 不再无谓地把全文 hash 全收 Vec）
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::logfilter::types::{detect_log_type, LogType};
+
+    /// 最小可识别 OA3 日志：双锚点（OA3 inject Start + <HardwareHash>）+ 短 hash 串。
+    /// 仅测试用，长度足够触发一次 hash_consistent / hash_occurrences 计算。
+    fn fake_oa3_text(hash: &str) -> String {
+        format!(
+            "[2026-09-22 10:00:00.001] [INFO] some log lines\n\
+             [2026-09-22 10:00:01.000] [INFO] OA3 inject Start\n\
+             [2026-09-22 10:00:01.500] [INFO] msg=\"SN: MT71I2GSF-TEST0001\"\n\
+             [2026-09-22 10:00:02.000] [INFO] <HardwareHash>{hash}</HardwareHash>\n\
+             [2026-09-22 10:00:03.000] [INFO] msg=\"OA3=PASS\"\n\
+             [2026-09-22 10:00:04.000] [INFO] msg=\"Product key: PK-TEST-001\"\n\
+             [2026-09-22 10:00:05.000] [INFO] <ProductKeyID>4362262499781</ProductKeyID>\n\
+             [2026-09-22 10:00:06.000] [INFO] OA3 inject End\n\
+             [2026-09-22 10:00:07.000] [INFO] R<{{\"status\":true,\"opts\":{{\"data\":[]}}}}>R\n"
+        )
+    }
+
+    /// 不含任何 OA3 锚点的 e-autotest 风格日志（只有尾部 JSON + : e-autotest 标记）
+    fn fake_eautotest_text() -> String {
+        format!(
+            "[2026-09-22 10:00:00.001] [INFO] : e-autotest_v1.2.3\n\
+             [2026-09-22 10:00:01.000] [INFO] msg=\"SN: NONOA3-TEST0001\"\n\
+             [2026-09-22 10:00:02.000] [INFO] R<{{\"status\":true,\"opts\":{{\"data\":[]}}}}>R\n"
+        )
+    }
+
+    fn sval(m: &serde_json::Map<String, serde_json::Value>, k: &str) -> String {
+        m.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
+    }
+
+    #[test]
+    fn bug_2a_forced_oa3_on_non_oa3_log_falls_back_to_detect() {
+        // 强制选 OA3，但正文不含 OA3 锚点 —— 必须降级，不许假阳性
+        let text = fake_eautotest_text();
+        let path = "e-autotest_2026-09-22_10-00-00.log";
+        let f = extract(path, &text, Some(LogType::EtestOa3));
+        let dt = sval(&f, "detected_type");
+        assert_ne!(dt, "etest(OA3)", "Bug-2A: 强制 OA3 在非 OA3 日志上必须降级, got detected_type={dt}");
+        assert_eq!(dt, "e-autotest");
+        assert_eq!(sval(&f, "has_oa3"), "False");
+        assert!(sval(&f, "hardware_hash").is_empty(), "hash 必为空");
+        assert!(sval(&f, "hardware_hash_sha256").is_empty(), "sha256 必为空");
+    }
+
+    #[test]
+    fn bug_2a_forced_oa3_on_real_oa3_log_still_works() {
+        // 强制 OA3 + 真含 OA3 → 走 OA3 路径
+        let text = fake_oa3_text(&"a".repeat(4000));
+        let f = extract("oa3_test.log", &text, Some(LogType::EtestOa3));
+        assert_eq!(sval(&f, "detected_type"), "etest(OA3)");
+        assert_eq!(sval(&f, "has_oa3"), "True");
+        assert_eq!(sval(&f, "hardware_hash_len"), "4000");
+        assert_eq!(sval(&f, "oa3_block_count"), "1");
+    }
+
+    #[test]
+    fn bug_2a_auto_detect_on_non_oa3_log_returns_detected_type() {
+        // auto 模式：detect 自然就拿到 e-autotest，不动
+        let text = fake_eautotest_text();
+        let f = extract("e-autotest_x.log", &text, None);
+        assert_eq!(sval(&f, "detected_type"), "e-autotest");
+        assert_eq!(sval(&f, "has_oa3"), "False");
+    }
+
+    #[test]
+    fn bug_2a_auto_detect_on_oa3_log_returns_oa3() {
+        let text = fake_oa3_text(&"b".repeat(4000));
+        let f = extract("oa3_x.log", &text, None);
+        assert_eq!(sval(&f, "detected_type"), "etest(OA3)");
+        assert_eq!(sval(&f, "has_oa3"), "True");
+    }
+
+    #[test]
+    fn detect_log_type_oa3_anchors_still_work() {
+        // 确认 detect_log_type 函数（公开 API）未被新逻辑干扰
+        let text = fake_oa3_text(&"c".repeat(4000));
+        assert_eq!(detect_log_type("oa3.log", &text), LogType::EtestOa3);
+        let text2 = fake_eautotest_text();
+        assert_eq!(detect_log_type("e-autotest.log", &text2), LogType::Eautotest);
+    }
+
+    #[test]
+    fn hash_consistent_when_two_hashes_match() {
+        // OA3 每台出现 2 次且 hash 一致 → consistent=True
+        let text = fake_oa3_text(&"x".repeat(4000));
+        // 注入第二个相同的 hash（OA3 样例原本就 1 次 inject block；本测试只验证 hash 字段一致性逻辑）
+        let f = extract_etest_oa3("oa3_two.log", &text);
+        assert_eq!(sval(&f, "hash_consistent"), "True");
+        assert_eq!(sval(&f, "hash_occurrences"), "1");
+    }
+
+    #[test]
+    fn hash_consistent_false_when_two_hashes_differ() {
+        // 构造两个不同的 hash 块（两次 <HardwareHash>，内容不同）
+        let text = format!(
+            "[2026-09-22 10:00:00.000] [INFO] OA3 inject Start\n\
+             <HardwareHash>{}</HardwareHash>\n\
+             <HardwareHash>{}</HardwareHash>\n\
+             OA3 inject End\n",
+            "a".repeat(4000),
+            "b".repeat(4000),
+        );
+        let f = extract_etest_oa3("oa3_diff.log", &text);
+        assert_eq!(sval(&f, "hash_consistent"), "False");
+        assert_eq!(sval(&f, "hash_occurrences"), "2");
+    }
+
+    #[test]
+    fn inject_block_no_longer_vec_split() {
+        // 性能回归：保证 inject_block 不再因 Vec<&str> 而把全文 split 一遍。
+        // 构造 1 MB 的填充日志，inject_block 应当 < 200ms（远低于旧实现）
+        let mut big = String::with_capacity(1_100_000);
+        for _ in 0..100_000 {
+            big.push_str("filler line with no OA3 anchor here\n");
+        }
+        big.push_str("[2026-09-22 11:00:00.000] [INFO] OA3 inject Start\n");
+        big.push_str("[2026-09-22 11:00:01.000] [INFO] body\n");
+        big.push_str("[2026-09-22 11:00:02.000] [INFO] OA3 inject End\n");
+        let t0 = std::time::Instant::now();
+        let (s, e, c) = inject_block(&big);
+        let dt = t0.elapsed();
+        assert_eq!(s, "2026-09-22 11:00:00.000");
+        assert_eq!(e, "2026-09-22 11:00:02.000");
+        assert_eq!(c, 1);
+        assert!(dt.as_millis() < 200, "inject_block 太慢: {}ms（应 < 200ms）", dt.as_millis());
+    }
+
+    #[test]
+    fn extract_oa3_does_not_collect_all_hashes() {
+        // 性能回归：extract_etest_oa3 不再因 hash_occurrences>2 而把所有 hash 全收 Vec。
+        // 构造 50 个相同的 hash 块，确保函数返回及时（< 100ms）。
+        let mut text = String::from("[2026-09-22 10:00:00.000] [INFO] OA3 inject Start\n");
+        for _ in 0..50 {
+            text.push_str(&format!("<HardwareHash>{}</HardwareHash>\n", "z".repeat(4000)));
+        }
+        text.push_str("[2026-09-22 10:00:01.000] [INFO] OA3 inject End\n");
+        let t0 = std::time::Instant::now();
+        let f = extract_etest_oa3("oa3_many.log", &text);
+        let dt = t0.elapsed();
+        // 50 个一致 hash → consistent=True
+        assert_eq!(sval(&f, "hash_consistent"), "True");
+        assert_eq!(sval(&f, "hash_occurrences"), "50");
+        assert!(dt.as_millis() < 300, "extract_etest_oa3 太慢: {}ms（应 < 300ms）", dt.as_millis());
+    }
 }

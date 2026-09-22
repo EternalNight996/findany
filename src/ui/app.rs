@@ -7,9 +7,9 @@
 //!   - 已移除 SN 关联 / 单文件筛选方案（不需要）
 
 use crate::core::config::SearchConfig;
-use crate::core::logfilter::engine::{self as fengine, FilterEvent, FilterOutcome, FilterSummary};
+use crate::core::logfilter::engine::{self as fengine, FilterEvent, FilterSummary};
 use crate::core::logfilter::types::LogType;
-use crate::core::scanner::{LiveProgress, ScanItem, ScanSummary};
+use crate::core::scanner::ScanItem;
 use crate::ui::theme::{self, Palette, BTN_H, ROW_H, SIZE_BODY, SIZE_HEAD, SIZE_SMALL, SIZE_STAT, SIZE_TITLE};
 use eframe::egui;
 use egui::{Color32, Rangef, RichText};
@@ -38,11 +38,9 @@ enum SaveState {
 
 enum Running {
     Idle,
-    Scan {
-        rx: Receiver<crate::core::scanner::ScanEvent>,
-        t0: Instant,
-        handle: crate::core::scanner::ScanHandle,
-    },
+    /// **两个模式共用同一个运行态**（通用扫描 / 日志筛选回传是同一条管道，
+    /// 差异只在 `cfg.work_mode` 决定的 process_one 策略）。
+    /// 之前分成 Scan/Filter 两个变体，导致事件类型、表格数据、池、统计全都要写两套。
     Filter {
         /// 实时计数 + 取消都在句柄里（不受分批节流影响）
         handle: Arc<fengine::FilterHandle>,
@@ -64,9 +62,17 @@ pub struct FindanyApp {
     dark: bool,
     panel_open: bool,
     running: Running,
-    items: Vec<ScanItem>,
+    /// 表格行数据 —— **两个模式共用这一份**（通用扫描与日志筛选回传是同一条管道，
+    /// 行结构也统一为 Map）。之前这里还有一份 `items: Vec<ScanItem>` 是扫描专用的，
+    /// 正是"两套分离"的残留。
     filter_items: Vec<Map<String, Value>>,
-    scan_summary: ScanSummary,
+    /// UI 端行缓存池：worker 推过来的行超过 cache_capacity_rows 时，把最旧的移到这里
+    /// （表格底部「加载更多」可从池里拉回）。
+    row_pool: Option<std::sync::Arc<crate::core::lru_pool::RowPool<Map<String, Value>>>>,
+    /// 行索引（rel_path -> filter_items 下标）：upsert 从 O(N) 线性扫描降到 O(1)。
+    /// **淘汰 / 头部插入后下标会整体偏移** ── 那些位置必须调 rebuild_filter_index()。
+    filter_index: std::collections::HashMap<String, usize>,
+    /// 两个模式共用的汇总（统一管道产出；扫描模式的命中/未命中也在 FilterSummary 里）
     summary: FilterSummary,
     logs: Vec<(String, String, String)>,
     log_open: bool,
@@ -106,6 +112,8 @@ pub struct FindanyApp {
     log_tx: std::sync::mpsc::Sender<Vec<(String, String)>>,
     /// 后台任务（导出 / 打开目录）结果：(给人看的消息, 产物目录)。UI 线程只 try_recv
     job_rx: Option<Receiver<(String, String)>>,
+    /// 后台任务开始时间（用于超时兜底：网络盘上 exists/create_dir_all 可能阻塞几十秒）
+    job_started: Option<Instant>,
     scan_out_dir: String,
     font_note: String,
     proc_dir: std::path::PathBuf,
@@ -127,9 +135,9 @@ impl FindanyApp {
             dark: true,
             panel_open: true,
             running: Running::Idle,
-            items: Vec::new(),
             filter_items: Vec::new(),
-            scan_summary: ScanSummary::default(),
+            row_pool: None,
+            filter_index: std::collections::HashMap::new(),
             summary: FilterSummary::default(),
             logs,
             log_open: false,
@@ -155,6 +163,7 @@ impl FindanyApp {
             log_flush_at: None,
             log_tx: make_log_writer(),
             job_rx: None,
+            job_started: None,
             scan_out_dir: String::new(),
             font_note,
             proc_dir,
@@ -230,7 +239,6 @@ impl FindanyApp {
     /// 已请求停止（句柄取消标志已置位）——按钮切"正在停止…"，避免"点了没反应"
     fn cancelling(&self) -> bool {
         match &self.running {
-            Running::Scan { handle, .. } => handle.cancelled(),
             Running::Filter { handle, .. } => handle.cancel.load(Ordering::Relaxed),
             Running::Idle => false,
         }
@@ -324,18 +332,46 @@ impl FindanyApp {
         }
         // 不在这里回写 toml：那会让「自动开跑」的机器每次启动都重建一遍配置文件。
         // 配置落盘只由用户点「保存配置」负责。
-        let cfg = self.cfg.clone();
-        let (tx, rx) = channel();
+        let app_dir = self.proc_dir.to_string_lossy().to_string();
+        // **和筛选走同一条管道**：同一个 spawn、同一套事件、同一个表格与按钮。
+        // 唯一差异是 mode="scan" —— 管道里的 process_one 据此走「按关键字匹配」策略。
+        let mut rcfg = crate::core::auto_run::filter_cfg_from_cfg(&self.cfg, &app_dir);
+        rcfg.mode = "scan".into();
+        // 有界通道（背压）：见 start_filter 的说明
+        let (tx, rx) = std::sync::mpsc::sync_channel(CHANNEL_BOUND);
         // 关键：这里**不做任何遍历/统计**——目录树可能是几万文件或网络盘，同步数一遍正是
         // 「点了开始先卡一下」的元凶。遍历交给 worker，界面立刻进入过渡态。
-        self.starting = true;
-        // 本轮从零开始：表格先清（不叠在上一轮结果上），之后每批数据实时进表
-        self.items.clear();
+        self.reset_for_new_run();
         self.scan_out_dir.clear();
+        self.feedback("info", format!("正在启动扫描：{}…（后台统计文件，稍候）", self.cfg.root_dir));
+        let handle = fengine::spawn_filter(rcfg, tx);
+        self.running = Running::Filter {
+            handle,
+            rx,
+            t0: Instant::now(),
+            up_index: 0,
+            up_total: 0,
+            up_pct: 0.0,
+            sn: String::new(),
+            status: String::new(),
+        };
+    }
+
+    /// **一轮起跑前的共同准备**：通用扫描与日志筛选回传都调这里。
+    ///
+    /// 之所以抽出来：两个模式此前各写一份「清表 + 建池」，结果分叉了 ——
+    /// 筛选侧接了 cache_capacity_rows、扫描侧还在用固定 5 万行上限，内存策略根本不是一套。
+    /// 现在两边都走这一处：清表 + **两个池都按本轮缓存行数重建**，天然一致。
+    ///
+    /// 注意用新的空容器**替换**而不是 `clear()`：clear() 只清元素、保留容量，
+    /// 上一轮撑到几万行时那份堆会一直挂着不还给分配器（「跑完内存降不回去」的原因之一）。
+    fn reset_for_new_run(&mut self) {
+        let cap = self.cfg.cache_capacity_rows.max(0) as usize;
+        self.starting = true;
+        self.filter_items = Vec::new();
+        self.filter_index = std::collections::HashMap::new();
+        self.row_pool = Some(std::sync::Arc::new(crate::core::lru_pool::RowPool::new(cap)));
         self.follow_tail = true;
-        self.feedback("info", format!("正在启动扫描：{}…（后台统计文件，稍候）", cfg.root_dir));
-        let handle = crate::core::scanner::spawn_scan(cfg, tx);
-        self.running = Running::Scan { rx, t0: Instant::now(), handle };
     }
 
     fn start_filter(&mut self) {
@@ -356,11 +392,13 @@ impl FindanyApp {
         self.starting = true;
         let app_dir = self.proc_dir.to_string_lossy().to_string();
         let rcfg = crate::core::auto_run::filter_cfg_from_cfg(&self.cfg, &app_dir);
-        let (tx, rx) = channel();
+        // 有界通道（背压）：见 scan 侧的说明。筛选每行含 4000 字符 HardwareHash，
+        // 无界通道堆积十万行 ≈ 2.6GB —— 这是运行中内存峰值远超实际数据量的根因。
+        let (tx, rx) = std::sync::mpsc::sync_channel(CHANNEL_BOUND);
         let handle = fengine::spawn_filter(rcfg, tx);
-        // 同上：本轮从零开始
-        self.filter_items.clear();
-        self.follow_tail = true;
+        // 与通用扫描**调同一个准备函数**：清表 + 两个池都按本轮的 cache_capacity_rows 重建。
+        // 旧实现两边各写一份（筛选漏了扫描的池、扫描没用缓存行数），改一处漏一处。
+        self.reset_for_new_run();
         let head = format!(
             "正在启动筛选：{}  类型「{}」  回传{}{}",
             self.cfg.root_dir,
@@ -385,7 +423,6 @@ impl FindanyApp {
     fn stop(&mut self) {
         match &self.running {
             Running::Filter { handle, .. } => handle.cancel.store(true, Ordering::SeqCst),
-            Running::Scan { handle, .. } => handle.cancel(),
             Running::Idle => {}
         }
         let tail = if self.mode == WorkMode::Filter {
@@ -407,33 +444,25 @@ impl FindanyApp {
             self.feedback("warn", "上一个后台任务（导出/打开目录）还没结束，稍等再点");
             return;
         }
-        let is_filter = self.mode == WorkMode::Filter;
-        let n = if is_filter { self.filter_items.len() } else { self.items.len() };
+        let n = self.filter_items.len();
         if n == 0 {
             self.feedback("warn", "表格里还没有数据，先跑一次（或等结果出现）再导出");
             return;
         }
         self.cfg.resolve_out_dir(&self.proc_dir);
-        let cfg = self.cfg.clone();
+        let mut cfg = self.cfg.clone();
         let app_dir = self.proc_dir.to_string_lossy().to_string();
-        let items = self.items.clone();
+        // 两个模式共用同一份行数据与同一条产物写出路径（差异只在 mode）
         let rows = self.filter_items.clone();
         let fsum = self.summary.clone();
-        let ssum = self.scan_summary.clone();
+        cfg.work_mode = if self.mode == WorkMode::Scan { "scan".into() } else { "filter".into() };
         self.spawn_job("正在导出当前数据", move || {
-            if is_filter {
-                let fc = crate::core::auto_run::filter_cfg_from_cfg(&cfg, &app_dir);
-                // 用这次运行的真实耗时回推 t0：导出的「耗时(秒)」和跑完时是同一个数
-                let t0 = Instant::now() - Duration::from_secs_f64(fsum.elapsed.max(0.0));
-                match fengine::export_products(&fc, &rows, &fsum, t0) {
-                    Ok((dir, _excel, _audit, _kept)) => (format!("已导出 {} 条 → {dir}", rows.len()), dir),
-                    Err(e) => (format!("导出失败：{e}"), String::new()),
-                }
-            } else {
-                match crate::core::scanner::export_scan_products(&items, &ssum, &cfg) {
-                    Ok((dir, _xlsx, _copied)) => (format!("已导出 {} 条 → {dir}", items.len()), dir),
-                    Err(e) => (format!("导出失败：{e}"), String::new()),
-                }
+            let fc = crate::core::auto_run::filter_cfg_from_cfg(&cfg, &app_dir);
+            // 用这次运行的真实耗时回推 t0：导出的「耗时(秒)」和跑完时是同一个数
+            let t0 = Instant::now() - Duration::from_secs_f64(fsum.elapsed.max(0.0));
+            match fengine::export_products(&fc, &rows, &fsum, t0) {
+                Ok((dir, _excel, _audit, _kept)) => (format!("已导出 {} 条 → {dir}", rows.len()), dir),
+                Err(e) => (format!("导出失败：{e}"), String::new()),
             }
         });
     }
@@ -445,15 +474,31 @@ impl FindanyApp {
     {
         let (tx, rx) = channel();
         self.job_rx = Some(rx);
+        self.job_started = Some(Instant::now());
         self.feedback("info", format!("{desc}…（后台进行，界面不会卡）"));
         std::thread::spawn(move || {
             let _ = tx.send(f());
         });
     }
 
-    /// 后台任务收尾（每帧非阻塞看一眼）
+    /// 后台任务收尾（每帧非阻塞看一眼）。
+    /// 加超时兜底：目标目录在网络盘/UNC 上时 `exists()`/`create_dir_all` 可能阻塞几十秒，
+    /// 旧实现会让 job_rx 一直挂着 → 「导出」「打开目录」按钮永久失效（看着像卡死）。
+    /// 超过 JOB_TIMEOUT_SECS 就丢弃句柄并提示（后台线程自己会跑完，只是结果不再回填）。
+    const JOB_TIMEOUT_SECS: u64 = 15;
+
     fn poll_job(&mut self) {
         let Some(rx) = &self.job_rx else { return };
+        // 超时兜底：先看时间，再收结果
+        if let Some(t0) = self.job_started {
+            if t0.elapsed().as_secs() >= Self::JOB_TIMEOUT_SECS {
+                self.job_rx = None;
+                self.job_started = None;
+                self.feedback("warn", "后台任务超时未返回（目录可能不可达），已解除占用，可重试");
+                self.need_repaint = true;
+                return;
+            }
+        }
         match rx.try_recv() {
             Ok((msg, dir)) => {
                 let bad = msg.contains("失败") || msg.contains("打不开") || msg.contains("无法");
@@ -466,6 +511,7 @@ impl FindanyApp {
                 }
                 self.feedback(if bad { "err" } else { "ok" }, msg);
                 self.job_rx = None;
+                self.job_started = None;
                 self.need_repaint = true;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -474,6 +520,7 @@ impl FindanyApp {
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.job_rx = None;
+                self.job_started = None;
             }
         }
     }
@@ -489,16 +536,33 @@ impl FindanyApp {
         }
     }
 
-    /// 按 rel_path 就地更新：同一份日志只留一行，状态类字段直接改这一行（etest 那种状态刷新）
+    /// 按 rel_path 就地更新：同一份日志只留一行，状态类字段直接改这一行（etest 那种状态刷新）。
+    /// 走 filter_index 定位（O(1)）── 旧实现是每个行扫全表（O(N)），
+    /// 一帧 2000 行 × 5000 行表 = 1000 万次字符串比较，这就是界面卡死的第二个原因。
     fn upsert_filter_row(&mut self, row: &Map<String, Value>) {
         let key = row.get("rel_path").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        for slot in self.filter_items.iter_mut() {
-            if slot.get("rel_path").and_then(|v| v.as_str()).unwrap_or_default() == key {
+        if let Some(&i) = self.filter_index.get(&key) {
+            if let Some(slot) = self.filter_items.get_mut(i) {
                 *slot = row.clone();
                 return;
             }
+            // 索引指向的位置已失效（理论上不该发生：淘汰/插头都会 rebuild）── 兜底重建
+            self.rebuild_filter_index();
         }
+        self.filter_index.insert(key, self.filter_items.len());
         self.filter_items.push(row.clone());
+    }
+
+    /// 淘汰（尾部截断 / 头部移除）或头部插入后下标整体偏移 ── 必须重建索引。
+    /// 批量淘汰只调一次，O(N)；比每行扫全表便宜一个数量级。
+    fn rebuild_filter_index(&mut self) {
+        self.filter_index.clear();
+        self.filter_index.reserve(self.filter_items.len());
+        for (i, r) in self.filter_items.iter().enumerate() {
+            if let Some(k) = r.get("rel_path").and_then(|v| v.as_str()) {
+                self.filter_index.insert(k.to_string(), i);
+            }
+        }
     }
 
 
@@ -542,78 +606,69 @@ impl FindanyApp {
     // ---------- 事件轮询 ----------
 
     fn poll(&mut self) {
-        enum Shot {
-            Scan(Box<crate::core::scanner::ScanOutcome>, String, String, usize),
-            Filter(Box<FilterOutcome>, String),
-            None,
-        }
         // 单帧事件预算：数据量大时通道里可能堆着几万条事件，一帧全消费会把界面卡死；
         // 超预算就留到下一帧（try_recv 队列不会丢事件）。
         let budget = Instant::now() + Duration::from_millis(6);
-        const MAX_EVENTS_PER_FRAME: usize = 2000;
-        let mut consumed = 0usize;
+        // **按「行数」而非「事件数」限额**：一个 Batch 事件最多含 64 行、每行含 4000 字符
+        // HardwareHash（真样本整行 ~13KB）。旧上限 2000 事件 = 最多 12.8 万行 ≈ 1.6GB 一次性
+        // 拉进内存 —— 这就是「界面卡死 + 内存从 170MB 冲到 1400MB」的直接原因之一。
+        // 2000 行 × 13KB ≈ 26MB：安全，且一帧足以消化。
+        const MAX_ROWS_PER_FRAME: usize = 2000;
+        let mut rows_in_frame = 0usize;
 
-        // 1) 扫描：批事件 append（表格实时长），Done 收尾
-        let scan_shot = if let Running::Scan { rx, .. } = &mut self.running {
-            let mut done = None;
-            let mut pending: Vec<Box<crate::core::scanner::ScanOutcome>> = Vec::new();
-            loop {
-                if consumed >= MAX_EVENTS_PER_FRAME || Instant::now() > budget {
-                    self.events_backlogged = true;
-                    break;
-                }
-                match rx.try_recv() {
-                    Ok(crate::core::scanner::ScanEvent::Batch(batch)) => {
-                        consumed += 1;
-                        pending.push(batch);
-                    }
-                    Ok(crate::core::scanner::ScanEvent::Done(o, dir, xlsx, copied)) => {
-                        consumed += 1;
-                        done = Some((o, dir, xlsx, copied));
-                    }
-                    Err(_) => break,
-                }
-            }
-            for b in pending {
-                self.items.extend(b.items);
-            }
-            if trim_rows(&mut self.items) {
-                self.note_ui_truncated();
-            }
-            if self.starting && !self.items.is_empty() {
-                self.starting = false;
-                self.feedback("info", format!("扫描进行中：已出 {} 行", self.items.len()));
-            }
-            done
-        } else {
-            None
-        };
-
-        // 2) 筛选：批事件 append，Log/Upload/Done 各归其位
+        // 事件轮询：**两个模式共用这一条分支**（扫描/筛选是同一条管道，事件类型也同一个）
         let filter_shot = if let Running::Filter { rx, .. } = &mut self.running {
             let mut evs: Vec<FilterEvent> = Vec::new();
             loop {
-                if consumed >= MAX_EVENTS_PER_FRAME || Instant::now() > budget {
+                if rows_in_frame >= MAX_ROWS_PER_FRAME || Instant::now() > budget {
                     self.events_backlogged = true;
                     break;
                 }
                 match rx.try_recv() {
                     Ok(ev) => {
-                        consumed += 1;
+                        if let FilterEvent::Batch(b) = &ev {
+                            rows_in_frame += b.items.len();
+                        }
                         evs.push(ev);
                     }
                     Err(_) => break,
                 }
             }
             let mut done = None;
+            let mut evicted_any = false;
             for ev in evs {
                 match ev {
                     FilterEvent::Log(lvl, msg) => self.push_log(&lvl, &msg),
                     FilterEvent::Progress { .. } => {}
                     FilterEvent::Batch(batch) => {
-                        self.filter_items.extend(batch.items);
+                        // 逐行 upsert（走 filter_index，O(1)/行）── 同一行只留一份，
+                        // 状态刷新（回传改状态）就地把那一行换掉，不新增行。
+                        for it in batch.items {
+                            self.upsert_filter_row(&it);
+                        }
+                        // 「启动中」的结束时机：首批结果到达就切到运行态。
+                        // 旧实现只在 Done 时才清 starting ── filter 模式整个运行期都显示
+                        // 「启动中…（点此取消）」，用户看不到「进行中」也不知道能不能停。
+                        if self.starting {
+                            self.starting = false;
+                            self.feedback("info", format!("筛选进行中：已出 {} 行", self.filter_items.len()));
+                        }
+                        // UI 端 LRU：超 cache_capacity_rows 把最旧的移到 row_pool
+                        // （表格底部「加载更多」可拉回）。批量 drain 后重建索引（下标整体偏移）。
+                        if let Some(pool) = self.row_pool.clone() {
+                            let cap = self.cfg.cache_capacity_rows.max(0) as usize;
+                            if cap > 0 && self.filter_items.len() > cap {
+                                let excess = self.filter_items.len() - cap;
+                                let moved: Vec<Map<String, Value>> = self.filter_items.drain(0..excess).collect();
+                                for it in moved {
+                                    pool.push(it);
+                                }
+                                evicted_any = true;
+                            }
+                        }
                         if trim_rows(&mut self.filter_items) {
                             self.note_ui_truncated();
+                            evicted_any = true;
                         }
                     }
                     FilterEvent::Row(row) => self.upsert_filter_row(&row),
@@ -629,61 +684,91 @@ impl FindanyApp {
                     FilterEvent::Done(outcome, note) => done = Some((outcome, note)),
                 }
             }
+            if evicted_any {
+                self.rebuild_filter_index();
+            }
             done
         } else {
             None
         };
 
-        let shot = match (scan_shot, filter_shot) {
-            (Some((o, dir, xlsx, copied)), _) => Shot::Scan(o, dir, xlsx, copied),
-            (_, Some((o, note))) => Shot::Filter(o, note),
-            _ => Shot::None,
-        };
-
-        match shot {
-            Shot::Scan(outcome, batch_dir, xlsx, copied) => {
-                self.scan_summary = outcome.summary.clone();
-                self.items = outcome.items;
-                if trim_rows(&mut self.items) {
-                    self.note_ui_truncated();
+        // 收尾：**两个模式共用这一条**（扫描 / 筛选都是这条管道），结论按 self.mode 分派
+        if let Some((outcome, note)) = filter_shot {
+            // 就地归并（upsert 走 filter_index，O(1)/行；收尾这几万行也不会再卡）
+            for r in &outcome.items {
+                self.upsert_filter_row(r);
+            }
+            // 收尾后按缓存上限淘汰（最旧的移到 row_pool，索引随后重建）
+            let mut evicted_tail = false;
+            if let Some(pool) = self.row_pool.clone() {
+                let cap = self.cfg.cache_capacity_rows.max(0) as usize;
+                if cap > 0 && self.filter_items.len() > cap {
+                    let excess = self.filter_items.len() - cap;
+                    let moved: Vec<Map<String, Value>> = self.filter_items.drain(0..excess).collect();
+                    for it in moved {
+                        pool.push(it);
+                    }
+                    evicted_tail = true;
                 }
-                self.push_log(
-                    "ok",
-                    &format!(
-                        "完成：命中 {} / 未命中 {} / 跳过 {}，耗时 {}s",
-                        self.scan_summary.hit, self.scan_summary.miss, self.scan_summary.skipped, self.scan_summary.elapsed
-                    ),
-                );
-                let target = if batch_dir.is_empty() {
-                    String::new()
-                } else {
-                    format!("{batch_dir}  ->  {xlsx}")
-                };
+            }
+            if trim_rows(&mut self.filter_items) {
+                self.note_ui_truncated();
+                evicted_tail = true;
+            }
+            if evicted_tail {
+                self.rebuild_filter_index();
+            }
+            self.summary = outcome.summary.clone();
+            self.starting = false;
+            // 先取出需要的标量/字符串（避免后面 &self.summary 与 &mut self 冲突）
+            let (s_hit, s_miss, s_skipped, s_total, s_elapsed, s_batch, s_excel) = {
+                let s = &self.summary;
+                (s.hit, s.miss, s.skipped, s.total, s.elapsed, s.batch_dir.clone(), s.excel_path.clone())
+            };
+            let target = if s_batch.is_empty() { String::new() } else { format!("{s_batch}  ->  {s_excel}") };
+            if self.mode == WorkMode::Scan {
+                // —— 通用扫描结论（与筛选同一套收尾，只是文案/判定不同）——
+                self.push_log("ok", &format!("完成：命中 {s_hit} / 未命中 {s_miss} / 跳过 {s_skipped}，耗时 {s_elapsed}s"));
                 self.push_log("info", &format!("输出：{target}"));
-                if copied > 0 {
-                    self.push_log("ok", &format!("落盘命中文件 {copied} 份"));
-                }
-                self.starting = false;
-                // 真实目录（不是「目录 -> 文件」这种展示串）：界面「打开输出目录」要能真的打开它
-                self.scan_out_dir = batch_dir.clone();
-                // 验收输出：R<{content,status,opts}>R（扫描模式——有命中即通过）
-                let ok = self.scan_summary.hit > 0;
+                self.scan_out_dir = s_batch.clone();
+                let ok = s_hit > 0;
                 let content = format!(
                     "扫描 命中 {}/{}（未命中 {}，跳过 {}），耗时 {}s，产物 {}",
-                    self.scan_summary.hit, self.scan_summary.total_files, self.scan_summary.miss, self.scan_summary.skipped, self.scan_summary.elapsed, target
+                    s_hit, s_total, s_miss, s_skipped, s_elapsed, target
                 );
                 crate::core::result::emit(&content, ok, "scan");
                 let mark = if ok { "PASS" } else { "FAIL" };
                 self.feedback(if ok { "ok" } else { "warn" }, format!("扫描完成（{mark}）：{content}"));
-                self.finish_ui(false);
+                // 与筛选模式一致：允许走 auto_close 倒计时（旧实现传 false → 扫描永不倒计时）
+                self.finish_ui(true);
+                let _ = note;
+                return;
             }
-            Shot::Filter(outcome, note) => {
+            {
                 // 收尾也走就地归并：表里已经是这些行，只更新字段（不再整表替换 -> 不会出现「最后清空重建」）
+                // 逐行 upsert 走 filter_index，收尾这几万行也不会再卡（旧的 O(N) 扫描在这里最痛）
                 for r in &outcome.items {
                     self.upsert_filter_row(r);
                 }
+                // 收尾后同样按缓存上限淘汰（把最旧的移到 row_pool，索引随后重建）
+                let mut evicted_tail = false;
+                if let Some(pool) = self.row_pool.clone() {
+                    let cap = self.cfg.cache_capacity_rows.max(0) as usize;
+                    if cap > 0 && self.filter_items.len() > cap {
+                        let excess = self.filter_items.len() - cap;
+                        let moved: Vec<Map<String, Value>> = self.filter_items.drain(0..excess).collect();
+                        for it in moved {
+                            pool.push(it);
+                        }
+                        evicted_tail = true;
+                    }
+                }
                 if trim_rows(&mut self.filter_items) {
                     self.note_ui_truncated();
+                    evicted_tail = true;
+                }
+                if evicted_tail {
+                    self.rebuild_filter_index();
                 }
                 self.summary = outcome.summary.clone();
                 let line = {
@@ -719,7 +804,7 @@ impl FindanyApp {
                 let mark = if ok { "PASS" } else { "FAIL" };
                 self.feedback(if ok { "ok" } else { "err" }, format!("筛选完成（{mark}）：{content}"));
             }
-            Shot::None => {}
+            let _ = note;
         }
 
         if self.running() {
@@ -734,18 +819,23 @@ impl FindanyApp {
         let upload_on = self.cfg.enabled && !self.cfg.dry_run;
         let ran = (self.summary.upload_ok + self.summary.upload_conflict + self.summary.upload_fail) > 0;
         let all_ok = ran && self.summary.upload_fail == 0 && self.summary.upload_conflict == 0;
-        if self.mode == WorkMode::Filter {
-            if self.cfg.auto_close && allow_countdown && !empty && !(upload_on && ran && !all_ok) {
-                self.countdown = Some(self.cfg.countdown_sec.max(1) as u32);
-            }
+        // **两个模式同一套完成弹窗规则**（主上要求同步）：
+        //   auto_close 开 + 允许倒计时 + 有数据 + （筛选侧）回传没有异常
+        //   → 倒计时并自动关；否则只弹提示不倒计时。
+        // 旧实现按 mode 分支：筛选受 auto_close 控制、扫描无条件 Some(0) —— 同样的操作
+        // 在两个模式下的弹窗/倒计时行为不一样。
+        let upload_bad = self.mode == WorkMode::Filter && upload_on && ran && !all_ok;
+        if self.cfg.auto_close && allow_countdown && !empty && !upload_bad {
+            self.countdown = Some(self.cfg.countdown_sec.max(1) as u32);
         } else {
-            self.countdown = Some(0); // 扫描完成只弹提示
+            self.countdown = Some(0); // 只弹提示，不自动关
         }
     }
 
     fn tick_countdown(&mut self) {
         let Some(sec) = self.countdown else { return };
-        if sec == 0 || self.mode != WorkMode::Filter || !self.cfg.auto_close {
+        // 与 finish_ui 同口径：不再限制只有筛选模式才倒计时
+        if sec == 0 || !self.cfg.auto_close {
             self.last_tick = None;
             return;
         }
@@ -888,10 +978,12 @@ impl FindanyApp {
             return;
         }
         if self.busy() {
-            if ui
-                .add(egui::Button::new(RichText::new("停止").size(SIZE_BODY).strong().color(p.err)).min_size(size))
-                .clicked()
-            {
+            // 「停止」= 红色（主上指定）：危险/终止动作要一眼看到，区别于中性的常规按钮。
+            let btn = egui::Button::new(RichText::new("停止").size(SIZE_BODY).strong().color(p.err))
+                .fill(p.err.gamma_multiply(0.15))
+                .stroke(egui::Stroke::new(1.0, p.err))
+                .min_size(size);
+            if ui.add(btn).clicked() {
                 self.stop();
             }
             return;
@@ -1243,9 +1335,21 @@ impl FindanyApp {
                 if ui.add(dv).changed() {
                     self.cfg.max_files = cap;
                 }
+                row_label(ui, p, "缓存行数");
+                let mut rows = self.cfg.cache_capacity_rows;
+                let dv = egui::DragValue::new(&mut rows)
+                    .range(0..=100_000)
+                    .custom_formatter(|v, _| if v == 0.0 { "不限".to_string() } else { format!("{v:.0} 行") });
+                if ui.add(dv).changed() {
+                    self.cfg.cache_capacity_rows = rows;
+                }
             })
             .response
-            .on_hover_text("最多处理多少个文件，0=不限：防目录跑飞的保险丝（没配时程序自己也有一道 100 万的硬上限）");
+            .on_hover_text(
+                "文件数上限：最多处理多少个文件，0=不限（防目录跑飞的保险丝）。\n\
+                 缓存行数：内存里最多留多少行结果，超出立即淘汰最旧（被淘汰的行可从表格底部「加载更多」拉回）；0=不限。\n\
+                 这一项直接决定内存占用 —— 十万份日志按 5000 行缓存的常驻内存约 60MB，不限则会到 GB 级。",
+            );
             // 内存上限：百万级目录最怕被系统挤爆（那种死法没有 panic、没有弹窗、日志停在半截）
             ui.horizontal_wrapped(|ui| {
                 row_label(ui, p, "内存上限");
@@ -1349,48 +1453,85 @@ impl FindanyApp {
 
     fn result_area(&mut self, ui: &mut egui::Ui, p: &Palette) {
         // 实时计数从共享句柄读（不受分批节流影响，进度条与统计数字始终跟手）
-        let (live_done, live_total, live_pct, live_hit, live_miss, live_skip, running_secs) = match &self.running {
-            Running::Scan { t0, handle, .. } => {
-                let p: LiveProgress = handle.progress();
-                (p.done, p.total, p.pct, p.hit, p.miss, p.skipped, t0.elapsed().as_secs_f64())
-            }
-            Running::Filter { t0, handle, .. } => {
-                let p = handle.progress();
-                (p.done, p.total, p.pct, p.extracted, p.unknown, p.skipped, t0.elapsed().as_secs_f64())
-            }
-            Running::Idle => (0, 0, 0.0, 0, 0, 0, 0.0),
-        };
+        // **两个模式共用这一条**：同一个句柄、同一份 progress
+        let (live_done, live_total, live_pct, live_extracted, live_unknown, live_hit, live_miss, live_skip, running_secs) =
+            match &self.running {
+                Running::Filter { t0, handle, .. } => {
+                    let p = handle.progress();
+                    (
+                        p.done,
+                        p.total,
+                        p.pct,
+                        p.extracted,
+                        p.unknown,
+                        p.hit,
+                        p.miss,
+                        p.skipped,
+                        t0.elapsed().as_secs_f64(),
+                    )
+                }
+                Running::Idle => (0, 0, 0.0, 0, 0, 0, 0, 0, 0.0),
+            };
         let is_filter = self.mode == WorkMode::Filter;
         let running = self.running();
+        // 运行中读实时计数；结束后读 summary（两个模式的计数都在同一个 FilterSummary 里）
         let (a, b, c) = if running {
-            (live_hit, live_miss, live_skip)
+            if is_filter {
+                (live_extracted, live_unknown, live_skip)
+            } else {
+                (live_hit, live_miss, live_skip)
+            }
         } else if is_filter {
             (self.summary.extracted, self.summary.unknown, self.summary.skipped)
         } else {
-            (self.scan_summary.hit, self.scan_summary.miss, self.scan_summary.skipped)
+            (self.summary.hit, self.summary.miss, self.summary.skipped)
         };
-        let elapsed = if self.scan_summary.elapsed > 0.0 { self.scan_summary.elapsed } else { self.summary.elapsed };
+        let elapsed = self.summary.elapsed;
 
         ui.horizontal(|ui| {
             stat(ui, p, if is_filter { "提取成功" } else { "命中" }, &a.to_string(), p.ok);
             stat(ui, p, if is_filter { "未知类型" } else { "未命中" }, &b.to_string(), p.text2);
             stat(ui, p, "跳过", &c.to_string(), p.warn);
-            let total_files = if running {
-                live_total
-            } else if is_filter {
-                self.summary.total
-            } else {
-                self.scan_summary.total_files
-            };
+            let total_files = if running { live_total } else { self.summary.total };
             // 遍历阶段总数还是 0：显式提示「正在统计」，避免看着像卡住
             let total_txt = if running && total_files == 0 { "统计中…".to_string() } else { total_files.to_string() };
             stat(ui, p, "文件总数", &total_txt, p.text);
+            // 回传成功 / 失败：运行中直接从 handle 的 Atomic 读（跟手），结束后读 summary。
+            // 只在日志筛选模式显示（扫描模式没有回传概念）。
+            if is_filter {
+                let (up_ok, up_fail) = match &self.running {
+                    Running::Filter { handle, .. } => (
+                        handle.upload_ok.load(Ordering::Relaxed),
+                        handle.upload_fail.load(Ordering::Relaxed),
+                    ),
+                    _ => (self.summary.upload_ok, self.summary.upload_fail),
+                };
+                stat(ui, p, "回传成功", &up_ok.to_string(), p.ok);
+                stat(ui, p, "回传失败", &up_fail.to_string(), if up_fail > 0 { p.err } else { p.text2 });
+            }
             stat(ui, p, if running { "已用时" } else { "耗时" }, &format!("{:.2}s", if running { running_secs } else { elapsed }), p.info);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let Running::Filter { up_total, up_index, up_pct, sn, status, .. } = &self.running {
+                if let Running::Filter { handle, up_total, up_index, up_pct, sn, status, .. } = &self.running {
+                    // 实时累计：直接读 worker 的 AtomicUsize（每帧都是最新值）──
+                    // 不必等 Done 事件就能看到「成功 / 冲突 / 失败 / dry-run」当场在变。
+                    let ok = handle.upload_ok.load(Ordering::Relaxed);
+                    let conflict = handle.upload_conflict.load(Ordering::Relaxed);
+                    let fail = handle.upload_fail.load(Ordering::Relaxed);
+                    let dry = handle.upload_dry.load(Ordering::Relaxed);
+                    let ran = ok + conflict + fail + dry;
                     if *up_total > 0 {
                         ui.label(theme::dim(format!("回传 {}/{}  {}  {}", up_index, up_total, sn, status), p));
                         ui.add(egui::ProgressBar::new((*up_pct as f32 / 100.0).clamp(0.0, 1.0)).desired_width(140.0));
+                    }
+                    if ran > 0 {
+                        ui.label(theme::dim(
+                            format!(
+                                "已回传 {}：✓{} ⚠{} ✗{}{}",
+                                ran, ok, conflict, fail,
+                                if dry > 0 { format!(" / dry-run {}", dry) } else { String::new() }
+                            ),
+                            p,
+                        ));
                     }
                 }
                 let bar = if live_total > 0 { format!("{live_done}/{live_total}") } else { String::new() };
@@ -1414,7 +1555,7 @@ impl FindanyApp {
             ));
             // 中途停止 / 想留档时：把表格里现有的数据直接落盘（走的还是正式产物那条路）
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let n = if is_filter { self.filter_items.len() } else { self.items.len() };
+                let n = self.filter_items.len();
                 let tip = if n == 0 {
                     "表格里还没有数据"
                 } else {
@@ -1450,8 +1591,32 @@ impl FindanyApp {
             let changed = self.rows_changed;
             filter_table(ui, p, &self.filter_items, self.follow_tail, "filter_table", changed);
         } else {
+            // 扫描与筛选**同一条管道、同一份行数据**（Vec<Map>），只是这里的列定义不同
             let changed = self.rows_changed;
-            scan_table(ui, p, &self.items, self.follow_tail, "scan_table", changed);
+            scan_table(ui, p, &self.filter_items, self.follow_tail, "scan_table", changed);
+        }
+        // 表格底部「加载更多」：两个模式**共用同一个池与同一段渲染** ──
+        // 池里有被缓存上限淘汰的旧行时露出按钮，点了拉回插到表头（下标整体偏移，须重建索引）。
+        if let Some(pool) = self.row_pool.clone() {
+            let pool_len = pool.pool_len();
+            if pool_len > 0 {
+                ui.horizontal(|ui| {
+                    let step = pool_len.min(self.cfg.cache_capacity_rows.max(1) as usize);
+                    let label = load_more_label(pool_len, step);
+                    if ui
+                        .add(egui::Button::new(theme::body(&label, p)).min_size(egui::vec2(220.0, BTN_H)))
+                        .clicked()
+                    {
+                        let moved = pool.take_more(step);
+                        if !moved.is_empty() {
+                            self.filter_items.splice(0..0, moved);
+                            self.rebuild_filter_index();
+                            self.rows_changed = true;
+                            self.need_repaint = true;
+                        }
+                    }
+                });
+            }
         }
     }
 
@@ -1518,11 +1683,12 @@ impl FindanyApp {
                 let sub = if is_filter {
                     format!("产物：{}", self.summary.batch_dir)
                 } else {
-                    format!("命中 {}，未命中 {}，跳过 {}", self.scan_summary.hit, self.scan_summary.miss, self.scan_summary.skipped)
+                    format!("命中 {}，未命中 {}，跳过 {}", self.summary.hit, self.summary.miss, self.summary.skipped)
                 };
                 ui.label(RichText::new(title).size(SIZE_HEAD).strong());
                 ui.label(RichText::new(sub).size(SIZE_SMALL).color(p.text2));
-                if is_filter && self.cfg.auto_close && sec > 0 {
+                // 倒计时提示两个模式都显示（与 finish_ui 同口径）
+                if self.cfg.auto_close && sec > 0 {
                     ui.label(RichText::new(format!("{sec} 秒后自动关闭程序")).size(SIZE_SMALL).color(p.warn));
                 }
                 ui.add_space(4.0);
@@ -1530,7 +1696,10 @@ impl FindanyApp {
                     if ui.add(egui::Button::new(theme::body("打开输出目录", p)).min_size(egui::vec2(130.0, BTN_H))).clicked() {
                         self.open_out_dir();
                     }
-                    if ui.add(egui::Button::new(theme::body("延时 30s", p)).min_size(egui::vec2(100.0, BTN_H))).clicked() {
+                    // 「延时」只在真的在倒计时时才给（auto_close 关着的时候点了也不会动）
+                    if self.cfg.auto_close && sec > 0
+                        && ui.add(egui::Button::new(theme::body("延时 30s", p)).min_size(egui::vec2(100.0, BTN_H))).clicked()
+                    {
                         self.countdown = Some(sec + 30);
                     }
                     let cancel_label = if sec == 0 { "关闭提示" } else { "取消自动关" };
@@ -1546,7 +1715,8 @@ impl FindanyApp {
         if close_now {
             self.countdown = None;
         }
-        if is_filter && self.cfg.auto_close && sec > 0 {
+        // 倒计时在走：保持 500ms 重绘（两个模式一致）
+        if self.cfg.auto_close && sec > 0 {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
     }
@@ -1569,15 +1739,23 @@ fn uitest_debug() -> bool {
 pub fn export_probe(app: &mut FindanyApp, dir: &std::path::Path) -> String {
     app.mode = WorkMode::Scan;
     app.cfg.out_dir = dir.to_string_lossy().to_string();
-    app.items = (0..3)
-        .map(|i| ScanItem {
-            filename: format!("f{i}.log"),
-            rel_path: format!("f{i}.log"),
-            hit_line_text: "x".into(),
-            encoding: "utf-8".into(),
-            ..Default::default()
+    // 造 3 行测试数据（统一管道的行结构 = Map）
+    app.filter_items = (0..3)
+        .map(|i| {
+            let mut m = Map::new();
+            m.insert("rel_path".into(), Value::String(format!("f{i}.log")));
+            m.insert("filename".into(), Value::String(format!("f{i}.log")));
+            m.insert("dir_name".into(), Value::String(".".into()));
+            m.insert("hit".into(), Value::Bool(true));
+            m.insert("hit_line_text".into(), Value::String("x".into()));
+            m.insert("size_str".into(), Value::String("1.0 KB".into()));
+            m.insert("mtime_str".into(), Value::String("2026-09-22 00:00:00".into()));
+            m.insert("encoding".into(), Value::String("utf-8".into()));
+            m.insert("extract_ok".into(), Value::Bool(true));
+            m
         })
         .collect();
+    app.rebuild_filter_index();
     app.export_now();
     let mut waited = 0u32;
     while app.job_rx.is_some() && waited < 200 {
@@ -1603,6 +1781,13 @@ fn make_log_writer() -> std::sync::mpsc::Sender<Vec<(String, String)>> {
 /// 产物/导出不受影响 —— 明细是引擎侧自己写的（scan/export 在交界面之前就落盘了），
 /// 这里只裁「显示用的那一份」，几十万行也不会再把内存翻倍。
 pub const UI_ROW_CAP: usize = 50_000;
+
+/// worker -> UI 事件通道的**有界**容量（背压）。
+/// 无界通道下 worker 跑得比 UI 渲染快时，结果会在通道里堆到几十万行
+/// （每行含 4000 字符 HardwareHash ≈ 13KB，十万行 ≈ 1.3GB）—— 这是运行中内存
+/// 峰值远超实际数据量的主因。有界后队列最多这么多个批次，满了 worker 就阻塞等 UI。
+/// 32 个批次 × 每批最多 64 行 ≈ 2048 行 ≈ 27MB 封顶。
+pub const CHANNEL_BOUND: usize = 32;
 
 /// 超过上限就丢掉最旧的（返回 true=发生了截断）
 fn trim_rows<T>(rows: &mut Vec<T>) -> bool {
@@ -1698,13 +1883,34 @@ pub fn with_central_test_ui(ctx: &eframe::egui::Context, add: impl FnOnce(&mut e
 
 /// 回归自证入口（--uitest 用）：用 egui 的 central 层画一遍表格，
 /// 覆盖「首帧/0 尺寸/极小窗口」等历史上会喂出 NaN 的布局。
+/// 内部把测试用 ScanItem 转成管道的 Row(Map)，走的正是运行时那条渲染路径。
 pub fn render_scan_table_for_test(ui: &mut egui::Ui, items: &[ScanItem], follow: bool) -> (f32, f32, f32, f32) {
     // 一帧只画一张表：表格在 Ui 里是竖着排的，画两张时第二张会被挤出可视区，
     // 布局会被 egui 裁剪掉，量到的几何就不是真实值了。
     // follow=true 走「本帧有新行 → 钉到底」那条分支（历史上正是在这里 NaN 崩溃）。
     let p = theme::dark();
     let salt = if follow { "uitest_table_follow" } else { "uitest_table" };
-    scan_table(ui, &p, items, follow, salt, true)
+    let rows: Vec<Map<String, Value>> = items.iter().map(scan_item_to_row).collect();
+    scan_table(ui, &p, &rows, follow, salt, true)
+}
+
+/// ScanItem → 管道 Row（仅 uitest 构造测试数据用；运行时由 engine::scan_one 产出）
+fn scan_item_to_row(it: &ScanItem) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("rel_path".into(), Value::String(it.rel_path.clone()));
+    m.insert("dir_name".into(), Value::String(it.dir_name.clone()));
+    m.insert("filename".into(), Value::String(it.filename.clone()));
+    m.insert("hit".into(), Value::Bool(it.hit));
+    m.insert(
+        "hit_lines".into(),
+        Value::String(it.hit_lines.iter().take(6).map(|x| x.to_string()).collect::<Vec<_>>().join(",")),
+    );
+    m.insert("hit_line_text".into(), Value::String(it.hit_line_text.clone()));
+    m.insert("hit_count".into(), Value::Number(it.hit_count.into()));
+    m.insert("size_str".into(), Value::String(it.size_str()));
+    m.insert("mtime_str".into(), Value::String(it.mtime_str()));
+    m.insert("encoding".into(), Value::String(it.encoding.clone()));
+    m
 }
 
 fn stat(ui: &mut egui::Ui, p: &Palette, label: &str, value: &str, color: Color32) {
@@ -1745,8 +1951,13 @@ fn open_path(path: &str) -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        return std::process::Command::new("explorer")
-            .arg(path.replace('/', "\\"))
+        // 用 `cmd /c start "" "<dir>"` 而不是直接 spawn explorer.exe：
+        // · `start` 是 cmd 内建，会立刻返回（不等待资源管理器窗口就绪）；
+        // · 直接 spawn explorer 时，目标在网络盘/UNC 上会卡在 CreateProcess 的路径解析上，
+        //   调用线程被占住几秒到几十秒（「打开目录就卡死」的成因之一）。
+        // 空标题参数 "" 不能省：否则路径带引号时 start 会把它当窗口标题。
+        return std::process::Command::new("cmd")
+            .args(["/c", "start", "", &path.replace('/', "\\")])
             .spawn()
             .is_ok();
     }
@@ -1788,96 +1999,156 @@ fn table_viewport(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> egui::Ve
 }
 
 #[allow(clippy::type_complexity)]
-fn scan_table(ui: &mut egui::Ui, p: &Palette, items: &[ScanItem], follow: bool, scroll_id: &str, rows_changed: bool) -> (f32, f32, f32, f32) {
-    let headers = ["序号", "相对路径", "目录", "扩展名", "包含状态", "命中行号", "命中行内容", "匹配计数", "大小", "修改时间", "编码"];
+/// 「加载更多」按钮的共用文案（通用扫描与日志筛选回传用同一套渲染）。
+fn load_more_label(pool_len: usize, step: usize) -> String {
+    if pool_len <= step {
+        format!("加载更多（剩 {} 行）", pool_len)
+    } else {
+        format!("加载更多（剩 {} 行，点一次拉 {}）", pool_len, step)
+    }
+}
+
+/// 通用结果表渲染：通用扫描与日志筛选回传共用这一份渲染实现。
+/// 两个模式此前各有一份几乎逐行重复的表格代码 —— 这正是「筛选修了、扫描没修」的根源
+/// （例如虚拟化、跟随最新、行缓存策略，改一处漏一处）。现在只保留这一份：
+/// 调用方只提供「列定义」和「每格取什么文本/颜色」，其余（定高视口、横向滚动、
+/// 纵向交给表格自身滚动区、跟随最新、虚拟化、uitest 探针）全部共用。
+///
+/// `cols`: (表头, 初始列宽, 最小列宽)
+/// `cell(row, col, palette) -> (文本, 颜色)`
+#[allow(clippy::type_complexity)]
+fn rows_table(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    cols: &[(&str, f32, f32)],
+    row_count: usize,
+    follow: bool,
+    scroll_id: &str,
+    rows_changed: bool,
+    cell: &dyn Fn(usize, usize, &Palette) -> (String, Color32),
+) -> (f32, f32, f32, f32) {
     // 供 --uitest 断言「跟随最新时每帧都精确贴底、且 offset 单调不减」
     let mut probe = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     let mut rendered = 0usize;
     table_viewport(ui, |ui| {
         let vp = ui.max_rect().size();
         // 外层滚动区只管横向（列比窗口宽）；**纵向滚动必须用表格自己的滚动区**——
-        // TableBuilder::body() 内部本身就是一个 ScrollArea（管行）。以前把纵向也交给外面这层，
-        // 外面那层的内容高恰好等于一屏（表格自己的滚动区就那么大），纵向范围恒为 0：
+        // TableBuilder::body() 内部本身就是一个 ScrollArea（管行）。把纵向也交给外面这层时，
+        // 外面那层的内容高恰好等于一屏，纵向范围恒为 0：
         //   · 每批新行都会把整张表顶上去再被夹回来 -> 画面一闪一闪
-        //   · 表格永远不跟随最新行 -> 用户看不到实时预览
+        //   · 表格永远不跟随最新行 -> 看不到实时预览
         let sa = egui::ScrollArea::horizontal().id_salt(scroll_id).auto_shrink([false, false]);
         sa.show(ui, |ui| {
-        let mut tb = egui_extras::TableBuilder::new(ui)
-            .vscroll(true)
-            // 程序化滚动立即生效：平滑追赶动画 + 每 200ms 一批的刷新率 = 肉眼看到的"来回追"
-            .animate_scrolling(false)
-            .auto_shrink([false, false]);
-        if follow {
-            tb = tb.stick_to_bottom(true);
-            if rows_changed && !items.is_empty() {
-                // 本帧有新行：把表格自己的滚动区钉到最后一行的底部
-                tb = tb.scroll_to_row(items.len() - 1, Some(egui::Align::BOTTOM));
+            let mut tb = egui_extras::TableBuilder::new(ui)
+                .vscroll(true)
+                // 程序化滚动立即生效：平滑追赶动画 + 每 200ms 一批的刷新率 = 肉眼看到的"来回追"
+                .animate_scrolling(false)
+                .auto_shrink([false, false])
+                .striped(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+            for (_, w, min_w) in cols {
+                tb = tb.column(egui_extras::Column::initial(*w).at_least(*min_w).clip(true));
             }
-        }
-        let out = tb
-            .striped(true)
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(egui_extras::Column::exact(52.0))
-            .column(egui_extras::Column::initial(280.0).at_least(140.0).clip(true))
-            .column(egui_extras::Column::initial(130.0).at_least(70.0).clip(true))
-            .column(egui_extras::Column::exact(66.0))
-            .column(egui_extras::Column::exact(78.0))
-            .column(egui_extras::Column::initial(120.0).clip(true))
-            .column(egui_extras::Column::initial(340.0).clip(true))
-            .column(egui_extras::Column::exact(76.0))
-            .column(egui_extras::Column::exact(86.0))
-            .column(egui_extras::Column::initial(160.0).clip(true))
-            .column(egui_extras::Column::exact(96.0))
-            .header(ROW_H, |mut header| {
-                for h in headers {
-                    header.col(|ui| {
-                        ui.label(RichText::new(h).size(SIZE_SMALL).strong().color(p.text2));
-                    });
+            if follow {
+                tb = tb.stick_to_bottom(true);
+                if rows_changed && row_count > 0 {
+                    // 本帧有新行：把表格自己的滚动区钉到最后一行的底部
+                    tb = tb.scroll_to_row(row_count - 1, Some(egui::Align::BOTTOM));
                 }
-            })
-            .body(|body| {
-                body.rows(ROW_H, items.len(), |mut row| {
-                    rendered += 1;
-                    let i = row.index();
-                    let it = &items[i];
-                    row.col(|ui| { ui.label(RichText::new((i + 1).to_string()).size(SIZE_BODY)); });
-                    row.col(|ui| { ui.label(RichText::new(&it.rel_path).size(SIZE_BODY)); });
-                    row.col(|ui| { ui.label(RichText::new(&it.dir_name).size(SIZE_BODY)); });
-                    row.col(|ui| { ui.label(RichText::new(ext(&it.filename)).size(SIZE_BODY)); });
-                    row.col(|ui| {
-                        let (t, c) = if it.hit { ("命中", p.ok) } else { ("未命中", p.text2) };
-                        ui.label(RichText::new(t).size(SIZE_BODY).color(c));
+            }
+            let out = tb
+                .header(ROW_H, |mut header| {
+                    for (h, _, _) in cols {
+                        header.col(|ui| {
+                            ui.label(RichText::new(*h).size(SIZE_SMALL).strong().color(p.text2));
+                        });
+                    }
+                })
+                .body(|body| {
+                    body.rows(ROW_H, row_count, |mut row| {
+                        rendered += 1;
+                        let i = row.index();
+                        for c in 0..cols.len() {
+                            row.col(|ui| {
+                                let (txt, color) = cell(i, c, p);
+                                ui.label(RichText::new(txt).size(SIZE_BODY).color(color));
+                            });
+                        }
                     });
-                    row.col(|ui| {
-                        let s = if it.hit { it.hit_lines.iter().take(6).map(|x| x.to_string()).collect::<Vec<_>>().join(",") } else { String::new() };
-                        ui.label(RichText::new(s).size(SIZE_BODY));
-                    });
-                    row.col(|ui| { ui.label(RichText::new(if it.hit { &it.hit_line_text } else { "" }).size(SIZE_BODY)); });
-                    row.col(|ui| { ui.label(RichText::new(if it.hit { it.hit_count.to_string() } else { String::new() }).size(SIZE_BODY)); });
-                    row.col(|ui| { ui.label(RichText::new(it.size_str()).size(SIZE_BODY)); });
-                    row.col(|ui| { ui.label(RichText::new(it.mtime_str()).size(SIZE_BODY)); });
-                    row.col(|ui| { ui.label(RichText::new(&it.encoding).size(SIZE_BODY)); });
                 });
-            });
-        // 探针：--uitest 用「跟随最新时每帧精确贴底 + 位置单调不减」锁住这个行为
-        probe = (out.state.offset.y, (out.content_size.y - out.inner_rect.height()).max(0.0), out.content_size.y, out.inner_rect.height());
-        if uitest_debug() {
-            println!(
-                "[dbg] rows={} rendered={} vp={:?} offset={:?} content={:?} inner={:?}",
-                items.len(), rendered, vp, out.state.offset, out.content_size, out.inner_rect.size()
-            );
-        }
+            // 探针：--uitest 用「跟随最新时每帧精确贴底 + 位置单调不减」锁住这个行为
+            probe = (out.state.offset.y, (out.content_size.y - out.inner_rect.height()).max(0.0), out.content_size.y, out.inner_rect.height());
+            if uitest_debug() {
+                println!(
+                    "[dbg] rows={} rendered={} vp={:?} offset={:?} content={:?} inner={:?}",
+                    row_count, rendered, vp, out.state.offset, out.content_size, out.inner_rect.size()
+                );
+            }
         });
         vp
     });
     probe
 }
 
+/// Map 取字符串（空/缺省都返回空串，与既有取值口径一致）
+fn sval(row: &Map<String, Value>, key: &str) -> String {
+    match row.get(key) {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// 通用扫描结果表：**数据来自与筛选完全相同的那条管道**（Row = Map），
+/// 只是列定义与取值不同。渲染本身走 rows_table（同一个实现）。
+#[allow(clippy::type_complexity)]
+fn scan_table(ui: &mut egui::Ui, p: &Palette, rows: &[Map<String, Value>], follow: bool, scroll_id: &str, rows_changed: bool) -> (f32, f32, f32, f32) {
+    const COLS: [(&str, f32, f32); 11] = [
+        ("序号", 52.0, 52.0),
+        ("相对路径", 280.0, 140.0),
+        ("目录", 130.0, 70.0),
+        ("扩展名", 66.0, 54.0),
+        ("包含状态", 78.0, 54.0),
+        ("命中行号", 120.0, 54.0),
+        ("命中行内容", 340.0, 54.0),
+        ("匹配计数", 76.0, 54.0),
+        ("大小", 86.0, 54.0),
+        ("修改时间", 160.0, 54.0),
+        ("编码", 96.0, 54.0),
+    ];
+    rows_table(ui, p, &COLS, rows.len(), follow, scroll_id, rows_changed, &|i, c, p| {
+        let r = &rows[i];
+        match c {
+            0 => ((i + 1).to_string(), p.text),
+            1 => (sval(r, "rel_path"), p.text),
+            2 => (sval(r, "dir_name"), p.text),
+            3 => (ext(&sval(r, "filename")), p.text),
+            4 => {
+                let hit = r.get("hit").and_then(|v| v.as_bool()).unwrap_or(false);
+                let skip = sval(r, "skip_reason");
+                if !skip.is_empty() {
+                    ("跳过".to_string(), p.warn)
+                } else if hit {
+                    ("命中".to_string(), p.ok)
+                } else {
+                    ("未命中".to_string(), p.text2)
+                }
+            }
+            5 => (sval(r, "hit_lines"), p.text),
+            6 => (sval(r, "hit_line_text"), p.text),
+            7 => (sval(r, "hit_count"), p.text),
+            8 => (sval(r, "size_str"), p.text),
+            9 => (sval(r, "mtime_str"), p.text),
+            10 => (sval(r, "encoding"), p.text),
+            _ => (String::new(), p.text),
+        }
+    })
+}
+
 #[allow(clippy::type_complexity)]
 fn filter_table(ui: &mut egui::Ui, p: &Palette, items: &[Map<String, Value>], follow: bool, scroll_id: &str, rows_changed: bool) -> (f32, f32, f32, f32) {
-    // 供 --uitest 断言「跟随最新时每帧都精确贴底、且 offset 单调不减」
-    let mut probe = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-    let cols: [(&str, &str, f32); 14] = [
+    // (表头, 取值键, 初始列宽)；渲染全部走 rows_table（与通用扫描同一份实现）
+    const COLS: [(&str, &str, f32); 14] = [
         ("序号", "idx", 52.0),
         ("文件", "log_file", 260.0),
         ("判型", "detected_type", 110.0),
@@ -1893,64 +2164,29 @@ fn filter_table(ui: &mut egui::Ui, p: &Palette, items: &[Map<String, Value>], fo
         ("提取错误", "error", 200.0),
         ("回传错误", "upload_error", 240.0),
     ];
-    table_viewport(ui, |ui| {
-        let vp = ui.max_rect().size();
-        // 外层只管横向、纵向交给表格自己的滚动区（理由见 scan_table）
-        let sa = egui::ScrollArea::horizontal().id_salt(scroll_id).auto_shrink([false, false]);
-        sa.show(ui, |ui| {
-        let mut tb = egui_extras::TableBuilder::new(ui)
-            .vscroll(true)
-            .animate_scrolling(false)
-            .auto_shrink([false, false])
-            .striped(true)
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
-        for (_, _, w) in cols {
-            tb = tb.column(egui_extras::Column::initial(w).at_least(54.0).clip(true));
+    let layout: Vec<(&str, f32, f32)> = COLS.iter().map(|(h, _, w)| (*h, *w, 54.0)).collect();
+    rows_table(ui, p, &layout, items.len(), follow, scroll_id, rows_changed, &|i, c, p| {
+        if c == 0 {
+            return ((i + 1).to_string(), p.text);
         }
-        if follow {
-            tb = tb.stick_to_bottom(true);
-            if rows_changed && !items.is_empty() {
-                tb = tb.scroll_to_row(items.len() - 1, Some(egui::Align::BOTTOM));
-            }
-        }
-        let out = tb.header(ROW_H, |mut header| {
-            for (h, _, _) in cols {
-                header.col(|ui| {
-                    ui.label(RichText::new(h).size(SIZE_SMALL).strong().color(p.text2));
-                });
-            }
-        })
-        .body(|body| {
-            body.rows(ROW_H, items.len(), |mut row| {
-                let i = row.index();
-                let it = &items[i];
-                row.col(|ui| { ui.label(RichText::new((i + 1).to_string()).size(SIZE_BODY)); });
-                for (_, key, _) in cols.iter().skip(1) {
-                    row.col(|ui| {
-                        let v = match it.get(*key) {
-                            Some(Value::String(s)) => s.clone(),
-                            Some(Value::Null) | None => String::new(),
-                            Some(other) => other.to_string(),
-                        };
-                        let color = match *key {
-                            "upload_state" | "extract_state" => match v.as_str() {
-                                "成功" => p.ok,
-                                "失败" => p.err,
-                                "冲突(人工)" => p.warn,
-                                _ => p.text,
-                            },
-                            _ => p.text,
-                        };
-                        ui.label(RichText::new(truncate(&v, 64)).size(SIZE_BODY).color(color));
-                    });
-                }
-            });
-        });
-        probe = (out.state.offset.y, (out.content_size.y - out.inner_rect.height()).max(0.0), out.content_size.y, out.inner_rect.height());
-        });   // 收 sa.show
-        vp
-    });   // 收 table_viewport 闭包
-    probe
+        let key = COLS[c].1;
+        let it = &items[i];
+        let v = match it.get(key) {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Null) | None => String::new(),
+            Some(other) => other.to_string(),
+        };
+        let color = match key {
+            "upload_state" | "extract_state" => match v.as_str() {
+                "成功" => p.ok,
+                "失败" => p.err,
+                "冲突(人工)" => p.warn,
+                _ => p.text,
+            },
+            _ => p.text,
+        };
+        (truncate(&v, 64), color)
+    })
 }
 
 impl eframe::App for FindanyApp {
@@ -1974,7 +2210,7 @@ impl eframe::App for FindanyApp {
         theme::apply(&ctx, &p, self.dark);
         self.poll();
         // 本帧行数变化 -> 结果表抬底（只在有新内容那一帧抬，不跟用户抢滚动条）
-        let rows_now = self.items.len() + self.filter_items.len();
+        let rows_now = self.filter_items.len();
         self.rows_changed = rows_now != self.last_row_count;
         self.last_row_count = rows_now;
         self.tick_save(&ctx);

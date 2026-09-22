@@ -24,6 +24,11 @@ venv/
 
 # just msi 按 mesa/ 实际 dll 列表生成的 WiX 片段（勿入库）
 /wix/mesa.generated.wxi
+# just msi 按运行时图标 PNG 列表生成的 WiX 片段（勿入库,build script 自动重写）
+/wix/icon.generated.wxi
+# 旧图标/资源备份（替换品牌时挪出 → 备份目录,不入库）
+_bak_*/
+_bak_*/**
 
 # 运行产出的批次目录（out/YYYY-MM-DD_HH-MM 之类跑飞的产物，不入库）
 /20??-??-??_??-??/
@@ -31,3 +36,10 @@ venv/
 
 # Mesa 软件 OpenGL 交付材料（59MB 第三方 DLL，随包分发不入库）
 /mesa/
+
+# 10W+ 压测数据（本地生成，约 2.9GB，不入库）
+# 生成/自检脚本与说明保留在 tests/benchdata/10w_mix/，数据本体按需本地生成
+/tests/benchdata/*/real/
+/tests/benchdata/*/fake/
+/tests/benchdata/*/manifest.json
+

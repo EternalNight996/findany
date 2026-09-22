@@ -197,11 +197,15 @@ pub fn resolve_cli(cli_path: &str, app_dir: &str) -> String {
 }
 
 /// 真实子进程调用。stdin 写完必须关闭（CLI 收到 EOF 才上传，SOP 第 4 节）。
+///
+/// `cancel` 可选：传入时每 20ms 检一次，cancel=true 立即 kill 子进程并返回 Err("cancelled")。
+/// 取消粒度从"整台超时（默认 60s）"压到 ~20ms —— 解决"点停止后干等几十秒到几分钟才退出"。
 pub fn default_runner(
     cmd: &[String],
     stdin_bytes: Option<Vec<u8>>,
     use_stdin: bool,
     timeout: f64,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<(Option<i64>, String, String), String> {
     if cmd.is_empty() {
         return Err("CLI 路径为空".into());
@@ -249,6 +253,15 @@ pub fn default_runner(
         match child.try_wait() {
             Ok(Some(st)) => break Some(st.code().unwrap_or(-1) as i64),
             Ok(None) => {
+                // 取消优先级最高：每 20ms 轮询一次，cancel=true 立即 kill
+                if let Some(c) = cancel {
+                    if c.load(std::sync::atomic::Ordering::SeqCst) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = err_handle.join();
+                        return Err("cancelled".into());
+                    }
+                }
                 if Instant::now() > deadline {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -290,6 +303,7 @@ pub fn run_upload(
     fields: &Map<String, Value>,
     dry_run: bool,
     on_log: &dyn Fn(&str, &str),
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> UploadResult {
     let payload = build_payload(fields, &profile.field_map);
     let miss = missing_fields(&payload);
@@ -316,8 +330,16 @@ pub fn run_upload(
     let t0 = Instant::now();
     let max_try = (profile.max_retries + 1).max(1);
     for attempt in 1..=max_try {
+        // 每轮重试前检一次 cancel（避免 max_retries=3 时连跑 3 次 dry-run 即使已取消）
+        if let Some(c) = cancel {
+            if c.load(std::sync::atomic::Ordering::SeqCst) {
+                res.error = "cancelled".into();
+                res.elapsed = round2(t0.elapsed().as_secs_f64());
+                return res;
+            }
+        }
         res.attempts = attempt;
-        let (rc, stdout, stderr) = match default_runner(&cmd, Some(stdin_bytes.clone()), profile.use_stdin, profile.timeout_sec) {
+        let (rc, stdout, stderr) = match default_runner(&cmd, Some(stdin_bytes.clone()), profile.use_stdin, profile.timeout_sec, cancel) {
             Ok(v) => v,
             Err(e) => {
                 res.error = e;

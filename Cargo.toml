@@ -12,6 +12,12 @@ build = "build.rs"
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winres = "0.1"
 
+# Windows 专用分配器：系统默认分配器（malloc/HeapAlloc）**不把空闲内存还给操作系统**，
+# 表现为「跑完一轮后任务管理器里的内存降不回去」（实测 89MB -> 峰值 800MB -> 停在 453MB）。
+# mimalloc 会定期 purge 空闲页（默认 delay 10ms），结束后内存能真正回落。
+[target.'cfg(target_os = "windows")'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+
 [dependencies]
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 egui_extras = "0.36"

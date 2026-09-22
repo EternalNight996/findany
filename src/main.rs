@@ -17,6 +17,13 @@
 // ↑ 与 gpu-test / heg-os-active2 同款：release = GUI 子系统（双击不弹命令行窗口），
 //   启动时 reattach_windows_terminal() 挂父控制台，cmd 下照样能看到 stdout 日志。
 
+// Windows 分配器换成 mimalloc：系统默认分配器不把空闲内存还给 OS，表现为
+// 「跑完一轮后内存降不回去」（实测 89MB 起步、峰值 800MB、结束后停在 453MB）。
+// mimalloc 会定期 purge 空闲页，结束后工作集能真正回落。
+#[cfg(windows)]
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod core;
 mod ui;
 
@@ -381,21 +388,28 @@ fn run_uitest() -> bool {
 
 /// 输出扫描总耗时、事件批次数、单帧最坏消费耗时（界面卡不卡就看这个）
 fn run_bench(dir: &str, keyword: &str, threads: i64) {
-    let cfg = core::config::SearchConfig {
+    // **与界面同一条管道**：mode="scan" 走扫描策略 —— bench 量的就是界面跑的真实路径
+    // （以前这里调的是独立的 ScanEngine，和界面用的不是一套，量出来的数对不上）。
+    let d = core::config::SearchConfig::default();
+    let rcfg = core::logfilter::engine::FilterRunCfg {
         root_dir: dir.to_string(),
-        keyword: keyword.to_string(),
         out_dir: std::env::temp_dir().join("findany-bench-out").to_string_lossy().to_string(),
         threads: if threads > 0 {
             threads.clamp(1, 64)
         } else {
             std::cmp::max(4, std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as i64)
         },
-        copy_files: false,
+        extensions: d.extensions.clone(),
+        keep_logs: false,
+        mode: "scan".into(),
+        keyword: keyword.to_string(),
+        match_mode: "inc".into(),
+        case_sensitive: false,
         ..Default::default()
     };
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::sync_channel(32);
     let t0 = std::time::Instant::now();
-    let handle = core::scanner::spawn_scan(cfg, tx);
+    let handle = core::logfilter::engine::spawn_filter(rcfg, tx);
     let mut batches = 0usize;
     let mut rows = 0usize;
     let mut queue_peak = 0usize;
@@ -409,16 +423,17 @@ fn run_bench(dir: &str, keyword: &str, threads: i64) {
         let mut done = false;
         while consumed < 2000 && std::time::Instant::now() < budget {
             match rx.try_recv() {
-                Ok(core::scanner::ScanEvent::Batch(b)) => {
+                Ok(core::logfilter::engine::FilterEvent::Batch(b)) => {
                     rows += b.items.len();
                     batches += 1;
                     consumed += 1;
                 }
-                Ok(core::scanner::ScanEvent::Done(o, _, _, _)) => {
+                Ok(core::logfilter::engine::FilterEvent::Done(o, _)) => {
                     let _ = o;
                     done = true;
                     break;
                 }
+                Ok(_) => {}
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     done = true;
@@ -437,10 +452,28 @@ fn run_bench(dir: &str, keyword: &str, threads: i64) {
         }
         std::thread::sleep(std::time::Duration::from_millis(16)); // 模拟 60fps 一帧
     }
-    let total = handle.last_total();
-    println!("[bench] 文件 {}，命中 {}，分批 {} 批 / {} 行", total, handle.last_hit(), batches, rows);
+    use std::sync::atomic::Ordering;
+    let total = handle.total.load(Ordering::Relaxed);
+    let hit = handle.hit_n.load(Ordering::Relaxed);
+    println!("[bench] 文件 {total}，命中 {hit}，分批 {batches} 批 / {rows} 行");
     println!("[bench] 扫描总耗时 {:.2}s，界面帧数 {}，单帧最坏 {:.1}ms", t0.elapsed().as_secs_f64(), frames, worst_frame.as_secs_f64() * 1000.0);
     let _ = queue_peak;
+}
+
+/// selftest 用：造一个「扫描模式」的统一管道配置（**与界面跑的是同一套**）
+fn scan_pipe_cfg(root: &str, out: &str, keyword: &str, threads: i64) -> core::logfilter::engine::FilterRunCfg {
+    core::logfilter::engine::FilterRunCfg {
+        root_dir: root.to_string(),
+        out_dir: out.to_string(),
+        threads,
+        extensions: core::config::SearchConfig::default().extensions.clone(),
+        keep_logs: false,
+        mode: "scan".into(),
+        keyword: keyword.to_string(),
+        match_mode: "inc".into(),
+        case_sensitive: false,
+        ..Default::default()
+    }
 }
 
 /// 自检（无 GUI）：findany --selftest <日志目录>
@@ -571,25 +604,19 @@ fn run_selftest(dir: &str) -> i32 {
         check("样例 0025 存在", false, "未找到");
     }
 
-    // 3) 通用扫描端到端：出 Excel 产物
+    // 3) 通用扫描端到端：出 Excel 产物（**与界面同一条管道**，mode="scan"）
     {
         let out_root = std::env::temp_dir().join("findany-selftest-out");
         let _ = std::fs::create_dir_all(&out_root);
-        let scfg = core::config::SearchConfig {
-            root_dir: dir.to_string(),
-            keyword: "HardwareHash".into(),
-            out_dir: out_root.to_string_lossy().to_string(),
-            threads: 4,
-            ..Default::default()
-        };
-        let engine = core::scanner::ScanEngine::new(scfg.clone());
-        let outcome = engine.scan(|_batch| true);
-        check("扫描命中", outcome.summary.hit >= 3, &format!("hit={}", outcome.summary.hit));
-        check("扫描无跳过", outcome.summary.skipped == 0, &format!("skipped={}", outcome.summary.skipped));
-        match core::scanner::export_scan_products(&outcome.items, &outcome.summary, &scfg) {
-            Ok((batch, xlsx, _)) => {
-                let size = std::fs::metadata(&xlsx).map(|m| m.len()).unwrap_or(0);
-                check("Excel 产物落盘", size > 4096, &format!("{xlsx} size={size}"));
+        let scfg = scan_pipe_cfg(dir, &out_root.to_string_lossy(), "HardwareHash", 4);
+        let cancel0 = std::sync::atomic::AtomicBool::new(false);
+        let (items, summary0) = core::logfilter::engine::run_filter(&scfg, None, &cancel0);
+        check("扫描命中", summary0.hit >= 3, &format!("hit={}", summary0.hit));
+        check("扫描无跳过", summary0.skipped == 0, &format!("skipped={}", summary0.skipped));
+        match core::logfilter::engine::export_products(&scfg, &items, &summary0, std::time::Instant::now()) {
+            Ok((batch, excel, _audit, _kept)) => {
+                let size = std::fs::metadata(&excel).map(|m| m.len()).unwrap_or(0);
+                check("Excel 产物落盘", size > 4096, &format!("{excel} size={size}"));
                 check("批次目录按时间命名", std::path::Path::new(&batch).is_dir(), &batch);
             }
             Err(e) => check("Excel 产物落盘", false, &e.to_string()),
@@ -610,14 +637,7 @@ fn run_selftest(dir: &str) -> i32 {
             let p = files_dir.join(format!("f{i:03}.log"));
             let _ = std::fs::write(&p, format!("line A {i}\nHardwareHash item {i}\nline C\n"));
         }
-        let lcfg = core::config::SearchConfig {
-            root_dir: files_dir.to_string_lossy().to_string(),
-            keyword: "HardwareHash".into(),
-            out_dir: bulk.to_string_lossy().to_string(),
-            threads: 4,
-            copy_files: false,
-            ..Default::default()
-        };
+        // （lcfg 已由下文的 scan_pipe_cfg 取代：与界面同一条管道）
         let created = std::fs::read_dir(&files_dir).map(|r| r.filter_map(|e| e.ok()).count()).unwrap_or(0);
         let walked = core::scanner::walk_files(&files_dir, &["log".to_string()], true).len();
         check("临时批量文件已建", created == 240, &format!("created={created}"));
@@ -630,38 +650,32 @@ fn run_selftest(dir: &str) -> i32 {
             .into_iter()
             .next()
             .unwrap_or_default();
-        let ocfg = core::config::SearchConfig {
-            root_dir: one.to_string_lossy().to_string(),
-            keyword: "HardwareHash".into(),
-            out_dir: bulk.to_string_lossy().to_string(),
-            threads: 1,
-            copy_files: false,
-            ..Default::default()
-        };
-        let otx = std::sync::mpsc::channel();
-        let ohandle = core::scanner::spawn_scan(ocfg, otx.0);
+        let oc = scan_pipe_cfg(&one.to_string_lossy(), &bulk.to_string_lossy(), "HardwareHash", 1);
+        let otx = std::sync::mpsc::sync_channel(32);
+        let ohandle = core::logfilter::engine::spawn_filter(oc, otx.0);
         let mut orows = 0usize;
         loop {
             match otx.1.recv() {
-                Ok(core::scanner::ScanEvent::Batch(b)) => orows += b.items.len(),
-                Ok(core::scanner::ScanEvent::Done(..)) => break,
+                Ok(core::logfilter::engine::FilterEvent::Batch(b)) => orows += b.items.len(),
+                Ok(core::logfilter::engine::FilterEvent::Done(..)) => break,
+                Ok(_) => {}
                 Err(_) => break,
             }
         }
         check("单文件扫描出 1 行", orows == 1, &format!("rows={orows}"));
         // 资源控制：max_files 真的截断（服务器上防目录跑飞）
         {
-            let mut ccfg = core::config::SearchConfig::default();
-            ccfg.root_dir = files_dir.to_string_lossy().to_string();
-            ccfg.keyword = "HardwareHash".into();
-            ccfg.out_dir = bulk.to_string_lossy().to_string();
-            ccfg.threads = 1;
+            let mut ccfg = scan_pipe_cfg(&files_dir.to_string_lossy(), &bulk.to_string_lossy(), "HardwareHash", 1);
             ccfg.max_files = 5;
-            let eng = core::scanner::ScanEngine::new(ccfg);
-            let out = eng.scan(|_| true);
-            check("max_files 截断生效(240->5)", out.summary.total_files == 5, &format!("total={}", out.summary.total_files));
+            let cancel1 = std::sync::atomic::AtomicBool::new(false);
+            let (_items, out) = core::logfilter::engine::run_filter(&ccfg, None, &cancel1);
+            check("max_files 截断生效(240->5)", out.total == 5, &format!("total={}", out.total));
         }
-        check("单文件统计总数=1", ohandle.last_total() == 1, &format!("total={}", ohandle.last_total()));
+        {
+            use std::sync::atomic::Ordering;
+            let t = ohandle.total.load(Ordering::Relaxed);
+            check("单文件统计总数=1", t == 1, &format!("total={t}"));
+        }
 
         // 文件类型过滤回归：勾了 log 就只扫 log（大小写都算），只要 txt 就不带 log，空列表=全部
         let mix = std::env::temp_dir().join("findany-ext-mix");
@@ -724,34 +738,39 @@ fn run_selftest(dir: &str) -> i32 {
             let _ = std::fs::remove_dir_all(&bdir);
         }
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = core::scanner::spawn_scan(lcfg, tx);
+        let (tx, rx) = std::sync::mpsc::sync_channel(32);
+        let lrcfg = scan_pipe_cfg(&files_dir.to_string_lossy(), &bulk.to_string_lossy(), "HardwareHash", 4);
+        let handle = core::logfilter::engine::spawn_filter(lrcfg, tx);
         let mut batches = 0usize;
         let mut scanned_rows = 0usize;
-        let mut partial_first = false;
         let mut first_batch_rows = 0usize;
         let mut done_hit = 0usize;
         let mut done_total = 0usize;
         // 一路收到 Done：既能证明「批先到、结果后到」，也能核对分批累计等于全量
         loop {
             match rx.recv() {
-                Ok(core::scanner::ScanEvent::Batch(b)) => {
+                Ok(core::logfilter::engine::FilterEvent::Batch(b)) => {
                     batches += 1;
                     scanned_rows += b.items.len();
                     if batches == 1 {
                         first_batch_rows = b.items.len();
-                        partial_first = handle.last_total() > first_batch_rows;
                     }
                 }
-                Ok(core::scanner::ScanEvent::Done(o, _, _, _)) => {
-                    done_total = o.summary.total_files;
+                Ok(core::logfilter::engine::FilterEvent::Done(o, _)) => {
+                    done_total = o.summary.total;
                     done_hit = o.summary.hit;
                     break;
                 }
+                Ok(_) => {}
                 Err(_) => break,
             }
         }
-        let scanned_total = handle.last_total();
+        use std::sync::atomic::Ordering;
+        let scanned_total = handle.total.load(Ordering::Relaxed);
+        // 首批发的是**部分**结果：总量（240）明显大于首批行数。
+        // 注意口径：统一管道是**流式遍历**（walk_files_each），首批 64 个文件到达时
+        // 遍历还没走完，所以不能用「首批时刻的 total」判断 —— 用最终总量比更准。
+        let partial_first = scanned_total > first_batch_rows;
         check(
             "扫描分批回传（首批发的是部分结果）",
             batches >= 2 && partial_first,
@@ -768,7 +787,7 @@ fn run_selftest(dir: &str) -> i32 {
             keep_logs: false,
             ..Default::default()
         };
-        let (tx2, rx2) = std::sync::mpsc::channel();
+        let (tx2, rx2) = std::sync::mpsc::sync_channel(32);
         let h2 = core::logfilter::engine::spawn_filter(rcfg, tx2);
         let mut fbatches = 0usize;
         let mut frows = 0usize;
@@ -825,7 +844,7 @@ fn run_selftest(dir: &str) -> i32 {
         .and_then(|i| i.get("fields").and_then(|v| v.as_object()).cloned())
         .unwrap_or_default();
     let profile = core::logfilter::uploader::UploadProfile::default();
-    let res = core::logfilter::uploader::run_upload(&profile, &fields, true, &|_, _| {});
+    let res = core::logfilter::uploader::run_upload(&profile, &fields, true, &|_, _| {}, None);
     check("dry-run 状态", res.status == core::logfilter::uploader::ST_DRY_RUN, &res.status);
     check("dry-run payload 有 serial_number", res.payload_json.contains("serial_number"), &res.payload_json);
     check("dry-run payload 含 4000 位 Hash", res.payload_json.len() > 4000, "长度不足");

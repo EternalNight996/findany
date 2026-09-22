@@ -1,4 +1,8 @@
-//! 输出层：Excel 明细导出（含摘要） + 命中文件落盘（对齐 sonar/exporter.py）。
+//! 输出层：批次目录 + Excel 明细导出（含摘要） + 命中文件落盘。
+//!
+//! 注意：通用扫描的产物导出已并入统一管道（engine::export_products），本文件里
+//! `export_excel` / `export_csv` / `copy_hits` 是旧扫描导出路径的残留（已无调用方），
+//! 只有 `make_batch_dir` / `column_letter` 仍被统一管道使用。
 
 use crate::core::config::SearchConfig;
 use crate::core::scanner::{clean_cell, ScanItem, ScanSummary};
@@ -7,6 +11,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct BatchDir {
     pub path: String,
+    #[allow(dead_code)]
     pub name: String,
 }
 
@@ -27,6 +32,7 @@ pub fn make_batch_dir(out_root: &str) -> std::io::Result<BatchDir> {
     Ok(BatchDir { path: path.to_string_lossy().to_string(), name })
 }
 
+#[allow(dead_code)]
 fn ext_of(name: &str) -> String {
     match name.rfind('.') {
         Some(i) => name[i + 1..].to_lowercase(),
@@ -35,6 +41,7 @@ fn ext_of(name: &str) -> String {
 }
 
 /// 导出 Excel 明细 + 摘要，返回实际生成文件路径（对齐 Python 列序与摘要项）。
+#[allow(dead_code)]
 pub fn export_excel(
     path: &str,
     items: &[ScanItem],
@@ -154,6 +161,7 @@ pub fn export_excel(
 }
 
 /// 导出为 CSV（utf-8-sig，带 BOM）——Excel 写出失败时的降级路径。
+#[allow(dead_code)]
 pub fn export_csv(
     path: &str,
     items: &[ScanItem],
@@ -204,6 +212,7 @@ pub fn export_csv(
 }
 
 /// 把命中的文件按「目录名/文件名」落盘到批次目录，返回复制数（同名自动加序号）。
+#[allow(dead_code)]
 pub fn copy_hits(items: &[ScanItem], batch_dir: &str, _mode: &str) -> usize {
     let mut copied = 0usize;
     for it in items.iter().filter(|i| i.hit) {

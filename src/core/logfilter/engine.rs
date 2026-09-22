@@ -4,14 +4,14 @@
 
 use super::extractors::{extract, read_text};
 use super::report;
-use super::types::{detect_log_type, file_name, LogType};
+use super::types::{file_name, LogType};
 use super::uploader::{resolve_cli, run_upload, UploadProfile, ST_CONFLICT, ST_DRY_RUN, ST_FAIL, ST_OK};
 use crate::core::scanner::{pathdiff, walk_files_filtered};
 use rayon::prelude::*;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -49,6 +49,18 @@ pub struct FilterRunCfg {
     pub throttle_ms: i64,
     /// 最多处理多少文件（0=不限）
     pub max_files: i64,
+    /// 行缓存容量（与 SearchConfig.cache_capacity_rows 同源）：worker 端也走同一个阈值。
+    /// 0=不限；>0 时超过立即淘汰最旧（FIFO），淘汰的暂留 pool 让 UI「加载更多」可拉回。
+    pub cache_capacity_rows: i64,
+    /// **处理策略**：`"scan"` = 通用扫描（按关键字匹配文件内容）；`"filter"` = 日志筛选 / 回传。
+    /// 管道（遍历 / 并行 / 主表限容 / LRU 池 / 有界通道 / 看门狗 / 节流 / 取消 / 产物 / 表格渲染）
+    /// 两者**完全共用**，唯一差异就是 `process_one` 按这个字段分派。
+    pub mode: String,
+    // ---- 下面是 scan 策略专用（mode="scan" 时才读）----
+    pub keyword: String,
+    /// inc 包含 | exc 不包含
+    pub match_mode: String,
+    pub case_sensitive: bool,
 }
 
 impl Default for FilterRunCfg {
@@ -75,6 +87,11 @@ impl Default for FilterRunCfg {
             batch_name_filter: String::new(),
             throttle_ms: 0,
             max_files: 0,
+            cache_capacity_rows: 5000,
+            mode: "filter".into(),
+            keyword: "IT6563".into(),
+            match_mode: "inc".into(),
+            case_sensitive: false,
         }
     }
 }
@@ -85,6 +102,9 @@ pub struct FilterSummary {
     pub extracted: usize,
     pub unknown: usize,
     pub skipped: usize,
+    /// 扫描模式专用：命中 / 未命中（筛选模式保持 0）
+    pub hit: usize,
+    pub miss: usize,
     pub upload_ok: usize,
     pub upload_conflict: usize,
     pub upload_fail: usize,
@@ -115,6 +135,9 @@ pub struct LiveFilterProgress {
     pub extracted: usize,
     pub unknown: usize,
     pub skipped: usize,
+    /// 扫描模式：命中 / 未命中（筛选模式 0）
+    pub hit: usize,
+    pub miss: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -188,20 +211,96 @@ pub fn extract_one(path: &str, root: &str, cfg: &FilterRunCfg) -> Map<String, Va
         }
     };
 
+    // `log_type=auto` 时把 None 交给 extract（让它内部 detect）；
+// 非 auto 时把强制类型交给 extract；**extract 内部会做 Bug-2A 真伪校验**（强制 OA3
+// 但正文不含 OA3 锚点 → 降级到 detect）。这里不再 use_type 覆盖 detected_type，
+// 而是让 extract 写权威字段，再读回来同步到 item.detected_type —— 防止 UI/Excel
+// 显示"detected_type=etest(OA3)"但 Map 其它字段是 detect 路径的空值（看起来
+// 像「OA3 提取成功」，实则假阳性）。
     let forced = if !cfg.log_type.is_empty() && cfg.log_type != LogType::Auto.as_str() {
         LogType::from_str(&cfg.log_type)
     } else {
         None
     };
-    let detected = detect_log_type(path, &text);
-    let use_type = forced.unwrap_or(detected);
-    item.insert("detected_type".into(), Value::String(use_type.as_str().into()));
-
-    let fields = extract(path, &text, Some(use_type));
+    let fields = extract(path, &text, forced);
+    let final_type = fields.get("detected_type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    item.insert("detected_type".into(), Value::String(final_type));
     for (k, v) in fields.iter() {
         item.insert(k.clone(), v.clone());
     }
     item.insert("fields".into(), Value::Object(fields));
+    item.insert("extract_ok".into(), Value::Bool(true));
+    item
+}
+
+/// **统一管道的唯一策略点**：处理一个文件、产出一行。
+///
+/// - `mode="scan"`   → 通用扫描：按关键字匹配文件内容（含/不含），行里是路径与命中信息
+/// - `mode="filter"` → 日志筛选回传：判型 + 字段提取，行里是 36 列业务字段
+///
+/// 其余（遍历、并行、限容、LRU 池、有界通道、看门狗、节流、取消、产物导出、表格渲染、
+/// 按钮启停）两个模式**走的是同一份代码** —— 这是「两套实现各改各的、总有一边漏」的根治。
+pub fn process_one(path: &str, root: &str, cfg: &FilterRunCfg) -> Map<String, Value> {
+    if cfg.mode == "scan" {
+        scan_one(path, root, cfg)
+    } else {
+        extract_one(path, root, cfg)
+    }
+}
+
+/// 扫描策略：一个文件 → 一行（结构与筛选行同构，UI/导出/池都不必分支）。
+fn scan_one(path: &str, root: &str, cfg: &FilterRunCfg) -> Map<String, Value> {
+    let rel = pathdiff(Path::new(path), Path::new(root));
+    let mut item = Map::new();
+    item.insert("abs_path".into(), Value::String(path.to_string()));
+    item.insert("rel_path".into(), Value::String(rel.clone()));
+    item.insert("filename".into(), Value::String(file_name(path)));
+    item.insert("dir_name".into(), Value::String(String::new()));
+    item.insert("detected_type".into(), Value::String("scan".into()));
+    item.insert("extract_ok".into(), Value::Bool(false));
+    item.insert("error".into(), Value::String(String::new()));
+    // 回传相关字段：扫描用不到，但保持行结构一致（导出模板/表格取值不必按模式分支）
+    for k in ["upload_state", "upload_code", "request_id", "resp_status", "upload_error", "upload_attempts", "upload_elapsed"] {
+        item.insert(k.into(), Value::String(String::new()));
+    }
+
+    let opts = crate::core::scanner::MatchOpts {
+        keyword: &cfg.keyword,
+        match_mode: &cfg.match_mode,
+        case_sensitive: cfg.case_sensitive,
+        encoding: &cfg.encoding,
+        max_file_mb: cfg.max_file_mb,
+    };
+    let it = match crate::core::scanner::match_one_opts(Path::new(path), &opts, Path::new(root)) {
+        Some(v) => v,
+        None => {
+            item.insert("error".into(), Value::String("无法读取文件属性".into()));
+            return item;
+        }
+    };
+    // 跳过（超大/二进制/读失败）：extract_ok 保持 false → 计入 skipped，并从表格里可见原因
+    if !it.skipped.is_empty() {
+        item.insert("error".into(), Value::String(it.skipped.clone()));
+        item.insert("skip_reason".into(), Value::String(it.skipped.clone()));
+        item.insert("size".into(), Value::Number(it.size.into()));
+        item.insert("size_str".into(), Value::String(it.size_str()));
+        item.insert("mtime_str".into(), Value::String(it.mtime_str()));
+        return item;
+    }
+
+    item.insert("dir_name".into(), Value::String(it.dir_name.clone()));
+    item.insert("hit".into(), Value::Bool(it.hit));
+    item.insert("hit_state".into(), Value::String(if it.hit { "命中".into() } else { "未命中".into() }));
+    item.insert(
+        "hit_lines".into(),
+        Value::String(it.hit_lines.iter().take(6).map(|x| x.to_string()).collect::<Vec<_>>().join(",")),
+    );
+    item.insert("hit_line_text".into(), Value::String(it.hit_line_text.clone()));
+    item.insert("hit_count".into(), Value::Number(it.hit_count.into()));
+    item.insert("size".into(), Value::Number(it.size.into()));
+    item.insert("size_str".into(), Value::String(it.size_str()));
+    item.insert("mtime_str".into(), Value::String(it.mtime_str()));
+    item.insert("encoding".into(), Value::String(it.encoding.clone()));
     item.insert("extract_ok".into(), Value::Bool(true));
     item
 }
@@ -243,7 +342,9 @@ pub fn walk_filter(cfg: &FilterRunCfg) -> Vec<String> {
 }
 
 /// 筛选句柄：worker 与界面共享（实时计数 + 取消）
-#[derive(Default)]
+///
+/// 注：行缓存池（row_pool）由 UI 端自己持有——worker 端不再跨线程共享一份 pool，
+/// 简化了 LRU 淘汰与 emit 协议（不重复发同一行）。
 pub struct FilterHandle {
     pub done: AtomicUsize,
     pub total: AtomicUsize,
@@ -255,8 +356,31 @@ pub struct FilterHandle {
     pub upload_fail: AtomicUsize,
     pub upload_dry: AtomicUsize,
     pub cancel: AtomicBool,
+    /// 扫描模式：命中 / 未命中
+    pub hit_n: AtomicUsize,
+    pub miss_n: AtomicUsize,
     /// 内存到上限被主动停（界面/结论用来写清原因）
     pub exceeded: AtomicBool,
+}
+
+impl Default for FilterHandle {
+    fn default() -> Self {
+        Self {
+            done: AtomicUsize::new(0),
+            total: AtomicUsize::new(0),
+            extracted: AtomicUsize::new(0),
+            unknown: AtomicUsize::new(0),
+            skipped: AtomicUsize::new(0),
+            upload_ok: AtomicUsize::new(0),
+            upload_conflict: AtomicUsize::new(0),
+            upload_fail: AtomicUsize::new(0),
+            upload_dry: AtomicUsize::new(0),
+            cancel: AtomicBool::new(false),
+            hit_n: AtomicUsize::new(0),
+            miss_n: AtomicUsize::new(0),
+            exceeded: AtomicBool::new(false),
+        }
+    }
 }
 
 impl FilterHandle {
@@ -270,12 +394,14 @@ impl FilterHandle {
             extracted: self.extracted.load(Ordering::Relaxed),
             unknown: self.unknown.load(Ordering::Relaxed),
             skipped: self.skipped.load(Ordering::Relaxed),
+            hit: self.hit_n.load(Ordering::Relaxed),
+            miss: self.miss_n.load(Ordering::Relaxed),
         }
     }
 }
 
 /// 跑一次筛选（阻塞）。events 为 None 时静默（测试用）。
-pub fn run_filter(cfg: &FilterRunCfg, events: Option<&Sender<FilterEvent>>, cancel: &AtomicBool) -> (Vec<Map<String, Value>>, FilterSummary) {
+pub fn run_filter(cfg: &FilterRunCfg, events: Option<&SyncSender<FilterEvent>>, cancel: &AtomicBool) -> (Vec<Map<String, Value>>, FilterSummary) {
     let handle = FilterHandle::default();
     run_filter_shared(cfg, events, cancel, &handle)
 }
@@ -283,7 +409,7 @@ pub fn run_filter(cfg: &FilterRunCfg, events: Option<&Sender<FilterEvent>>, canc
 /// 单目录筛选（分批模式里每批走一遍这里）
 pub fn run_filter_one(
     cfg: &FilterRunCfg,
-    events: Option<&Sender<FilterEvent>>,
+    events: Option<&SyncSender<FilterEvent>>,
     cancel: &AtomicBool,
     handle: &FilterHandle,
 ) -> (Vec<Map<String, Value>>, FilterSummary) {
@@ -296,6 +422,14 @@ pub fn run_filter_one(
 
     let t0 = std::time::Instant::now();
     let mut s = FilterSummary::default();
+    // 计数基线：handle 的计数器在多批（batch_dirs）模式下是共享累加的，
+    // 本批数量 = 结束时 - 开始时（不能直接读绝对值，否则第二批复述第一批）。
+    // 也**不能**从主表 items 数（主表受 cache_capacity_rows 限制，会漏掉被淘汰的行）。
+    let base_extracted = handle.extracted.load(Ordering::Relaxed);
+    let base_unknown = handle.unknown.load(Ordering::Relaxed);
+    let base_skipped = handle.skipped.load(Ordering::Relaxed);
+    let base_hit = handle.hit_n.load(Ordering::Relaxed);
+    let base_miss = handle.miss_n.load(Ordering::Relaxed);
     // ①-a 不再预先遍历成清单（百万级目录会先吃 1GB 路径）：总数边遍历边累加
     log(
         "info",
@@ -310,15 +444,24 @@ pub fn run_filter_one(
     send(FilterEvent::Progress { phase: "extract", done: 0, total: 0, pct: 0.0 });
 
     let extract_batch = |batch: &[String]| -> Vec<Map<String, Value>> {
+        // 直接 collect<Vec>：rayon par_iter 已经产出 owned Map，无需再 cloned
         batch
             .par_iter()
             .map(|p| {
-                let it = extract_one(p, &cfg.root_dir, cfg);
+                let it = process_one(p, &cfg.root_dir, cfg);
                 handle.done.fetch_add(1, Ordering::Relaxed);
                 if it.get("extract_ok").and_then(|v| v.as_bool()) == Some(true) {
                     handle.extracted.fetch_add(1, Ordering::Relaxed);
                     if sval(it.get("detected_type")) == LogType::Unknown.as_str() {
                         handle.unknown.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // 扫描模式：命中 / 未命中（同一管道里多记两个计数即可）
+                    if cfg.mode == "scan" {
+                        if it.get("hit").and_then(|v| v.as_bool()) == Some(true) {
+                            handle.hit_n.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            handle.miss_n.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 } else {
                     handle.skipped.fetch_add(1, Ordering::Relaxed);
@@ -334,13 +477,32 @@ pub fn run_filter_one(
     let throttle_ms = cfg.throttle_ms.clamp(0, 5000) as u64;
     let mut last_emit = std::time::Instant::now();
     // ①-a：不再按文件总数预留（总数未知）；①-b 会把行改成边跑边落 CSV
-    let mut items: Vec<Map<String, Value>> = Vec::new();
+    //
+    // **内存上限（主表容量）**：`cache_capacity_rows`（默认 5000）。0=不限；>0 时超出立即
+    // 淘汰最旧 —— 这是内存不失控的关键。此前这里用 `max_files`（默认 0=不限）导致 10 万行
+    // × 真样本 13KB ≈ 1.3GB（实测 170MB→1400MB 的根因）。
+    //
+    // **只存一份 owned 数据**：主表就是唯一持有者，不再额外 clone 到"待发队列"（那会让内存翻倍）。
+    // 用 `since_emit` 记录「自上次 emit 后新增了几行」，emit 时只取主表末尾这几行。
+    // 旧实现用「单 Vec + emitted_offset 索引」，一旦淘汰就会打乱 offset 语义（已发过的行被移走
+    // → 索引错位 → 同一行重复发或漏发）；末尾计数法在淘汰下天然正确。
+    let worker_cap: usize = if cfg.cache_capacity_rows > 0 {
+        cfg.cache_capacity_rows as usize
+    } else if cfg.max_files > 0 {
+        cfg.max_files as usize
+    } else {
+        usize::MAX
+    };
     let pool = if cfg.threads <= 1 {
         None
     } else {
         rayon::ThreadPoolBuilder::new().num_threads(cfg.threads.clamp(1, 64) as usize).build().ok()
     };
-    let mut emitted = 0usize;
+    let mut items: std::collections::VecDeque<Map<String, Value>> = std::collections::VecDeque::new();
+    // 自上次 emit 后新增的行数（emit 时只发主表末尾这几行，避免额外 clone 一份待发队列）
+    let mut since_emit = 0usize;
+    // 因容量上限被淘汰的行数（结论里要说清，避免用户以为「提取了却没进产物」是 bug）
+    let mut evicted_rows: usize = 0;
     // 看门狗状态（每批一次采样）
     let mem = crate::core::mem_guard::new_guard();
     let mem_limit_mb = crate::core::mem_guard::effective_limit_mb(cfg.mem_limit_mb);
@@ -349,8 +511,20 @@ pub fn run_filter_one(
     // ①-a 流式遍历：边遍历边处理，不再先把百万条路径全收进内存（那是大目录的第一块 GB 级分配）
     let mut discovered = 0usize;
     let mut walk_stopped = false;
+    // 文件数上限（0=不限）：防目录跑飞的保险丝。**必须在这里截断** ——
+    // 旧实现只在 walk_filter（预收集版）里截断，而统一管道走的是流式 walk_files_each，
+    // 结果 max_files 对扫描/筛选都不生效（selftest 的 240->5 断言暴露）。
+    let file_cap: usize = if cfg.max_files > 0 { cfg.max_files as usize } else { usize::MAX };
     crate::core::scanner::walk_files_each(Path::new(&cfg.root_dir), &cfg.extensions, cfg.recursive, &cfg.name_filter, BATCH, |chunk| {
+        // 到上限：本块按剩余额度截断，处理完就停（不再往下遍历）
+        let remaining = file_cap.saturating_sub(discovered);
+        if remaining == 0 {
+            walk_stopped = true;
+            return false;
+        }
+        let chunk = if chunk.len() > remaining { &chunk[..remaining] } else { chunk };
         discovered += chunk.len();
+        let hit_cap = discovered >= file_cap;
         handle.total.store(discovered, Ordering::Relaxed);
         if cancel.load(Ordering::SeqCst) {
             walk_stopped = true;
@@ -361,12 +535,26 @@ pub fn run_filter_one(
             Some(p) => p.install(run),
             None => run(),
         };
-        items.extend(got.iter().cloned());
+        // 行逐条进主表：超 worker_cap 立即淘汰最旧（VecDeque::pop_front 是 O(1)，旧版 Vec::remove(0) 是 O(N)）。
+        // **只存一份 owned 数据**：不再额外 clone 进待发队列（那会让内存翻倍）。
+        // 用 `since_emit` 记录「自上次 emit 后新增了几行」，emit 时只取主表末尾这几行。
+        for it in got {
+            if items.len() >= worker_cap {
+                items.pop_front();
+                evicted_rows += 1;
+            }
+            items.push_back(it);
+            since_emit += 1;
+        }
         // 条数够了就发（chunk 本身就是一批），否则按间隔发 —— 小数据量也要分批，界面才看得见增长
-        if got.len() >= BATCH || interval.is_zero() || last_emit.elapsed() >= interval {
+        if since_emit >= BATCH || interval.is_zero() || last_emit.elapsed() >= interval {
             last_emit = std::time::Instant::now();
-            emit_batch(&send, &got, discovered, &handle);
-            emitted = items.len();
+            // 取主表末尾 `since_emit` 行（O(since_emit)，不是 O(N)）：
+            // VecDeque 是双端队列，rev().take(n).rev() 高效且保持原顺序。
+            let tail: Vec<Map<String, Value>> =
+                items.iter().rev().take(since_emit).rev().cloned().collect();
+            emit_batch(&send, tail, discovered, &handle);
+            since_emit = 0;
         }
         // 内存看门狗：到上限主动安全停止（百万级目录被系统挤爆时，进程内既没 panic 也没弹窗）
         {
@@ -382,27 +570,44 @@ pub fn run_filter_one(
         if throttle_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(throttle_ms));
         }
+        // 本块已把额度用满：收工（不再遍历后续文件）
+        if hit_cap {
+            walk_stopped = true;
+            return false;
+        }
         true
     });
     let _ = walk_stopped;
-    // 尾批：循环里可能因为没到间隔而没发出去，这里补发，保证界面拿到全部行
-    if emitted < items.len() {
-        let tail: Vec<Map<String, Value>> = items[emitted..].to_vec();
-        emit_batch(&send, &tail, discovered, &handle);
+    // 尾批：循环里可能因为没到间隔而没发出去，这里补发，保证界面拿到最后一批
+    if since_emit > 0 {
+        let tail: Vec<Map<String, Value>> =
+            items.iter().rev().take(since_emit).rev().cloned().collect();
+        emit_batch(&send, tail, discovered, &handle);
     }
     s.total = discovered;
 
-    for it in &items {
-        if it.get("extract_ok").and_then(|v| v.as_bool()) == Some(true) {
-            s.extracted += 1;
-            if sval(it.get("detected_type")) == LogType::Unknown.as_str() {
-                s.unknown += 1;
-            }
-        } else {
-            s.skipped += 1;
-            log("warn", &format!("{}：{}", sval(it.get("rel_path")), sval(it.get("error"))));
-        }
+    // 提取阶段的计数：**从 handle 的差值**算（全量准确，不受主表容量淘汰影响）。
+    // 旧实现遍历主表 items 计数 ── 主表被 cache_capacity_rows 限制后，10 万份只会报出 5000，
+    // R 结论会误报「提取 5000」，看起来像丢数据。
+    s.extracted = handle.extracted.load(Ordering::Relaxed).saturating_sub(base_extracted);
+    s.unknown = handle.unknown.load(Ordering::Relaxed).saturating_sub(base_unknown);
+    s.skipped = handle.skipped.load(Ordering::Relaxed).saturating_sub(base_skipped);
+    s.hit = handle.hit_n.load(Ordering::Relaxed).saturating_sub(base_hit);
+    s.miss = handle.miss_n.load(Ordering::Relaxed).saturating_sub(base_miss);
+    // 容量淘汰提示：被淘汰的行不再参与产物/回传，必须在日志里说清
+    // （否则用户看到「提取 10 万、产物只有 5000」会以为丢数据）
+    if evicted_rows > 0 {
+        log(
+            "warn",
+            &format!(
+                "行缓存上限 {} 行：已淘汰最旧 {} 行不参与产物与回传（提取计数仍按全量 {} 统计）。调大「缓存行数」或勾「按子目录分批」可覆盖全量",
+                worker_cap, evicted_rows, s.extracted
+            ),
+        );
     }
+    // VecDeque -> Vec：一次 memcpy 级移动（5000 行 ≈ 10ms），换来主表容量可控。
+    // 之后按 rel_path 排序供导出/回传（顺序稳定，UI 已在 Batch 流式接收时拿到自己的顺序）。
+    let mut items: Vec<Map<String, Value>> = items.into();
     items.sort_by_key(|d| sval(d.get("rel_path")));
 
     // ---------- 回传（SOP：逐台串行，一次一台） ----------
@@ -427,7 +632,17 @@ pub fn run_filter_one(
                 .iter()
                 .enumerate()
                 .filter(|(_, it)| {
-                    it.get("extract_ok").and_then(|v| v.as_bool()) == Some(true) && cfg.upload_types.contains(&sval(it.get("detected_type")))
+                    if it.get("extract_ok").and_then(|v| v.as_bool()) != Some(true) {
+                        return false;
+                    }
+                    // Bug-2B：回传 targets 必须**真含 OA3**（has_oa3=True）。
+                    // Bug-2A 已经把「强制 OA3 但正文不含 OA3 锚点」的台 detected_type 改回 detect 真值，
+                    // 这里再加 has_oa3 守卫：哪怕将来 detect 路径有漏网，targets 也不会把假 OA3 送进回传队列。
+                    let dt = sval(it.get("detected_type"));
+                    if dt == LogType::EtestOa3.as_str() && sval(it.get("has_oa3")) != "True" {
+                        return false;
+                    }
+                    cfg.upload_types.contains(&dt)
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -438,7 +653,9 @@ pub fn run_filter_one(
                     break;
                 }
                 let fields = items[*idx].get("fields").and_then(|v| v.as_object()).cloned().unwrap_or_default();
-                let res = run_upload(&profile, &fields, cfg.dry_run, &|lvl, msg| log(lvl, msg));
+                // cancel 透传到 default_runner：点停止时单次回传也能在 20ms 内中断子进程，
+                // 否则 1万回传 + 默认 60s 超时 = 卡住几分钟。
+                let res = run_upload(&profile, &fields, cfg.dry_run, &|lvl, msg| log(lvl, msg), Some(cancel));
                 let rel = sval(items[*idx].get("rel_path"));
                 {
                     let it = &mut items[*idx];
@@ -541,7 +758,7 @@ pub fn run_filter_one(
 /// 关掉时直通单目录流程，行为与以前完全一致。每批各出产物、各判 PASS/FAIL，汇总计数给 R 结论。
 pub fn run_filter_shared(
     cfg: &FilterRunCfg,
-    events: Option<&Sender<FilterEvent>>,
+    events: Option<&SyncSender<FilterEvent>>,
     cancel: &AtomicBool,
     handle: &FilterHandle,
 ) -> (Vec<Map<String, Value>>, FilterSummary) {
@@ -613,17 +830,23 @@ pub fn run_filter_shared(
     run_filter_one(cfg, events, cancel, handle)
 }
 
-/// Excel 降级阈值：超过这个行数只出 CSV（umya 生成 xlsx 时整本驻留内存）
-pub const EXCEL_MAX_ROWS: usize = 50_000;
+/// Excel 降级阈值：超过这个行数只出 CSV（umya 生成 xlsx 时整本驻留内存）。
+/// 从 50000 降到 10000：大目录（10万+）跑出来的 Excel 内存按行数放大，1万行
+/// 已经是常见一台工位一整年的量，再多就是「没人会打开来看」的规模，强制走 CSV 更稳。
+pub const EXCEL_MAX_ROWS: usize = 10_000;
 
 /// 把一批结果推给界面：附实时计数，同批也会发进度事件
-fn emit_batch(send: &impl Fn(FilterEvent), batch: &[Map<String, Value>], total: usize, handle: &FilterHandle) {
-    if batch.is_empty() {
+///
+/// 接收 owned `Vec<Map>`，调用方 `items.drain(range).collect()` 出来直接发——
+/// 避免旧版「再 to_vec 一份」造成的内存双拷贝。
+/// **不再 emit 内排序**：UI 端按 push 顺序渲染（follow_tail 时自动滚到底），
+/// 全表排序统一放到回传前的 `items.sort_by_key`（见 run_filter_one 末尾），
+/// 减少 emit 路径上的 O(N) 开销。
+fn emit_batch(send: &impl Fn(FilterEvent), items: Vec<Map<String, Value>>, total: usize, handle: &FilterHandle) {
+    if items.is_empty() {
         return;
     }
     let live = handle.progress();
-    let mut items = batch.to_vec();
-    items.sort_by_key(|d| sval(d.get("rel_path")));
     send(FilterEvent::Batch(Box::new(FilterOutcome {
         items,
         summary: FilterSummary {
@@ -653,11 +876,9 @@ pub fn export_products(
     };
     let batch = crate::core::exporter::make_batch_dir(&out_root)?;
     let batch_dir = batch.path.clone();
-    let mut rows: Vec<Map<String, Value>> = items.to_vec();
-    for r in rows.iter_mut() {
-        let state = if r.get("extract_ok").and_then(|v| v.as_bool()) == Some(true) { "成功" } else { "失败" };
-        r.insert("extract_state".into(), Value::String(state.into()));
-    }
+    // 不再 `items.to_vec()`：旧实现为了给每行补一个派生列 `extract_state` 而整体 clone 一份
+    // （5000 行 × 13KB ≈ 65MB 峰值，十万行更甚）。该列现由 report::s() 当场从 extract_ok 派生。
+    let rows: &[Map<String, Value>] = items;
     let summary_rows: Vec<(&str, String)> = vec![
         ("扫描目录", cfg.root_dir.clone()),
         ("筛选类型", if cfg.log_type.is_empty() { "auto".into() } else { cfg.log_type.clone() }),
@@ -694,7 +915,11 @@ pub fn export_products(
 }
 
 /// 后台线程跑筛选（边筛边分批回传），返回共享句柄（取消 + 实时计数）
-pub fn spawn_filter(cfg: FilterRunCfg, tx: Sender<FilterEvent>) -> Arc<FilterHandle> {
+///
+/// `tx` 用 **SyncSender（有界通道）**：worker 推进速度远快于 UI 渲染时，无界通道会把
+/// 全部结果堆在内存里（十万行 ≈ 2.6GB —— 实测峰值 600~800MB 的主因就在这里）。
+/// 有界通道提供**背压**：队列满了 worker 的 send 就阻塞，等 UI 消费，内存因此封顶。
+pub fn spawn_filter(cfg: FilterRunCfg, tx: SyncSender<FilterEvent>) -> Arc<FilterHandle> {
     let handle = Arc::new(FilterHandle::default());
     let h = handle.clone();
     std::thread::spawn(move || {

@@ -42,6 +42,12 @@ pub fn filter_cfg_from_cfg(cfg: &SearchConfig, app_dir: &str) -> FilterRunCfg {
         batch_name_filter: cfg.batch_name_filter.clone(),
         throttle_ms: cfg.throttle_ms,
         max_files: cfg.max_files,
+        cache_capacity_rows: cfg.cache_capacity_rows,
+        // 统一管道的策略选择：TOML 的 work_mode 决定跑扫描还是筛选（差异只在这里）
+        mode: if cfg.work_mode == "scan" { "scan".into() } else { "filter".into() },
+        keyword: cfg.keyword.clone(),
+        match_mode: cfg.mode.clone(),
+        case_sensitive: cfg.case_sensitive,
     }
 }
 

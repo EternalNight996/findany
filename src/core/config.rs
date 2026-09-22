@@ -49,6 +49,9 @@ fn default_upload_retries() -> i64 {
 fn default_countdown() -> i64 {
     3
 }
+fn default_cache_capacity_rows() -> i64 {
+    5000
+}
 fn default_true() -> bool {
     true
 }
@@ -94,6 +97,11 @@ pub struct SearchConfig {
     pub throttle_ms: i64,
     /// 最多处理多少个文件（0=不限）：防目录跑飞，超了记警告并按上限收尾
     pub max_files: i64,
+    /// 行缓存容量（单位：条）：worker 与 UI 共同遵守的内存门限。
+    /// 0=不限（保留全部）；>0 时插入超出立即淘汰最旧（FIFO），被淘汰的行暂留「LRU 池」，
+    /// UI 表格底部「加载更多」可从池里拉回来查看（一次性全部拉回，不是逐条）。
+    /// 默认 5000：百万级目录也不会让内存失控，UI 同时保持流畅。
+    pub cache_capacity_rows: i64,
 
     // ---------- [upload] ----------
     pub enabled: bool,
@@ -144,6 +152,7 @@ impl Default for SearchConfig {
             batch_name_filter: String::new(),
             throttle_ms: 0,
             max_files: 0,
+            cache_capacity_rows: default_cache_capacity_rows(),
             enabled: false,
             dry_run: true,
             types: default_upload_types(),
@@ -179,6 +188,9 @@ impl SearchConfig {
         }
         if self.max_files < 0 {
             errs.push("文件数上限不能为负（0=不限）".to_string());
+        }
+        if !(0..=100_000).contains(&self.cache_capacity_rows) {
+            errs.push("缓存行数需在 0~100000 之间（0=不限）".to_string());
         }
         if self.work_mode == "scan" {
             if self.keyword.trim().is_empty() {

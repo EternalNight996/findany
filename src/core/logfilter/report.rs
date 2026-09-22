@@ -12,6 +12,15 @@ use umya_spreadsheet::{Alignment, Color, Font, HorizontalAlignmentValues, Vertic
 pub type Row = Map<String, Value>;
 
 fn s(row: &Row, key: &str) -> String {
+    // `extract_state` 是**派生列**：由 extract_ok 当场算出，不再存进每行的 Map。
+    // 旧实现会在导出前把 rows 整体 clone 一份再逐行 insert 这列（5000 行 × 13KB ≈ 65MB 峰值），
+    // 只为加一个布尔派生列，不划算。
+    if key == "extract_state" {
+        return match row.get("extract_ok").and_then(|v| v.as_bool()) {
+            Some(true) => "成功".to_string(),
+            _ => "失败".to_string(),
+        };
+    }
     match row.get(key) {
         Some(Value::String(v)) => v.clone(),
         Some(Value::Null) | None => String::new(),

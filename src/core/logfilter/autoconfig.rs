@@ -76,6 +76,7 @@ mem_limit_mb = 0               # 内存上限(MB)：超过就主动安全停止�
 threads = 8                    # 并发线程 1~64：服务器上跑就调小（1~4），别抢生产任务
 throttle_ms = 0                # 每批之间的休眠(ms, 0~5000)：给 CPU/磁盘/网络盘让路，服务器上建议 20~200
 max_files = 0                  # 最多处理多少个文件(0=不限)：防目录跑飞
+cache_capacity_rows = 5000      # 行缓存容量(0=不限)：超过立即淘汰最旧，UI「加载更多」可拉回
 
 [run]
 auto_start = false             # 改 true：启动即自动「检测→回传→倒计时关」
@@ -175,6 +176,7 @@ pub fn parse_config(text: &str) -> SearchConfig {
         },
         throttle_ms: int_of(&doc, "filter", "throttle_ms", d.throttle_ms).clamp(0, 5000),
         max_files: int_of(&doc, "filter", "max_files", d.max_files).max(0),
+        cache_capacity_rows: int_of(&doc, "filter", "cache_capacity_rows", d.cache_capacity_rows).clamp(0, 100_000),
         log_type: str_of(&doc, "filter", "log_type", &d.log_type),
         enabled: bool_of(&doc, "upload", "enabled", d.enabled),
         dry_run: bool_of(&doc, "upload", "dry_run", d.dry_run),
@@ -240,6 +242,7 @@ fn managed_keys() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("batch_name_filter", "batch_name_filter"),
                 ("throttle_ms", "throttle_ms"),
                 ("max_files", "max_files"),
+                ("cache_capacity_rows", "cache_capacity_rows"),
             ],
         ),
         (
@@ -289,6 +292,7 @@ fn cfg_value(cfg: &SearchConfig, key: &str) -> Value {
         "batch_name_filter" => Value::String(cfg.batch_name_filter.clone()),
         "throttle_ms" => Value::Number(cfg.throttle_ms.into()),
         "max_files" => Value::Number(cfg.max_files.into()),
+        "cache_capacity_rows" => Value::Number(cfg.cache_capacity_rows.into()),
         "process_priority" => Value::String(cfg.process_priority.clone()),
         "enabled" => Value::Bool(cfg.enabled),
         "dry_run" => Value::Bool(cfg.dry_run),

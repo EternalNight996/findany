@@ -24,10 +24,12 @@ pub struct MemGuard {
 }
 
 impl MemGuard {
+    #[allow(dead_code)]
     pub fn exceeded(&self) -> bool {
         self.exceeded.load(Ordering::Relaxed)
     }
     /// 触发原因（给 R 结论用）
+    #[allow(dead_code)]
     pub fn reason(&self, limit_mb: u64) -> String {
         format!("内存到达上限 {} MB（当前 {} MB），已安全停止", limit_mb, self.peak_mb.load(Ordering::Relaxed))
     }

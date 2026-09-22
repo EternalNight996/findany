@@ -6,7 +6,7 @@ use crate::core::config::SearchConfig;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 
 /// 单个文件的扫描结果。
@@ -51,7 +51,13 @@ impl ScanItem {
     }
 }
 
+// ============================================================================
+// 以下为**旧独立扫描引擎的残留**：通用扫描已并入统一管道
+// （engine::process_one 的 mode="scan" 策略），这些类型/函数已无任何调用方。
+// 保留仅为对照历史实现；新代码请走 core::logfilter::engine。
+// ============================================================================
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct ScanSummary {
     pub total_files: usize,
     pub scanned: usize,
@@ -62,12 +68,14 @@ pub struct ScanSummary {
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct ScanOutcome {
     pub items: Vec<ScanItem>,
     pub summary: ScanSummary,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)]
 pub struct LiveProgress {
     pub done: usize,
     pub total: usize,
@@ -78,6 +86,7 @@ pub struct LiveProgress {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum ScanEvent {
     /// 进行中的一批结果（可能为空 items：仅更新计数，界面用于刷新数字）
     Batch(Box<ScanOutcome>),
@@ -87,9 +96,11 @@ pub enum ScanEvent {
 }
 
 /// 没配 max_files 时的硬上限：百万级目录光是把路径收进内存就能吃掉几个 GB
+#[allow(dead_code)]
 pub const HARD_MAX_FILES: usize = 1_000_000;
 
 /// 扫描引擎：rayon 线程池 + 实时计数（界面共享同一份计数，读它就知道进度）
+#[allow(dead_code)]
 pub struct ScanEngine {
     pub cfg: SearchConfig,
     cancel: AtomicBool,
@@ -105,6 +116,7 @@ pub struct ScanEngine {
 }
 
 impl ScanEngine {
+    #[allow(dead_code)]
     pub fn new(cfg: SearchConfig) -> Self {
         Self {
             mem_limit_mb: crate::core::mem_guard::effective_limit_mb(cfg.mem_limit_mb),
@@ -119,24 +131,29 @@ impl ScanEngine {
         }
     }
 
+    #[allow(dead_code)]
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
     }
 
+    #[allow(dead_code)]
     pub fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
 
     /// 已遍历到的待扫文件数（遍历阶段也能看到进度）
+    #[allow(dead_code)]
     pub fn last_total(&self) -> usize {
         self.total_n.load(Ordering::Relaxed)
     }
 
+    #[allow(dead_code)]
     pub fn last_hit(&self) -> usize {
         self.hit_n.load(Ordering::Relaxed)
     }
 
     /// 实时进度（界面每帧直接读，不必等批事件）
+    #[allow(dead_code)]
     pub fn progress(&self) -> LiveProgress {
         let total = self.total_n.load(Ordering::Relaxed);
         let done = self.done_n.load(Ordering::Relaxed);
@@ -151,6 +168,7 @@ impl ScanEngine {
     }
 
     /// 扫描：on_batch 按批间隔回调（返回 false 中止）
+    #[allow(dead_code)]
     pub fn scan(&self, mut on_batch: impl FnMut(ScanOutcome) -> bool) -> ScanOutcome {
         let cfg = &self.cfg;
         let t0 = std::time::Instant::now();
@@ -336,6 +354,7 @@ impl ScanEngine {
 
 /// 扫描完成后落产物：批次目录 + Excel（CSV 降级）+ 可选复制命中文件。
 /// 返回（批次目录, xlsx 路径, 复制份数）
+#[allow(dead_code)]
 pub fn export_scan_products(items: &[ScanItem], summary: &ScanSummary, cfg: &SearchConfig) -> anyhow::Result<(String, String, usize)> {
     use crate::core::exporter;
     if items.is_empty() {
@@ -354,10 +373,15 @@ pub fn export_scan_products(items: &[ScanItem], summary: &ScanSummary, cfg: &Sea
 }
 
 /// 引擎句柄：worker 线程与界面共享（取消 + 实时计数 + 遍历阶段进度）
+#[allow(dead_code)]
 pub type ScanHandle = Arc<ScanEngine>;
 
 /// 在后台线程跑扫描：按间隔发批（界面表格按同样节奏实时增长）；结束发 Done。
-pub fn spawn_scan(cfg: SearchConfig, tx: Sender<ScanEvent>) -> ScanHandle {
+///
+/// `tx` 用 **SyncSender（有界通道）**：扫描结果里带命中行文本，无界通道会让 worker 跑在前面时
+/// 把几万条结果全堆进内存。有界通道提供背压（队列满则 send 阻塞，等 UI 消费），内存封顶。
+#[allow(dead_code)]
+pub fn spawn_scan(cfg: SearchConfig, tx: SyncSender<ScanEvent>) -> ScanHandle {
     let engine = Arc::new(ScanEngine::new(cfg.clone()));
     let handle = engine.clone();
     std::thread::spawn(move || {
@@ -579,6 +603,13 @@ pub fn walk_files_each(
     batch: usize,
     mut on_chunk: impl FnMut(&[String]) -> bool,
 ) -> (usize, bool) {
+    // **单文件模式**：root 指向单个文件时直接回调它。read_dir 对文件路径会失败返回空，
+    // 结果就是「用户点了某个具体文件，却一行都没有」—— 统一管道合并后由 selftest 暴露。
+    if root.is_file() {
+        let mut b = vec![root.to_string_lossy().to_string()];
+        let ok = on_chunk(&mut b);
+        return (1, !ok);
+    }
     let exts = ext_set(extensions);
     let needle = name_filter.trim().to_string();
     let batch = batch.max(1);
@@ -700,8 +731,39 @@ pub fn under(path: &Path, base: &Path) -> bool {
 
 // ---------- 单个文件匹配 ----------
 
+/// 扫描一个文件所需的**全部选项**（轻量借用，不持有任何 String）。
+///
+/// 存在的意义：通用扫描与日志筛选现在走**同一条管道**，管道只认
+/// `process_one(path) -> Row`；扫描策略需要的关键字/匹配模式/编码等从这里传进去。
+/// 直接复用 `SearchConfig` 会每文件构造一次全量默认值（含 12 个 String 的 extensions），
+/// 十万文件就是十万次无谓分配 —— 所以抽成借用式选项。
+pub struct MatchOpts<'a> {
+    pub keyword: &'a str,
+    /// inc 包含 | exc 不包含
+    pub match_mode: &'a str,
+    pub case_sensitive: bool,
+    pub encoding: &'a str,
+    pub max_file_mb: f64,
+}
+
 /// 扫描单个文件；无法 stat 时返回 None。
+#[allow(dead_code)]
 pub fn match_one(path: &Path, cfg: &SearchConfig, root: &Path) -> Option<ScanItem> {
+    match_one_opts(
+        path,
+        &MatchOpts {
+            keyword: &cfg.keyword,
+            match_mode: &cfg.mode,
+            case_sensitive: cfg.case_sensitive,
+            encoding: &cfg.encoding,
+            max_file_mb: cfg.max_file_mb,
+        },
+        root,
+    )
+}
+
+/// 扫描单个文件（显式选项版）—— 统一管道调用这个。
+pub fn match_one_opts(path: &Path, opts: &MatchOpts, root: &Path) -> Option<ScanItem> {
     let md = std::fs::metadata(path).ok()?;
     let size = md.len();
     let rel = pathdiff(path, root);
@@ -728,7 +790,7 @@ pub fn match_one(path: &Path, cfg: &SearchConfig, root: &Path) -> Option<ScanIte
         ..Default::default()
     };
 
-    if size as f64 > cfg.max_file_mb * 1024.0 * 1024.0 {
+    if size as f64 > opts.max_file_mb * 1024.0 * 1024.0 {
         item.skipped = "too_large".into();
         return Some(item);
     }
@@ -740,7 +802,7 @@ pub fn match_one(path: &Path, cfg: &SearchConfig, root: &Path) -> Option<ScanIte
         }
     };
     if !head.is_empty() && head.contains(&0u8) {
-        let mut is_utf16 = matches!(cfg.encoding.as_str(), "utf-16" | "utf-16le" | "utf-16be");
+        let mut is_utf16 = matches!(opts.encoding, "utf-16" | "utf-16le" | "utf-16be");
         if head.starts_with(&[0xFF, 0xFE]) || head.starts_with(&[0xFE, 0xFF]) {
             is_utf16 = true;
         }
@@ -748,14 +810,21 @@ pub fn match_one(path: &Path, cfg: &SearchConfig, root: &Path) -> Option<ScanIte
             item.skipped = "binary".into();
             return Some(item);
         }
-        item.encoding = if cfg.encoding != "auto" { cfg.encoding.clone() } else { "utf-16".into() };
+        item.encoding = if opts.encoding != "auto" { opts.encoding.to_string() } else { "utf-16".into() };
     } else {
-        item.encoding = if cfg.encoding != "auto" { cfg.encoding.clone() } else { detect_encoding(path) };
+        item.encoding = if opts.encoding != "auto" { opts.encoding.to_string() } else { detect_encoding(path) };
     }
 
-    let needle = if cfg.case_sensitive { cfg.keyword.clone() } else { cfg.keyword.to_lowercase() };
+    // needle：大小写敏感时直接用关键字；否则用小写副本（借用局部变量，避免每文件多一次 String 分配）
+    let lower_needle;
+    let needle: &str = if opts.case_sensitive {
+        opts.keyword
+    } else {
+        lower_needle = opts.keyword.to_lowercase();
+        &lower_needle
+    };
 
-    let decoded = decode_file(path, &cfg.encoding);
+    let decoded = decode_file(path, opts.encoding);
     let (text, enc_used) = match decoded {
         Some(v) => v,
         None => {
@@ -767,7 +836,7 @@ pub fn match_one(path: &Path, cfg: &SearchConfig, root: &Path) -> Option<ScanIte
     let mut hit_lines: Vec<usize> = Vec::new();
     let mut hit_text = String::new();
     for (i, line) in lines_with_endings(&text).iter().enumerate() {
-        let cmp = if cfg.case_sensitive { line.to_string() } else { line.to_lowercase() };
+        let cmp = if opts.case_sensitive { line.to_string() } else { line.to_lowercase() };
         if cmp.contains(&needle) {
             hit_lines.push(i + 1);
             if hit_text.is_empty() {
@@ -781,7 +850,7 @@ pub fn match_one(path: &Path, cfg: &SearchConfig, root: &Path) -> Option<ScanIte
     item.hit_lines = hit_lines;
     item.hit_line_text = hit_text;
     let found_any = item.hit_count > 0;
-    item.hit = if cfg.mode == "inc" { found_any } else { !found_any };
+    item.hit = if opts.match_mode == "inc" { found_any } else { !found_any };
     Some(item)
 }
 
