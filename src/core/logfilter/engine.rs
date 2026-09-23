@@ -61,6 +61,14 @@ pub struct FilterRunCfg {
     /// inc 包含 | exc 不包含
     pub match_mode: String,
     pub case_sensitive: bool,
+    // ---- 断点续扫 ----
+    /// 进度文件（JSONL：一行一条已处理记录）。它同时就是**产物本体** ——
+    /// 边跑边追加，中断后文件留着；跑完（未取消）就删掉（产物已有 Excel/CSV）。
+    /// 空 = 不落进度（自检 / 无需续跑的场景可关）。
+    pub progress_path: String,
+    /// 已处理过的文件绝对路径：遍历时直接跳过（续跑的核心）。
+    /// UI 从上次的进度文件读出后填进来。
+    pub skip_paths: std::collections::HashSet<String>,
 }
 
 impl Default for FilterRunCfg {
@@ -92,6 +100,8 @@ impl Default for FilterRunCfg {
             keyword: "IT6563".into(),
             match_mode: "inc".into(),
             case_sensitive: false,
+            progress_path: String::new(),
+            skip_paths: std::collections::HashSet::new(),
         }
     }
 }
@@ -515,7 +525,42 @@ pub fn run_filter_one(
     // 旧实现只在 walk_filter（预收集版）里截断，而统一管道走的是流式 walk_files_each，
     // 结果 max_files 对扫描/筛选都不生效（selftest 的 240->5 断言暴露）。
     let file_cap: usize = if cfg.max_files > 0 { cfg.max_files as usize } else { usize::MAX };
+    // **进度节点**：开始时先写一份到 `<out_dir>/_resume.json` —— 它就是「上一次的任务记录」，
+    // 重启/重开时 UI 读它决定要不要弹「继续上次」。每批刷新 done，跑完（导出成功）清掉。
+    let node_out_dir = cfg.out_dir.clone();
+    let node_on = !cfg.progress_path.is_empty() && !node_out_dir.trim().is_empty();
+    let node_fp = if node_on { crate::core::logfilter::resume::task_fingerprint(cfg) } else { String::new() };
+    let node_started = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    if node_on {
+        let n = crate::core::logfilter::resume::ResumeNode {
+            version: 1,
+            mode: cfg.mode.clone(),
+            root_dir: cfg.root_dir.clone(),
+            out_dir: node_out_dir.clone(),
+            fingerprint: node_fp.clone(),
+            total: 0, // 流式遍历：总量边跑边累加
+            done: 0,
+            started_at: node_started.clone(),
+            updated_at: node_started.clone(),
+            data_file: cfg.progress_path.clone(),
+            done_files: Vec::new(),
+        };
+        let _ = crate::core::logfilter::resume::save_node(&node_out_dir, &n);
+    }
+    // 每批刷新节点用的累计行数（与已落盘行数一致）
+    let mut node_rows = 0usize;
     crate::core::scanner::walk_files_each(Path::new(&cfg.root_dir), &cfg.extensions, cfg.recursive, &cfg.name_filter, BATCH, |chunk| {
+        // **断点续扫**：上次已经处理过的文件直接跳过（不重复提取/回传）。
+        // 在限额与计数之前过滤 —— 让「文件总数」反映的是**本次还要跑多少**，进度条才对。
+        let chunk: Vec<String> = if cfg.skip_paths.is_empty() {
+            chunk.to_vec()
+        } else {
+            chunk.iter().filter(|p| !cfg.skip_paths.contains(*p)).cloned().collect()
+        };
+        if chunk.is_empty() {
+            return true; // 整块都已完成，继续下一块（不打扰取消/看门狗判断）
+        }
+        let chunk = chunk.as_slice();
         // 到上限：本块按剩余额度截断，处理完就停（不再往下遍历）
         let remaining = file_cap.saturating_sub(discovered);
         if remaining == 0 {
@@ -553,6 +598,32 @@ pub fn run_filter_one(
             // VecDeque 是双端队列，rev().take(n).rev() 高效且保持原顺序。
             let tail: Vec<Map<String, Value>> =
                 items.iter().rev().take(since_emit).rev().cloned().collect();
+            // **增量落盘**（先写盘再推 UI，tail 随后被 move 走）：
+            // 这个 JSONL 既是断点续扫的进度，也是中断时的产物本体。
+            if !cfg.progress_path.is_empty() {
+                if let Err(e) = append_progress(&cfg.progress_path, &tail) {
+                    log("warn", &format!("进度落盘失败（中断后无法续跑）：{e}"));
+                }
+            }
+            // 刷新进度节点（done = 已落盘行数、total = 本轮要处理的文件数）
+            if node_on {
+                node_rows += tail.len();
+                let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                let n = crate::core::logfilter::resume::ResumeNode {
+                    version: 1,
+                    mode: cfg.mode.clone(),
+                    root_dir: cfg.root_dir.clone(),
+                    out_dir: node_out_dir.clone(),
+                    fingerprint: node_fp.clone(),
+                    total: discovered,
+                    done: node_rows,
+                    started_at: node_started.clone(),
+                    updated_at: now,
+                    data_file: cfg.progress_path.clone(),
+                    done_files: Vec::new(),
+                };
+                let _ = crate::core::logfilter::resume::save_node(&node_out_dir, &n);
+            }
             emit_batch(&send, tail, discovered, &handle);
             since_emit = 0;
         }
@@ -582,6 +653,11 @@ pub fn run_filter_one(
     if since_emit > 0 {
         let tail: Vec<Map<String, Value>> =
             items.iter().rev().take(since_emit).rev().cloned().collect();
+        if !cfg.progress_path.is_empty() {
+            if let Err(e) = append_progress(&cfg.progress_path, &tail) {
+                log("warn", &format!("进度落盘失败（中断后无法续跑）：{e}"));
+            }
+        }
         emit_batch(&send, tail, discovered, &handle);
     }
     s.total = discovered;
@@ -736,6 +812,15 @@ pub fn run_filter_one(
                     "ok",
                     &format!("产物：{batch_dir}  （Excel {} + 审计 upload-result.csv + 留存 {kept} 份日志）", file_name(&s.excel_path)),
                 );
+                // 跑完了：进度文件的使命结束（产物已有 Excel / 审计 CSV），删掉它，
+                // 否则下次点开始会被当成「未完成的任务」反复追问。
+                if !cfg.progress_path.is_empty() {
+                    let _ = std::fs::remove_file(&cfg.progress_path);
+                }
+                // 进度节点同理：跑完就清，别让下次点开始又问一遍
+                if node_on {
+                    crate::core::logfilter::resume::clear_node(&node_out_dir);
+                }
             }
             Err(e) => log("err", &format!("产物导出失败：{e}")),
         }
@@ -834,6 +919,38 @@ pub fn run_filter_shared(
 /// 从 50000 降到 10000：大目录（10万+）跑出来的 Excel 内存按行数放大，1万行
 /// 已经是常见一台工位一整年的量，再多就是「没人会打开来看」的规模，强制走 CSV 更稳。
 pub const EXCEL_MAX_ROWS: usize = 10_000;
+
+/// 把一批行**追加**到进度文件（JSONL，一行一条）。
+///
+/// 这个文件既是「断点续扫的进度」也是「中断时的产物本体」：
+/// - 每批 flush 一次（进程被杀也只丢最后未落盘的那一批）
+/// - 一行一个 JSON 对象 → 恢复时能原样读回表格（主上要求「上次的行也载回表格」）
+fn append_progress(path: &str, rows: &[Map<String, Value>]) -> std::io::Result<()> {
+    use std::io::Write;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    // 进度文件和产物同目录：目录可能还没建（首次跑）
+    if let Some(dir) = Path::new(path).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)?;
+        }
+    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut buf = String::new();
+    for r in rows {
+        match serde_json::to_string(r) {
+            Ok(s) => {
+                buf.push_str(&s);
+                buf.push('\n');
+            }
+            Err(_) => continue, // 单行序列化失败不该拖垮整轮
+        }
+    }
+    f.write_all(buf.as_bytes())?;
+    f.flush()?; // 关键：中断时已落盘的不能丢
+    Ok(())
+}
 
 /// 把一批结果推给界面：附实时计数，同批也会发进度事件
 ///

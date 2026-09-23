@@ -837,7 +837,164 @@ fn run_selftest(dir: &str) -> i32 {
         check("滚动结果文件只留一条 R", std::fs::read_to_string(&rf).map(|t| t.matches("R<").count() == 1).unwrap_or(false), "");
     }
 
-    // 6) 回传组包 dry-run（不打网，只验四字段）
+    // 5) 历史结果重传：读 filter_result.xlsx → 只挑「失败/未回传」的行 → dry-run 重传 → 写回（含备份）
+    {
+        use core::logfilter::retry;
+        let dir = std::env::temp_dir().join("findany-selftest-retry");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let xlsx = dir.join("filter_result.xlsx").to_string_lossy().to_string();
+        // 造 4 行：成功 / 失败 / 空 / 冲突(人工) —— 只有「失败」「空」该被重传
+        let mut rows: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
+        for (i, state) in ["成功", "失败", "", "冲突(人工)"].iter().enumerate() {
+            let mut m = serde_json::Map::new();
+            let mut put = |k: &str, v: &str| m.insert(k.into(), serde_json::Value::String(v.into()));
+            put("sn", &format!("SN{i}"));
+            put("product_key_id", &format!("PK{i}"));
+            put("hardware_hash", "HASH-4000");
+            put("baseboard_product", "XBoard V7");
+            put("upload_state", state);
+            put("rel_path", &format!("f{i}.log"));
+            put("log_file", &format!("f{i}.log"));
+            put("extract_state", "成功");
+            m.insert("extract_ok".into(), serde_json::Value::Bool(true));
+            rows.push(m);
+        }
+        // 用**正式导出路径**造 xlsx：列模板与实际产物逐字一致（否则读回映射对不上）
+        let summary_text: Vec<(&str, String)> = vec![("扫描目录", dir.to_string_lossy().to_string())];
+        let exported = core::logfilter::report::export_filter_excel(&xlsx, &rows, &summary_text).is_ok();
+        check("历史重传：造出 xlsx", exported && std::path::Path::new(&xlsx).is_file(), &xlsx);
+
+        let sheet = retry::read_history(&xlsx).ok();
+        check(
+            "历史重传：读回表头与数据行",
+            sheet.as_ref().map(|s| s.rows.len()).unwrap_or(0) >= 4,
+            &format!("rows={:?}", sheet.as_ref().map(|s| s.rows.len())),
+        );
+        let targets = sheet.as_ref().map(retry::retry_targets).unwrap_or_default();
+        check("历史重传：只挑 失败+未回传 两行", targets.len() == 2, &format!("targets={targets:?}"));
+
+        if let Some(sh) = sheet.as_ref() {
+            let profile = core::logfilter::uploader::UploadProfile::default();
+            let mut updates = Vec::new();
+            for r in sh.rows.iter().filter(|r| targets.contains(&r.excel_row)) {
+                updates.push((r.excel_row, retry::retry_one(&profile, r, true, &|_, _| {})));
+            }
+            let (bak, cells) = retry::write_back(&xlsx, &updates).unwrap_or_default();
+            check(
+                "历史重传：写回前已备份原文件",
+                !bak.is_empty() && std::path::Path::new(&bak).is_file(),
+                &bak,
+            );
+            check("历史重传：写回了单元格", cells > 0, &format!("cells={cells}"));
+            // 再读回：被重传的两行变 dry-run；成功/冲突行原样不动（不能误改）
+            let states: Vec<String> = retry::read_history(&xlsx)
+                .map(|s| s.rows.iter().map(retry::prev_state).collect())
+                .unwrap_or_default();
+            let dry_n = states.iter().filter(|s| s.as_str() == "dry-run").count();
+            check(
+                "历史重传：状态已更新且不误改成功/冲突行",
+                dry_n == 2 && states.iter().any(|s| s == "成功") && states.iter().any(|s| s == "冲突(人工)"),
+                &format!("{states:?}"),
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 6) 断点续扫：跑完清进度；进度文件存在=未完成；续跑只处理剩下的
+    {
+        use core::logfilter::resume;
+        let dir = std::env::temp_dir().join("findany-selftest-resume");
+        let files = dir.join("logs");
+        let out = dir.join("out");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&files);
+        let _ = std::fs::create_dir_all(&out);
+        for i in 0..20 {
+            let _ = std::fs::write(files.join(format!("r{i:02}.log")), "HardwareHash\n");
+        }
+        let mut rcfg = scan_pipe_cfg(&files.to_string_lossy(), &out.to_string_lossy(), "HardwareHash", 1);
+        let fp = resume::task_fingerprint(&rcfg);
+        rcfg.progress_path = resume::progress_path(&rcfg.out_dir, &fp);
+        // ① 完整跑一轮：跑完（导出成功）应把进度文件清掉，下次点开始不该被追问
+        {
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let (_items, s1) = core::logfilter::engine::run_filter(&rcfg, None, &cancel);
+            check("续扫：首轮跑完 20 个", s1.total == 20, &format!("total={}", s1.total));
+            check(
+                "续扫：跑完不留进度文件",
+                !std::path::Path::new(&rcfg.progress_path).exists(),
+                &rcfg.progress_path,
+            );
+        }
+        // ② 造一个「上次处理了 10 个」的进度（模拟中断留下的）
+        {
+            let mut body = String::new();
+            for i in 0..10 {
+                let p = files.join(format!("r{i:02}.log"));
+                let mut m = serde_json::Map::new();
+                m.insert("abs_path".into(), serde_json::Value::String(p.to_string_lossy().to_string()));
+                m.insert("rel_path".into(), serde_json::Value::String(format!("r{i:02}.log")));
+                body.push_str(&serde_json::to_string(&m).unwrap_or_default());
+                body.push('\n');
+            }
+            std::fs::write(&rcfg.progress_path, body).unwrap();
+            let pending = resume::find_pending(&rcfg.out_dir, &fp);
+            check("续扫：识别出未完成任务", pending.is_some(), "未识别");
+            check(
+                "续扫：读回已处理 10 行",
+                pending.as_ref().map(|p| p.done_rows()).unwrap_or(0) == 10,
+                &format!("done={:?}", pending.as_ref().map(|p| p.done_rows())),
+            );
+            // ③ 续跑：跳过已处理的 10 个 → 本轮只处理剩下 10 个
+            let mut r2 = rcfg.clone();
+            r2.skip_paths = pending.as_ref().map(|p| p.done_paths.clone()).unwrap_or_default();
+            r2.progress_path = String::new(); // 这轮不落盘，只核对处理数
+            let cancel2 = std::sync::atomic::AtomicBool::new(false);
+            let (_i2, s2) = core::logfilter::engine::run_filter(&r2, None, &cancel2);
+            check("续扫：只处理剩下的 10 个", s2.total == 10, &format!("total={}", s2.total));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 6b) 历史重传选目录：递归找到所有 filter_result.xlsx（且不认 .bak 备份）
+    {
+        use core::logfilter::retry;
+        let dir = std::env::temp_dir().join("findany-selftest-retrydir");
+        let _ = std::fs::remove_dir_all(&dir);
+        // 造两层批次目录 + 一个 .bak 备份 + 一个无关文件 + 一个隐藏目录
+        for sub in ["2026-09-23_10-00", "2026-09-23_11-00", "2026-09-23_11-00/nested"] {
+            let _ = std::fs::create_dir_all(dir.join(sub));
+        }
+        let files = [
+            ("2026-09-23_10-00/filter_result.xlsx", true),
+            ("2026-09-23_11-00/filter_result.xlsx", true),
+            ("2026-09-23_11-00/nested/filter_result.xlsx", true), // 深层也要找到
+            ("2026-09-23_10-00/filter_result.xlsx.bak-20260923-101010", false), // 备份不算
+            ("2026-09-23_10-00/upload-result.csv", false),                      // 无关文件
+        ];
+        for (rel, _) in files {
+            let p = dir.join(rel);
+            if let Some(par) = p.parent() {
+                let _ = std::fs::create_dir_all(par);
+            }
+            let _ = std::fs::write(&p, b"x");
+        }
+        let _ = std::fs::create_dir_all(dir.join(".hidden"));
+        let _ = std::fs::write(dir.join(".hidden/filter_result.xlsx"), b"x");
+        let found = retry::collect_filter_xlsx(&dir);
+        check(
+            "历史重传：递归找到 3 个 filter_result.xlsx（跳过 .bak / 无关文件 / 隐藏目录）",
+            found.len() == 3,
+            &format!("found={}", found.len()),
+        );
+        // 传文件本身也要认（容错）
+        let one = retry::collect_filter_xlsx(&dir.join("2026-09-23_10-00/filter_result.xlsx"));
+        check("历史重传：传文件本身也接受", one.len() == 1, &format!("one={}", one.len()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 7) 回传组包 dry-run（不打网，只验四字段）
     let fields = items
         .iter()
         .find(|i| i.get("log_file").and_then(|v| v.as_str()) == Some("MT71I2GSF-2HG260807250XAG0015.log"))

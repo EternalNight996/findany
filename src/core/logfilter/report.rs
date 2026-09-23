@@ -30,7 +30,13 @@ fn s(row: &Row, key: &str) -> String {
 
 // 统一模板：36 列固定集合，按 6 组逻辑排序（识别→设备→网络→OA3→原始→结果）。
 // 导出时「整列全空自动隐藏」——模板统一，视图按批次自适应。
-fn detail_cols() -> Vec<(&'static str, &'static str)> {
+/// 明细列的**表头 → 字段名**映射。
+/// 对外公开：从历史 `filter_result.xlsx` 重传时要靠它把 Excel 表头反查成字段名
+/// （导出与读回必须同一张表，否则列一改就对不上）。
+/// 明细列的**表头 → 字段名**映射。
+/// 对外公开：从历史 `filter_result.xlsx` 重传时要靠它把 Excel 表头反查成字段名
+/// （导出与读回必须同一张表，否则列一改就对不上）。
+pub fn detail_cols() -> Vec<(&'static str, &'static str)> {
     vec![
         // 识别
         ("序号", "idx"), ("文件", "log_file"), ("目录", "dir_name"), ("相对路径", "rel_path"),

@@ -3,5 +3,7 @@ pub mod autoconfig;
 pub mod engine;
 pub mod extractors;
 pub mod report;
+pub mod resume;
+pub mod retry;
 pub mod types;
 pub mod uploader;

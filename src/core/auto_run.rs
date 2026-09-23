@@ -12,7 +12,7 @@ use crate::core::logfilter::autoconfig::CliArgs;
 
 /// 由 SearchConfig 组装筛选配置（GUI 与无窗口模式共用）
 pub fn filter_cfg_from_cfg(cfg: &SearchConfig, app_dir: &str) -> FilterRunCfg {
-    FilterRunCfg {
+    let mut rcfg = FilterRunCfg {
         root_dir: cfg.root_dir.clone(),
         out_dir: cfg.out_dir.clone(),
         log_type: cfg.log_type.clone(),
@@ -48,7 +48,14 @@ pub fn filter_cfg_from_cfg(cfg: &SearchConfig, app_dir: &str) -> FilterRunCfg {
         keyword: cfg.keyword.clone(),
         match_mode: cfg.mode.clone(),
         case_sensitive: cfg.case_sensitive,
-    }
+        // 断点续扫：进度文件路径稍后按任务指纹补（无窗口模式也落 —— 中断后能续）
+        progress_path: String::new(),
+        skip_paths: Default::default(),
+    };
+    // 指纹依赖 root/mode/扩展名/名过滤，上面都填好了，这里补进度文件路径
+    let fp = crate::core::logfilter::resume::task_fingerprint(&rcfg);
+    rcfg.progress_path = crate::core::logfilter::resume::progress_path(&rcfg.out_dir, &fp);
+    rcfg
 }
 
 /// 无窗口自动化：跑完返回退出码（0=成功，1=有失败项，2=首次生成模板）
