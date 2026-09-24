@@ -46,3 +46,11 @@ _bak_*/**
 # cargo-wix 在仓库根输出的临时 wxs(每构建覆盖),不入库
 /ETest-*.wxs
 /findany-*.wxs
+
+# runtime artifacts (progress node / dir index / bad-file list / done log)
+/_index_*.jsonl
+/_index_*.meta.json
+/_run_*.jsonl
+/_resume*.json
+/_resume_retry_done.txt
+/_bad_files.txt

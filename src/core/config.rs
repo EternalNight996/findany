@@ -2,7 +2,7 @@
 //!
 //! 字段与分区对齐 Python 版 findany.toml 模板：findany.toml 既服务 GUI，
 //! 也服务「检测 → 回传 → 倒计时关」自动化，一处改两处生效。
-//! 不落盘的仅两个运行期字段：\`work_mode\`（界面工作模式）\`auto_start\`（自动化开跑开关，在 [run]）。
+//! 不落盘的仅 `auto_start`（自动化开跑开关，在 [run]）；`work_mode` 会落盘，下次启动直接进上次的模式。
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -123,9 +123,9 @@ pub struct SearchConfig {
     /// 进程优先级：normal | below_normal | idle（服务器上别抢生产任务的资源；仅 Windows 生效）
     pub process_priority: String,
 
-    // ---------- 运行期（不落盘） ----------
-    /// scan 通用扫描 | filter 日志筛选
-    #[serde(skip)]
+    // ---------- 界面 ----------
+    /// 上次选择的工作模式：`scan` 通用扫描 | `filter` 日志筛选回传 | `retry` 历史结果重传。
+    /// **落盘**（不再是运行期字段）：下次启动直接进上次用的那个模式的界面。
     pub work_mode: String,
 }
 
@@ -203,7 +203,8 @@ impl SearchConfig {
                 errs.push("ASCII 编码无法匹配非 ASCII 关键字".to_string());
             }
         } else {
-            if self.work_mode != "scan" && self.work_mode != "filter" {
+            // 非扫描档：日志筛选回传 或 历史结果重传
+            if self.work_mode != "filter" && self.work_mode != "retry" {
                 errs.push("工作模式不合法".to_string());
             }
             if self.enabled {

@@ -283,33 +283,83 @@ fn run_uitest() -> bool {
         println!("[uitest] 布局回归 OK：窗口 {w:.0}x{h:.0} 渲染无 panic");
     }
 
-    // 左侧面板宽度回归：360 / 420 / 680 三档下面板内容都不许超出面板宽度。
+    // 重传模式的结果表（独立成模式后第一次上屏）：同样过一遍首帧 / 0 尺寸 / NaN
+    for (w, h) in sizes {
+        for _ in 0..3 {
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(w, h),
+                )),
+                ..Default::default()
+            };
+            ctx.begin_pass(input);
+            ui::app::with_central_test_ui(&ctx, |ui| {
+                let _ = ui::app::render_retry_table_for_test(ui, true);
+            });
+            let mut out = ctx.end_pass();
+            out.textures_delta.clear();
+        }
+        println!("[uitest] 重传表回归 OK：窗口 {w:.0}x{h:.0} 渲染无 panic");
+    }
+
+    // 左侧面板宽度回归：360 / 420 / 680 三档 × 三种模式（扫描 / 筛选 / 重传）都不许超出面板宽度。
     // 踩过的坑：①「CLI 路径」输入框吃掉全部宽度，把右边的「…」选文件按钮顶出面板；
     //          ②「自动运行」标题+提示一行放不下，把整张卡片右边界顶出去（右边到顶）。
     let mut panel_ok = true;
     for w in [360.0f32, 440.0, 680.0] {
-        let app_cfg = core::config::SearchConfig::default();
-        let mut app = ui::app::FindanyApp::new(app_cfg, std::path::PathBuf::from("."), String::new(), false);
-        let ctxp = eframe::egui::Context::default();
-        let input = eframe::egui::RawInput {
-            screen_rect: Some(eframe::egui::Rect::from_min_size(
-                eframe::egui::Pos2::ZERO,
-                eframe::egui::vec2(1360.0, 900.0),
-            )),
-            ..Default::default()
-        };
-        ctxp.begin_pass(input);
-        let mut measured = 0.0f32;
-        ui::app::with_central_test_ui(&ctxp, |ui| {
-            measured = ui::app::measure_config_panel(&mut app, ui, w);
-        });
-        let mut o = ctxp.end_pass();
-        o.textures_delta.clear();
-        let fits = measured <= w + 1.0;
-        if !fits {
+        for m in ["scan", "filter", "retry"] {
+            let mut app_cfg = core::config::SearchConfig::default();
+            app_cfg.work_mode = m.to_string();
+            let mut app = ui::app::FindanyApp::new(app_cfg, std::path::PathBuf::from("."), String::new(), false);
+            let ctxp = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1360.0, 900.0),
+                )),
+                ..Default::default()
+            };
+            ctxp.begin_pass(input);
+            let mut measured = 0.0f32;
+            ui::app::with_central_test_ui(&ctxp, |ui| {
+                measured = ui::app::measure_config_panel(&mut app, ui, w);
+            });
+            let mut o = ctxp.end_pass();
+            o.textures_delta.clear();
+            let fits = measured <= w + 1.0;
+            if !fits {
+                panel_ok = false;
+            }
+            println!(
+                "[uitest] 左侧面板 {w:.0}px/{m} -> 内容宽 {measured:.0}px{}",
+                if fits { "" } else { "  <- FAIL（超出面板）" }
+            );
+        }
+    }
+
+    // 切模式时左侧栏数据必须按模式独立（改一个不覆盖另一个）
+    {
+        let mut app = ui::app::FindanyApp::new(
+            core::config::SearchConfig::default(),
+            std::path::PathBuf::from("."),
+            String::new(),
+            false,
+        );
+        let seen = ui::app::mode_switch_probe(&mut app);
+        let ok = seen.len() == 4
+            && seen[0] == "D:/edited-scan"
+            && seen[1] == "D:/edited-filter"
+            && seen[2] == "D:/edited-retry"
+            && seen[3] == "rows_scan=0_filter=2";
+        if !ok {
             panel_ok = false;
         }
-        println!("[uitest] 左侧面板 {w:.0}px -> 内容宽 {measured:.0}px{}", if fits { "" } else { "  <- FAIL（超出面板）" });
+        println!(
+            "[uitest] 三模式隔离（配置 + 结果表）：{}{}",
+            seen.join(" / "),
+            if ok { "" } else { "  <- FAIL（串模式了）" }
+        );
     }
 
     // 导出必须在后台线程跑完并把结果回传（UI 线程零 I/O 的那道闸门）
@@ -529,6 +579,50 @@ fn run_selftest(dir: &str) -> i32 {
             &format!("throttle={} max_files={} prio={}", back.throttle_ms, back.max_files, back.process_priority),
         );
         check("文件名搜索框往返一致", back.name_filter == "MT71", &back.name_filter);
+        // 工作模式（界面）：写进配置 -> 下次启动直接进这个模式。
+        // retry 曾经漏在允许列表外（保存配置会报「工作模式不合法」），这里连校验一起锁住。
+        cfg.work_mode = "retry".into();
+        cfg.root_dir = ".".into();
+        let _ = core::logfilter::autoconfig::save_config(&tmp, &cfg);
+        let back_retry = core::logfilter::autoconfig::load_config(&tmp);
+        check("工作模式往返一致(retry)", back_retry.work_mode == "retry", &back_retry.work_mode);
+        check("retry 模式通过校验", back_retry.validate().is_empty(), &back_retry.validate().join("；"));
+        // 三个模式的模版：左侧栏数据（含扫描目标目录）**按模式独立**，改一个不动另一个
+        {
+            let mut scan = cfg.clone();
+            scan.work_mode = "scan".into();
+            scan.root_dir = "D:/scan-root".into();
+            scan.keyword = "SCAN-KW".into();
+            let mut filt = cfg.clone();
+            filt.work_mode = "filter".into();
+            filt.root_dir = "D:/filter-root".into();
+            filt.keyword = "FILTER-KW".into();
+            let mut ret = cfg.clone();
+            ret.work_mode = "retry".into();
+            ret.root_dir = "D:/retry-root".into();
+            ret.keyword = "RETRY-KW".into();
+            let modes = [scan, filt.clone(), ret];
+            let _ = core::logfilter::autoconfig::save_config_all(&tmp, &filt, &modes);
+            let back_modes = core::logfilter::autoconfig::load_mode_configs(&tmp);
+            check(
+                "三模式目录各自独立",
+                back_modes[0].root_dir == "D:/scan-root"
+                    && back_modes[1].root_dir == "D:/filter-root"
+                    && back_modes[2].root_dir == "D:/retry-root",
+                &format!("{}/{}/{}", back_modes[0].root_dir, back_modes[1].root_dir, back_modes[2].root_dir),
+            );
+            check(
+                "三模式搜索条件各自独立",
+                back_modes[0].keyword == "SCAN-KW" && back_modes[1].keyword == "FILTER-KW" && back_modes[2].keyword == "RETRY-KW",
+                &format!("{}/{}/{}", back_modes[0].keyword, back_modes[1].keyword, back_modes[2].keyword),
+            );
+            let top = core::logfilter::autoconfig::load_config(&tmp);
+            check(
+                "顶层段 = 当前模式镜像",
+                top.root_dir == "D:/filter-root" && top.work_mode == "filter",
+                &format!("{} / {}", top.root_dir, top.work_mode),
+            );
+        }
         let text = std::fs::read_to_string(&tmp).unwrap_or_default();
         check("保留模板注释", text.contains("# 改 true：启动即自动"), "");
         check("保留 auto_start 键", text.contains("auto_start = false"), "");
@@ -543,6 +637,13 @@ fn run_selftest(dir: &str) -> i32 {
         let after = std::fs::read_to_string(&mini).unwrap_or_default();
         check("老档加载不回写文件（原文一字未动）", before == after, "文件被改写了");
         check("老档原值生效", healed.root_dir == ".", &healed.root_dir);
+        // 老档没有 [modes.*] 段：三个模式先都回落到顶层那份（之后各自独立演化）
+        let old_modes = core::logfilter::autoconfig::load_mode_configs(&mini);
+        check(
+            "老档三模式回落到顶层",
+            old_modes.iter().all(|c| c.root_dir == ".") && old_modes[0].work_mode == "scan" && old_modes[2].work_mode == "retry",
+            &format!("{}/{}/{}", old_modes[0].root_dir, old_modes[1].root_dir, old_modes[2].root_dir),
+        );
         check(
             "缺失键按默认补齐(threads)",
             healed.threads == core::config::SearchConfig::default().threads,
@@ -844,7 +945,7 @@ fn run_selftest(dir: &str) -> i32 {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let xlsx = dir.join("filter_result.xlsx").to_string_lossy().to_string();
-        // 造 4 行：成功 / 失败 / 空 / 冲突(人工) —— 只有「失败」「空」该被重传
+        // 造 6 行：口径是「判型 OA3 + 数据完整就重传，不看上次状态」
         let mut rows: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
         for (i, state) in ["成功", "失败", "", "冲突(人工)"].iter().enumerate() {
             let mut m = serde_json::Map::new();
@@ -853,11 +954,35 @@ fn run_selftest(dir: &str) -> i32 {
             put("product_key_id", &format!("PK{i}"));
             put("hardware_hash", "HASH-4000");
             put("baseboard_product", "XBoard V7");
+            put("detected_type", "etest(OA3)");
             put("upload_state", state);
             put("rel_path", &format!("f{i}.log"));
             put("log_file", &format!("f{i}.log"));
             put("extract_state", "成功");
             m.insert("extract_ok".into(), serde_json::Value::Bool(true));
+            rows.push(m);
+        }
+        // 第 5 行：判型是 e-autotest 但字段齐全（应照样回传）；第 6 行：缺 hardware_hash（该跳过）
+        {
+            let mut m = serde_json::Map::new();
+            let mut put = |k: &str, v: &str| m.insert(k.into(), serde_json::Value::String(v.into()));
+            put("sn", "SN-E");
+            put("product_key_id", "PK-E");
+            put("hardware_hash", "HASH-E");
+            put("baseboard_product", "XBoard V7");
+            put("detected_type", "e-autotest");
+            put("upload_state", "");
+            put("rel_path", "f4.log");
+            rows.push(m);
+        }
+        {
+            let mut m = serde_json::Map::new();
+            m.insert("sn".into(), serde_json::Value::String("SN-M".into()));
+            m.insert("product_key_id".into(), serde_json::Value::String("PK-M".into()));
+            m.insert("baseboard_product".into(), serde_json::Value::String("B".into()));
+            m.insert("detected_type".into(), serde_json::Value::String("etest(OA3)".into()));
+            m.insert("upload_state".into(), serde_json::Value::String("".into()));
+            m.insert("rel_path".into(), serde_json::Value::String("f5.log".into()));
             rows.push(m);
         }
         // 用**正式导出路径**造 xlsx：列模板与实际产物逐字一致（否则读回映射对不上）
@@ -871,12 +996,24 @@ fn run_selftest(dir: &str) -> i32 {
             sheet.as_ref().map(|s| s.rows.len()).unwrap_or(0) >= 4,
             &format!("rows={:?}", sheet.as_ref().map(|s| s.rows.len())),
         );
-        let targets = sheet.as_ref().map(retry::retry_targets).unwrap_or_default();
-        check("历史重传：只挑 失败+未回传 两行", targets.len() == 2, &format!("targets={targets:?}"));
+        let (targets, skipped) = sheet
+            .as_ref()
+            .map(|s| retry::retry_targets(&core::logfilter::uploader::UploadProfile::default(), s))
+            .unwrap_or_default();
+        check(
+            "历史重传：字段齐全就传（判型 e-autotest 也算）= 5 台",
+            targets.len() == 5,
+            &format!("targets={targets:?}"),
+        );
+        check(
+            "历史重传：只有缺字段的 1 条跳过",
+            skipped.len() == 1,
+            &format!("skipped={:?}", skipped.iter().map(|(r, w)| (*r, w.clone())).collect::<Vec<_>>()),
+        );
 
         if let Some(sh) = sheet.as_ref() {
             let profile = core::logfilter::uploader::UploadProfile::default();
-            let mut updates = Vec::new();
+            let mut updates: Vec<(u32, serde_json::Map<String, serde_json::Value>)> = Vec::new();
             for r in sh.rows.iter().filter(|r| targets.contains(&r.excel_row)) {
                 updates.push((r.excel_row, retry::retry_one(&profile, r, true, &|_, _| {})));
             }
@@ -887,32 +1024,36 @@ fn run_selftest(dir: &str) -> i32 {
                 &bak,
             );
             check("历史重传：写回了单元格", cells > 0, &format!("cells={cells}"));
-            // 再读回：被重传的两行变 dry-run；成功/冲突行原样不动（不能误改）
+            // 再读回：被重传的 4 行变 dry-run（**含上次显示"成功"和"冲突(人工)"的那两行**）
             let states: Vec<String> = retry::read_history(&xlsx)
                 .map(|s| s.rows.iter().map(retry::prev_state).collect())
                 .unwrap_or_default();
             let dry_n = states.iter().filter(|s| s.as_str() == "dry-run").count();
             check(
-                "历史重传：状态已更新且不误改成功/冲突行",
-                dry_n == 2 && states.iter().any(|s| s == "成功") && states.iter().any(|s| s == "冲突(人工)"),
-                &format!("{states:?}"),
+                "历史重传：成功/冲突/其它判型但字段齐的行都被重新回传",
+                dry_n == 5,
+                &format!("dry-run={dry_n} states={states:?}"),
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // 6) 断点续扫：跑完清进度；进度文件存在=未完成；续跑只处理剩下的
+    // 6) 断点续跑（**文件夹级**）：跑完清进度；节点记「已跑完的文件夹」；续跑整份跳过已完成文件夹
     {
         use core::logfilter::resume;
         let dir = std::env::temp_dir().join("findany-selftest-resume");
         let files = dir.join("logs");
         let out = dir.join("out");
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::create_dir_all(&files);
-        let _ = std::fs::create_dir_all(&out);
-        for i in 0..20 {
-            let _ = std::fs::write(files.join(format!("r{i:02}.log")), "HardwareHash\n");
+        // 两个子目录各 10 个文件：文件夹级续跑才有意义（同目录内不按文件跳）
+        let (dir_a, dir_b) = (files.join("station-a"), files.join("station-b"));
+        for d in [&dir_a, &dir_b] {
+            let _ = std::fs::create_dir_all(d);
+            for i in 0..10 {
+                let _ = std::fs::write(d.join(format!("r{i:02}.log")), "HardwareHash\n");
+            }
         }
+        let _ = std::fs::create_dir_all(&out);
         let mut rcfg = scan_pipe_cfg(&files.to_string_lossy(), &out.to_string_lossy(), "HardwareHash", 1);
         let fp = resume::task_fingerprint(&rcfg);
         rcfg.progress_path = resume::progress_path(&rcfg.out_dir, &fp);
@@ -927,14 +1068,14 @@ fn run_selftest(dir: &str) -> i32 {
                 &rcfg.progress_path,
             );
         }
-        // ② 造一个「上次处理了 10 个」的进度（模拟中断留下的）
+        // ② 造一个「上次跑完了 station-a、station-b 刚开跑就被打断」的节点 + 进度
         {
             let mut body = String::new();
             for i in 0..10 {
-                let p = files.join(format!("r{i:02}.log"));
+                let p = dir_a.join(format!("r{i:02}.log"));
                 let mut m = serde_json::Map::new();
                 m.insert("abs_path".into(), serde_json::Value::String(p.to_string_lossy().to_string()));
-                m.insert("rel_path".into(), serde_json::Value::String(format!("r{i:02}.log")));
+                m.insert("rel_path".into(), serde_json::Value::String(format!("station-a/r{i:02}.log")));
                 body.push_str(&serde_json::to_string(&m).unwrap_or_default());
                 body.push('\n');
             }
@@ -946,13 +1087,75 @@ fn run_selftest(dir: &str) -> i32 {
                 pending.as_ref().map(|p| p.done_rows()).unwrap_or(0) == 10,
                 &format!("done={:?}", pending.as_ref().map(|p| p.done_rows())),
             );
-            // ③ 续跑：跳过已处理的 10 个 → 本轮只处理剩下 10 个
+            let node = resume::ResumeNode {
+                version: 1,
+                mode: "scan".into(),
+                root_dir: rcfg.root_dir.clone(),
+                out_dir: rcfg.out_dir.clone(),
+                fingerprint: fp.clone(),
+                total: 20,
+                done: 10,
+                started_at: "2026-09-23 10:00:00".into(),
+                updated_at: "2026-09-23 10:05:00".into(),
+                data_file: rcfg.progress_path.clone(),
+                done_files: vec![],
+                done_dirs: vec![dir_a.to_string_lossy().to_string()],
+            };
+            resume::save_node(&rcfg.out_dir, &node).unwrap();
+            let back = resume::load_node(&rcfg.out_dir, "scan").expect("节点应能读回");
+            check(
+                "续扫：节点记下已跑完的文件夹",
+                back.done_dirs == vec![dir_a.to_string_lossy().to_string()],
+                &format!("{:?}", back.done_dirs),
+            );
+            // ③ 续跑：station-a 整个跳过 → 本轮只处理 station-b 的 10 个
             let mut r2 = rcfg.clone();
-            r2.skip_paths = pending.as_ref().map(|p| p.done_paths.clone()).unwrap_or_default();
+            r2.skip_dirs = back.done_dirs.iter().cloned().collect();
             r2.progress_path = String::new(); // 这轮不落盘，只核对处理数
             let cancel2 = std::sync::atomic::AtomicBool::new(false);
             let (_i2, s2) = core::logfilter::engine::run_filter(&r2, None, &cancel2);
-            check("续扫：只处理剩下的 10 个", s2.total == 10, &format!("total={}", s2.total));
+            check("续扫：已完成文件夹整份跳过（只跑剩下 10 个）", s2.total == 10, &format!("total={}", s2.total));
+            // ④ 目录统计（索引）：跑完必须 completed=true 并落盘
+            let m1 = core::logfilter::treeindex::load_meta(&rcfg.out_dir, &fp).expect("跑完应有目录统计 meta");
+            check(
+                "目录统计：完成并落盘（目录/子目录/文件数）",
+                m1.completed && m1.total_dirs == 2 && m1.total_files == 20,
+                &format!("completed={} dirs={} subs={} files={}", m1.completed, m1.total_dirs, m1.sub_dirs, m1.total_files),
+            );
+            // ⑤ 复用：源目录里再加一个文件，再跑一轮 —— 统计总数必须还是 20（证明没重新统计）
+            let extra = files.join("station-c");
+            let _ = std::fs::create_dir_all(&extra);
+            let _ = std::fs::write(extra.join("new.log"), "HardwareHash\n");
+            let cancel3 = std::sync::atomic::AtomicBool::new(false);
+            let (_i3, _s3) = core::logfilter::engine::run_filter(&rcfg, None, &cancel3);
+            let m2 = core::logfilter::treeindex::load_meta(&rcfg.out_dir, &fp).expect("meta 还在");
+            check(
+                "目录统计：完成后下次不再重新统计",
+                m2.total_files == 20 && m2.completed,
+                &format!("files={}（若变成 21 就是又统计了一遍）", m2.total_files),
+            );
+            // ⑥ 路径写法变了（大小写 / 斜杠方向）也必须认出已完成的文件夹，不能整批重跑
+            let mut r3 = rcfg.clone();
+            r3.skip_dirs = back.done_dirs.iter().map(|d| d.replace('\\', "/").to_uppercase()).collect();
+            r3.root_dir = rcfg.root_dir.replace('\\', "/").to_uppercase();
+            r3.progress_path = String::new();
+            let cancel4 = std::sync::atomic::AtomicBool::new(false);
+            let (_i4, s4) = core::logfilter::engine::run_filter(&r3, None, &cancel4);
+            check(
+                "续扫：路径写法变了也认得出已完成的文件夹（不整批重跑）",
+                // 路径写法变了 = 任务指纹变了 = 新索引（这次会重新统计+遍历），
+                // 所以能看到第⑤步新增的 station-c：10 + 1 = 11（若跳过集失效会是 21）
+                s4.total == 11,
+                &format!("total={}（若=21 就是跳过集失效）", s4.total),
+            );
+            // ⑦ 清单驱动：索引完成后，源目录里新加的目录**不会被发现**（这是效率的取舍，不是 bug）
+            let cancel5 = std::sync::atomic::AtomicBool::new(false);
+            let (_i5, s5) = core::logfilter::engine::run_filter(&rcfg, None, &cancel5);
+            check(
+                "清单驱动：按索引清单跑，不发现索引之后新增的目录",
+                s5.total == 20,
+                &format!("total={}（=21 说明又遍历了一遍全树）", s5.total),
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -991,6 +1194,123 @@ fn run_selftest(dir: &str) -> i32 {
         // 传文件本身也要认（容错）
         let one = retry::collect_filter_xlsx(&dir.join("2026-09-23_10-00/filter_result.xlsx"));
         check("历史重传：传文件本身也接受", one.len() == 1, &format!("one={}", one.len()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 6c) 历史结果重传（**独立模式**）：递归处理 + 写回 + 跑完清节点
+    {
+        use core::logfilter::retry;
+        let dir = std::env::temp_dir().join("findany-selftest-retrymode");
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = dir.join("src");
+        let out = dir.join("out");
+        let _ = std::fs::create_dir_all(&src);
+        let _ = std::fs::create_dir_all(&out);
+        // 造 2 个批次目录，各一个 xlsx（各含 1 行「失败」→ 该被重传）
+        for b in ["2026-09-23_10-00", "2026-09-23_11-00"] {
+            let bd = src.join(b);
+            let _ = std::fs::create_dir_all(&bd);
+            let xlsx = bd.join("filter_result.xlsx").to_string_lossy().to_string();
+            let mut m = serde_json::Map::new();
+            m.insert("sn".into(), serde_json::Value::String("SN-X".into()));
+            m.insert("product_key_id".into(), serde_json::Value::String("PK-X".into()));
+            m.insert("hardware_hash".into(), serde_json::Value::String("HASH-4000".into()));
+            m.insert("baseboard_product".into(), serde_json::Value::String("XBoard V7".into()));
+            m.insert("detected_type".into(), serde_json::Value::String("etest(OA3)".into()));
+            m.insert("upload_state".into(), serde_json::Value::String("失败".into()));
+            m.insert("log_file".into(), serde_json::Value::String("x.log".into()));
+            m.insert("extract_ok".into(), serde_json::Value::Bool(true));
+            let _ = core::logfilter::report::export_filter_excel(
+                &xlsx,
+                &[m],
+                &[("扫描目录", src.to_string_lossy().to_string())],
+            );
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(32);
+        let profile = core::logfilter::uploader::UploadProfile::default();
+        let h = retry::spawn_retry(
+            src.to_string_lossy().to_string(),
+            out.to_string_lossy().to_string(),
+            profile,
+            true, // dry-run：不调 CLI
+            tx,
+        );
+        let mut batch_rows = 0usize;
+        let mut done_items = 0usize;
+        let mut items: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
+        loop {
+            match rx.recv() {
+                Ok(core::logfilter::engine::FilterEvent::Batch(b)) => batch_rows += b.items.len(),
+                Ok(core::logfilter::engine::FilterEvent::Done(o, _)) => {
+                    done_items = o.items.len();
+                    items = o.items.clone();
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        check("重传模式：2 个 xlsx 各出 1 行", done_items == 2, &format!("items={done_items}"));
+        check("重传模式：逐文件实时推批", batch_rows == 2, &format!("batch_rows={batch_rows}"));
+        // 每行必须带 rel_path —— 表格按它做行索引，缺了就会「所有文件挤在同一行上刷新」
+        check(
+            "重传模式：每行都有 rel_path（不会挤成一行）",
+            items.iter().all(|r| r.get("rel_path").map(|v| !v.as_str().unwrap_or("").is_empty()).unwrap_or(false)),
+            &format!("缺 rel_path 的行: {}", items.iter().filter(|r| r.get("rel_path").is_none()).count()),
+        );
+        check(
+            "重传模式：跑完清进度节点",
+            core::logfilter::resume::load_node(&out.to_string_lossy(), "retry").is_none(),
+            "节点未清",
+        );
+        let x2 = src.join("2026-09-23_10-00/filter_result.xlsx").to_string_lossy().to_string();
+        let states: Vec<String> = retry::read_history(&x2)
+            .map(|s| s.rows.iter().map(retry::prev_state).collect())
+            .unwrap_or_default();
+        check("重传模式：写回后状态=dry-run", states.iter().any(|s| s == "dry-run"), &format!("{states:?}"));
+        // 回传 CLI 兜底：留空时按程序目录找 intunehelper_cli.exe。
+        // 历史重传曾经没走这个解析 → 一开跑就是「CLI 不存在」，整批全失败。
+        {
+            let cdir = std::env::temp_dir().join("findany-selftest-cli");
+            let _ = std::fs::remove_dir_all(&cdir);
+            std::fs::create_dir_all(&cdir).unwrap();
+            let fake = cdir.join("intunehelper_cli.exe");
+            std::fs::write(&fake, b"stub").unwrap();
+            let mut c = core::config::SearchConfig::default();
+            c.cli_path = String::new();
+            let fc = core::auto_run::filter_cfg_from_cfg(&c, &cdir.to_string_lossy());
+            check(
+                "回传 CLI 留空按程序目录兜底",
+                fc.profile.cli_path == fake.to_string_lossy(),
+                &fc.profile.cli_path,
+            );
+            c.cli_path = fake.to_string_lossy().to_string();
+            let fc2 = core::auto_run::filter_cfg_from_cfg(&c, &cdir.to_string_lossy());
+            check("回传 CLI 显式路径优先", fc2.profile.cli_path == fake.to_string_lossy(), &fc2.profile.cli_path);
+            // cargo run 的开发布局：程序目录是 <仓库>/target/debug，要能向上找到 doc/devicehashupload
+            let dev = cdir.join("dev");
+            let deep = dev.join("target").join("debug");
+            std::fs::create_dir_all(&deep).unwrap();
+            let dev_cli = dev.join("doc").join("devicehashupload").join("intunehelper_cli.exe");
+            std::fs::create_dir_all(dev_cli.parent().unwrap()).unwrap();
+            std::fs::write(&dev_cli, b"stub").unwrap();
+            let got = core::logfilter::uploader::resolve_cli("", &deep.to_string_lossy());
+            check("回传 CLI 开发布局向上兜底", got == dev_cli.to_string_lossy(), &got);
+            let _ = std::fs::remove_dir_all(&cdir);
+        }
+        // 缺 OA3 必需字段的行（非 OA3 判型的日志，如 e-autotest）：记「跳过(缺字段)」，不能记「失败」
+        {
+            let mut fields = serde_json::Map::new();
+            fields.insert("sn".into(), serde_json::Value::String("SN-ONLY".into()));
+            let r = retry::HistRow { excel_row: 2, fields };
+            let out = retry::retry_one(&core::logfilter::uploader::UploadProfile::default(), &r, false, &|_, _| {});
+            check(
+                "缺字段的行记「跳过」而不是失败",
+                out.get("upload_state").and_then(|v| v.as_str()) == Some("跳过"),
+                &format!("{:?}", out.get("upload_state")),
+            );
+        }
+        let _ = h;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1098,8 +1418,11 @@ fn main() -> eframe::Result<()> {
     // 资源控制：进程优先级（服务器上别抢生产任务）
     apply_process_priority(&cfg.process_priority);
     if cfg.auto_start {
-        // TOML 要求自动开跑：默认进入筛选流程
-        cfg.work_mode = "filter".into();
+        // 自动开跑：**尊重配置里的工作模式**（scan / filter / retry 都能无人值守跑）。
+        // 旧逻辑无条件改成 filter —— 配了 retry 的机器一开启自动运行就跑错模式（跑成日志筛选）。
+        if !matches!(cfg.work_mode.as_str(), "scan" | "filter" | "retry") {
+            cfg.work_mode = "filter".into();
+        }
     }
     let auto_mode = cfg.auto_start || !cli.config.is_empty();
     core::app_dir::log_line(

@@ -66,9 +66,12 @@ pub struct FilterRunCfg {
     /// 边跑边追加，中断后文件留着；跑完（未取消）就删掉（产物已有 Excel/CSV）。
     /// 空 = 不落进度（自检 / 无需续跑的场景可关）。
     pub progress_path: String,
-    /// 已处理过的文件绝对路径：遍历时直接跳过（续跑的核心）。
-    /// UI 从上次的进度文件读出后填进来。
-    pub skip_paths: std::collections::HashSet<String>,
+    /// **已完成的文件夹**（绝对路径）：续跑时整个目录直接跳过 —— 这就是「缓存文件夹」的粒度。
+    ///
+    /// 为什么不用文件级跳过：一条日志一个文件时，进度表会涨到几十万行、续跑要把它全读进内存比对；
+    /// 文件夹级只需几十~几百条，续跑判定是 O(目录数) 的集合查询，简单可靠。
+    /// 代价：中断时正在跑的那个文件夹会整份重跑（服务端对重复上报返回 duplicate_accepted）。
+    pub skip_dirs: std::collections::HashSet<String>,
 }
 
 impl Default for FilterRunCfg {
@@ -101,7 +104,7 @@ impl Default for FilterRunCfg {
             match_mode: "inc".into(),
             case_sensitive: false,
             progress_path: String::new(),
-            skip_paths: std::collections::HashSet::new(),
+            skip_dirs: std::collections::HashSet::new(),
         }
     }
 }
@@ -130,6 +133,9 @@ pub struct FilterSummary {
     pub batches_total: usize,
     pub batches_pass: usize,
     pub batch_fail_names: Vec<String>,
+    /// 目录统计：有匹配文件的目录数 / 递归看到的子目录数（统计阶段产物，界面显示用）
+    pub idx_dirs: usize,
+    pub idx_sub_dirs: usize,
     pub elapsed: f64,
     pub batch_dir: String,
     pub excel_path: String,
@@ -168,6 +174,28 @@ pub enum FilterEvent {
     Row(Box<Map<String, Value>>),
     Upload { index: usize, total: usize, sn: String, status: String, pct: f64 },
     Done(Box<FilterOutcome>, String),
+}
+
+/// 路径规范化：Windows 路径大小写不敏感、正/反斜杠等价。
+/// 目录级跳过（续跑）必须按规范化形式比较 —— 否则用户把 root_dir 写法换一下
+/// （大小写 / 斜杠方向），已完成目录就全部对不上、整批从头重跑。
+fn norm_key(p: &str) -> String {
+    p.replace('/', "\\").to_lowercase()
+}
+
+/// 文件路径 → 所在目录（与 walk 给出的路径同一形式；文件夹级续跑按它判定）
+fn parent_dir(p: &str) -> String {
+    match p.rfind(['\\', '/']) {
+        Some(i) if i > 0 => p[..i].to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 落盘用的已完成文件夹列表：排序后写（顺序固定，人工看与比对都稳定）
+fn sorted_dirs(done: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut v: Vec<String> = done.iter().cloned().collect();
+    v.sort();
+    v
 }
 
 fn sval(v: Option<&Value>) -> String {
@@ -371,6 +399,12 @@ pub struct FilterHandle {
     pub miss_n: AtomicUsize,
     /// 内存到上限被主动停（界面/结论用来写清原因）
     pub exceeded: AtomicBool,
+    /// 统计阶段的结果：有匹配文件的目录数 / 递归看到的子目录数
+    /// （界面「统计」那一栏用；统计完成标记由 treeindex 的 meta 持久化）
+    pub idx_dirs: AtomicUsize,
+    pub idx_sub_dirs: AtomicUsize,
+    /// 统计是否已完整（true = 复用了上次的索引，没重新遍历）
+    pub idx_ready: AtomicBool,
 }
 
 impl Default for FilterHandle {
@@ -389,6 +423,9 @@ impl Default for FilterHandle {
             hit_n: AtomicUsize::new(0),
             miss_n: AtomicUsize::new(0),
             exceeded: AtomicBool::new(false),
+            idx_dirs: AtomicUsize::new(0),
+            idx_sub_dirs: AtomicUsize::new(0),
+            idx_ready: AtomicBool::new(false),
         }
     }
 }
@@ -440,7 +477,38 @@ pub fn run_filter_one(
     let base_skipped = handle.skipped.load(Ordering::Relaxed);
     let base_hit = handle.hit_n.load(Ordering::Relaxed);
     let base_miss = handle.miss_n.load(Ordering::Relaxed);
-    // ①-a 不再预先遍历成清单（百万级目录会先吃 1GB 路径）：总数边遍历边累加
+    // ①-a **统计阶段**：先把目录树统计清楚并落盘（`_index_<指纹>.jsonl` + meta 的 completed 标记）。
+    // 统计完整后**下次开始直接复用，不再重新遍历**；统计被中断也能接着数（已统计目录整棵跳过）。
+    // 有了它，进度条分母与续跑弹窗里的总数才是真的（以前是边跑边累加，开始永远显示 0/0）。
+    let idx = crate::core::logfilter::treeindex::ensure(cfg, cancel);
+    let idx_total = idx.meta.total_files;
+    handle.idx_dirs.store(idx.meta.total_dirs, Ordering::Relaxed);
+    handle.idx_sub_dirs.store(idx.meta.sub_dirs, Ordering::Relaxed);
+    handle.idx_ready.store(idx.meta.completed, Ordering::Relaxed);
+    if idx_total > 0 {
+        handle.total.store(idx_total, Ordering::Relaxed);
+    }
+    s.idx_dirs = idx.meta.total_dirs;
+    s.idx_sub_dirs = idx.meta.sub_dirs;
+    // 索引自检：meta 与目录清单对不上（写到一半被杀）就当没统计完，本次按遍历重扫
+    if idx.meta.completed && idx.dirs.len() != idx.meta.total_dirs {
+        log(
+            "warn",
+            &format!("目录统计与清单数量不一致（{} vs {}），本次按遍历重扫", idx.dirs.len(), idx.meta.total_dirs),
+        );
+    }
+    log(
+        "info",
+        &format!(
+            "目录统计{}：目录 {} 个（子目录 {} 个）/ 匹配文件 {} 个{}",
+            if idx.reused { "（复用上次结果，不再重新统计）" } else if idx.meta.completed { "完成" } else { "（中断，下次接着数）" },
+            idx.meta.total_dirs,
+            idx.meta.sub_dirs,
+            idx_total,
+            if idx.meta.completed { " —— 已缓存，下次开始直接从这里往下跑" } else { "" }
+        ),
+    );
+    // ①-b 不再预先遍历成清单（百万级目录会先吃 1GB 路径）：总数边遍历边累加
     log(
         "info",
         &format!(
@@ -451,7 +519,7 @@ pub fn run_filter_one(
             if cfg.upload_enabled && cfg.dry_run { "（dry-run）" } else { "" }
         ),
     );
-    send(FilterEvent::Progress { phase: "extract", done: 0, total: 0, pct: 0.0 });
+    send(FilterEvent::Progress { phase: "extract", done: 0, total: idx_total, pct: 0.0 });
 
     let extract_batch = |batch: &[String]| -> Vec<Map<String, Value>> {
         // 直接 collect<Vec>：rayon par_iter 已经产出 owned Map，无需再 cloned
@@ -538,29 +606,74 @@ pub fn run_filter_one(
             root_dir: cfg.root_dir.clone(),
             out_dir: node_out_dir.clone(),
             fingerprint: node_fp.clone(),
-            total: 0, // 流式遍历：总量边跑边累加
+            total: idx_total, // 统计阶段给出的真实总数（复用上次索引时也是它）
             done: 0,
             started_at: node_started.clone(),
             updated_at: node_started.clone(),
             data_file: cfg.progress_path.clone(),
             done_files: Vec::new(),
+            done_dirs: cfg.skip_dirs.iter().cloned().collect::<Vec<_>>(),
         };
         let _ = crate::core::logfilter::resume::save_node(&node_out_dir, &n);
     }
     // 每批刷新节点用的累计行数（与已落盘行数一致）
     let mut node_rows = 0usize;
-    crate::core::scanner::walk_files_each(Path::new(&cfg.root_dir), &cfg.extensions, cfg.recursive, &cfg.name_filter, BATCH, |chunk| {
-        // **断点续扫**：上次已经处理过的文件直接跳过（不重复提取/回传）。
-        // 在限额与计数之前过滤 —— 让「文件总数」反映的是**本次还要跑多少**，进度条才对。
-        let chunk: Vec<String> = if cfg.skip_paths.is_empty() {
-            chunk.to_vec()
-        } else {
-            chunk.iter().filter(|p| !cfg.skip_paths.contains(*p)).cloned().collect()
-        };
-        if chunk.is_empty() {
-            return true; // 整块都已完成，继续下一块（不打扰取消/看门狗判断）
+    // ---- 文件夹级续跑的状态 ----
+    // `done_dirs`：已跑完的文件夹（初始 = 上次留下的，续跑时逐个累加）；**一律存规范化路径**
+    let mut done_dirs: std::collections::HashSet<String> =
+        cfg.skip_dirs.iter().map(|d| norm_key(d)).collect();
+    // 目录 → 是否在「已完成」集合之下（含自身）：遍历按目录推进，同一个目录只判一次
+    let mut dir_skip_cache: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    // 上一个文件所在目录（规范化）：一旦出现新目录，说明上一个目录已经整个走完
+    let mut last_dir: String = String::new();
+    // 某个路径是否落在已完成的文件夹里（逐级向上找祖先，结果缓存）
+    fn under_done(dir: &str, done: &std::collections::HashSet<String>, cache: &mut std::collections::HashMap<String, bool>) -> bool {
+        if done.is_empty() {
+            return false;
         }
-        let chunk = chunk.as_slice();
+        let dir = norm_key(dir);
+        if let Some(v) = cache.get(&dir) {
+            return *v;
+        }
+        let mut hit = false;
+        let mut cur = dir.clone();
+        loop {
+            if done.contains(&cur) {
+                hit = true;
+                break;
+            }
+            match cur.rfind('\\') {
+                // i <= 2 就到盘符/根了（C:\ 这种），不再往上
+                Some(i) if i > 2 => {
+                    cur.truncate(i);
+                }
+                _ => break,
+            }
+        }
+        cache.insert(dir, hit);
+        hit
+    }
+    let mut on_chunk = |chunk: &[String]| -> bool {
+        // ① **断点续跑（文件夹级）**：已完成文件夹下的文件整批丢弃 —— 不重复提取/回传。
+        //   注意顺序：先用「本批开始前」的已完成集合过滤，② 再把本批走完的目录记下来
+        //   （只对后面的批生效）。反过来的话，本批第一个目录会被自己标记完成、把自己的文件全滤掉。
+        let kept: Vec<String> = chunk
+            .iter()
+            .filter(|p| !under_done(&parent_dir(p), &done_dirs, &mut dir_skip_cache))
+            .cloned()
+            .collect();
+        // ② 更新目录边界：出现新目录 = 上一个目录已经整个走完（walk 是深度优先、同目录连续）
+        for p in chunk.iter() {
+            let d = norm_key(&parent_dir(p));
+            if !last_dir.is_empty() && last_dir != d {
+                done_dirs.insert(last_dir.clone());
+            }
+            last_dir = d;
+        }
+        if kept.is_empty() {
+            return true; // 整块都在已完成的文件夹里，继续下一块（不打扰取消/看门狗判断）
+        }
+        let chunk = kept.as_slice();
         // 到上限：本块按剩余额度截断，处理完就停（不再往下遍历）
         let remaining = file_cap.saturating_sub(discovered);
         if remaining == 0 {
@@ -570,7 +683,8 @@ pub fn run_filter_one(
         let chunk = if chunk.len() > remaining { &chunk[..remaining] } else { chunk };
         discovered += chunk.len();
         let hit_cap = discovered >= file_cap;
-        handle.total.store(discovered, Ordering::Relaxed);
+        // 分母用统计阶段的真实总数（进度条才准）；没有索引时退回「边跑边累加」
+        handle.total.store(if idx_total > 0 { idx_total } else { discovered }, Ordering::Relaxed);
         if cancel.load(Ordering::SeqCst) {
             walk_stopped = true;
             return false;
@@ -615,12 +729,13 @@ pub fn run_filter_one(
                     root_dir: cfg.root_dir.clone(),
                     out_dir: node_out_dir.clone(),
                     fingerprint: node_fp.clone(),
-                    total: discovered,
+                    total: if idx_total > 0 { idx_total } else { discovered },
                     done: node_rows,
                     started_at: node_started.clone(),
                     updated_at: now,
                     data_file: cfg.progress_path.clone(),
                     done_files: Vec::new(),
+                    done_dirs: sorted_dirs(&done_dirs),
                 };
                 let _ = crate::core::logfilter::resume::save_node(&node_out_dir, &n);
             }
@@ -647,7 +762,23 @@ pub fn run_filter_one(
             return false;
         }
         true
-    });
+    };
+    // **驱动方式**：索引已统计完整 → 按清单逐目录列文件（不再遍历全树，省一遍遍历、续跑起点精确到目录）；
+    // 否则按目录树流式遍历。两者回调语义一致，处理逻辑是同一份。
+    // 注意：root 本身是**单个文件**时不走清单（清单是「目录 → 文件数」，按它列会把这个目录下的
+    // 兄弟文件全带上，而单文件模式只该处理那一个）。
+    if idx.meta.completed && !idx.dirs.is_empty() && !Path::new(&cfg.root_dir).is_file() {
+        crate::core::logfilter::treeindex::walk_dirs(&idx.dirs, &cfg.extensions, &cfg.name_filter, BATCH, &mut on_chunk);
+    } else {
+        crate::core::scanner::walk_files_each(
+            Path::new(&cfg.root_dir),
+            &cfg.extensions,
+            cfg.recursive,
+            &cfg.name_filter,
+            BATCH,
+            &mut on_chunk,
+        );
+    }
     let _ = walk_stopped;
     // 尾批：循环里可能因为没到间隔而没发出去，这里补发，保证界面拿到最后一批
     if since_emit > 0 {
@@ -819,7 +950,7 @@ pub fn run_filter_one(
                 }
                 // 进度节点同理：跑完就清，别让下次点开始又问一遍
                 if node_on {
-                    crate::core::logfilter::resume::clear_node(&node_out_dir);
+                    crate::core::logfilter::resume::clear_node(&node_out_dir, &cfg.mode);
                 }
             }
             Err(e) => log("err", &format!("产物导出失败：{e}")),

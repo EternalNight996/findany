@@ -193,6 +193,19 @@ pub fn resolve_cli(cli_path: &str, app_dir: &str) -> String {
             return c;
         }
     }
+    // 开发布局再向上找几层：`cargo run` 时程序目录是 `<仓库>/target/debug`，
+    // 仓库里的 doc/devicehashupload/intunehelper_cli.exe 就在上两层。
+    if !app_dir.is_empty() {
+        let mut cur = Path::new(app_dir);
+        for _ in 0..3 {
+            let Some(up) = cur.parent() else { break };
+            cur = up;
+            let cand = cur.join("doc").join("devicehashupload").join("intunehelper_cli.exe");
+            if cand.is_file() {
+                return cand.to_string_lossy().to_string();
+            }
+        }
+    }
     cli_path.to_string()
 }
 
@@ -243,10 +256,18 @@ pub fn default_runner(
         }
     }
     let mut stdout_buf = Vec::new();
-    if let Some(mut so) = child.stdout.take() {
-        use std::io::Read;
-        let _ = so.read_to_end(&mut stdout_buf);
-    }
+    // stdout 也必须**在独立线程里读**：主线程 read_to_end 会一直等 EOF，而 CLI 若是启动器
+    // （自己再拉起子进程、把管道也继承过去），EOF 可能永远不来 —— 主线程就永久阻塞在读取上，
+    // 超时/取消全部失效，整批卡死（实测就是这么把 10248 个文件的任务卡住的）。
+    let mut stdout_pipe = child.stdout.take();
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = stdout_pipe.as_mut() {
+            use std::io::Read;
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
 
     let deadline = Instant::now() + Duration::from_secs_f64(timeout.max(0.001));
     let code = loop {
@@ -274,6 +295,16 @@ pub fn default_runner(
         }
     };
     let stderr_buf = err_handle.join().unwrap_or_default();
+    // 读线程最多再等 3 秒：管道若被 CLI 拉起的子进程攥着，EOF 永远不来 ——
+    // 拿不到 stdout 就当没有（成功判定会退回退出码），绝不为了它把整批卡住。
+    let wait_until = Instant::now() + Duration::from_secs(3);
+    while !out_handle.is_finished() && Instant::now() < wait_until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if out_handle.is_finished() {
+        stdout_buf = out_handle.join().unwrap_or_default();
+    }
+    // 拿不到就留空：成功判定退回退出码，绝不为了 stdout 把整批卡住
     Ok((
         code,
         String::from_utf8_lossy(&stdout_buf).into_owned(),

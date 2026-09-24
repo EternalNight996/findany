@@ -65,6 +65,29 @@ enum SaveState {
     Failed,
 }
 
+/// 模式数组下标（顺序与 `autoconfig::load_mode_configs` 一致：scan / filter / retry）
+fn mode_idx(m: WorkMode) -> usize {
+    match m {
+        WorkMode::Scan => 0,
+        WorkMode::Filter => 1,
+        WorkMode::Retry => 2,
+    }
+}
+
+/// 一个模式自己的**结果数据**（切模式时整份换过去）：
+/// 表格行、行索引、缓存池、汇总、抬底状态 —— 都按模式独立，两个模式的结果不混在一张表里。
+#[derive(Default)]
+struct ModeData {
+    items: Vec<Map<String, Value>>,
+    index: std::collections::HashMap<String, usize>,
+    pool: Option<std::sync::Arc<crate::core::lru_pool::RowPool<Map<String, Value>>>>,
+    summary: FilterSummary,
+    last_row_count: usize,
+    rows_changed: bool,
+    ui_truncated_note: bool,
+    scan_out_dir: String,
+}
+
 enum Running {
     Idle,
     /// **两个模式共用同一个运行态**（通用扫描 / 日志筛选回传是同一条管道，
@@ -95,6 +118,11 @@ struct ResumePrompt {
 
 pub struct FindanyApp {
     cfg: SearchConfig,
+    /// 三个模式各自的模版（顺序 scan / filter / retry）：左侧栏的数据（含扫描目标目录）
+    /// 按模式独立，切模式互不覆盖。`cfg` 永远是「当前模式」那一份，切模式时与对应槽互换。
+    cfg_modes: [SearchConfig; 3],
+    /// 三个模式各自的结果数据（表格 / 汇总 / 缓存池）：切模式时整份换，互不串用
+    mode_data: [ModeData; 3],
     /// 上次落盘时的配置快照（用于顶栏「有改动，点保存配置」提示）
     snapshot: SearchConfig,
     mode: WorkMode,
@@ -162,7 +190,9 @@ pub struct FindanyApp {
 
 impl FindanyApp {
     pub fn new(cfg: SearchConfig, proc_dir: std::path::PathBuf, font_note: String, auto_mode: bool) -> Self {
-        let start_mode = if cfg.work_mode == "filter" { WorkMode::Filter } else { WorkMode::Scan };
+        let start_mode = WorkMode::from_key(&cfg.work_mode);
+        // 没显式装载三份模版时，三个模式先都拿到这一份（之后各自独立演化）
+        let cfg_modes = [cfg.clone(), cfg.clone(), cfg.clone()];
         let mut logs = Vec::new();
         logs.push((
             chrono::Local::now().format("%H:%M:%S").to_string(),
@@ -172,6 +202,8 @@ impl FindanyApp {
         let app = Self {
             snapshot: cfg.clone(),
             cfg,
+            cfg_modes,
+            mode_data: Default::default(),
             mode: start_mode,
             dark: true,
             panel_open: true,
@@ -293,10 +325,79 @@ impl FindanyApp {
     }
 
 
+    /// 载入三个模式的模版（启动时由 main 传进来；不调用则三份都等于当前 cfg）
+    pub fn set_mode_cfgs(&mut self, modes: [SearchConfig; 3]) {
+        self.cfg_modes = modes;
+        // 当前模式这一份以 self.cfg 为准：顶层 [filter]/[upload]/[run] 就是它的镜像
+        let i = mode_idx(self.mode);
+        self.cfg_modes[i] = self.cfg.clone();
+    }
+
+    /// 把当前 cfg 存回它对应的模式槽（切模式 / 保存配置前都要做）
+    fn store_mode_cfg(&mut self) {
+        let i = mode_idx(self.mode);
+        self.cfg_modes[i] = self.cfg.clone();
+    }
+
+    /// 切模式：当前这份先存回旧槽，再载入新槽 —— 左侧栏数据（含扫描目标目录）各模式独立
+    fn switch_mode(&mut self, m: WorkMode) {
+        if self.mode == m {
+            return;
+        }
+        // 运行中不许切：worker 的结果是按「当前模式」写进表格的，切了会把两轮数据混在一张表里
+        if self.running() || self.starting {
+            self.feedback("warn", "正在运行：先「停止」再切模式（免得两个模式的结果混在一张表里）");
+            return;
+        }
+        self.store_mode_cfg();
+        // 结果数据也按模式独立：当前这份整份存回本模式槽，再取出目标模式那份
+        let cur = mode_idx(self.mode);
+        let dst = mode_idx(m);
+        self.mode_data[cur] = self.take_mode_data();
+        self.mode = m;
+        self.cfg = self.cfg_modes[dst].clone();
+        self.cfg.work_mode = m.key().into();
+        self.restore_mode_data(dst);
+        // 换模式不是配置改动：快照跟着走，别让顶栏一直提示「有改动」
+        self.snapshot = self.cfg.clone();
+        self.dirty_now = false;
+        // 挂着的续跑询问是上一个模式的，不能带到新模式来
+        self.resume_prompt = None;
+    }
+
+    /// 把当前结果数据整份取出（切模式用）
+    fn take_mode_data(&mut self) -> ModeData {
+        ModeData {
+            items: std::mem::take(&mut self.filter_items),
+            index: std::mem::take(&mut self.filter_index),
+            pool: self.row_pool.take(),
+            summary: std::mem::take(&mut self.summary),
+            last_row_count: std::mem::replace(&mut self.last_row_count, 0),
+            rows_changed: std::mem::replace(&mut self.rows_changed, false),
+            ui_truncated_note: std::mem::replace(&mut self.ui_truncated_note, false),
+            scan_out_dir: std::mem::take(&mut self.scan_out_dir),
+        }
+    }
+
+    /// 把某模式的结果数据整份装回当前字段
+    fn restore_mode_data(&mut self, i: usize) {
+        let d = std::mem::take(&mut self.mode_data[i]);
+        self.filter_items = d.items;
+        self.filter_index = d.index;
+        self.row_pool = d.pool;
+        self.summary = d.summary;
+        self.last_row_count = d.last_row_count;
+        self.rows_changed = d.rows_changed;
+        self.ui_truncated_note = d.ui_truncated_note;
+        self.scan_out_dir = d.scan_out_dir;
+    }
+
     /// 写回 findany.toml（**只有用户点「保存配置」会走到这里** —— 不再有自动保存）
     fn save_now(&mut self) -> bool {
         let path = crate::core::logfilter::autoconfig::config_path();
-        match crate::core::logfilter::autoconfig::save_config(&path, &self.cfg) {
+        self.store_mode_cfg();
+        let modes = self.cfg_modes.clone();
+        match crate::core::logfilter::autoconfig::save_config_all(&path, &self.cfg, &modes) {
             Ok(p) => {
                 self.snapshot = self.cfg.clone();
                 self.dirty_now = false;
@@ -390,7 +491,7 @@ impl FindanyApp {
     fn begin_run_with_resume(&mut self, mut rcfg: fengine::FilterRunCfg, scan_mode: bool) {
         let fp = crate::core::logfilter::resume::task_fingerprint(&rcfg);
         rcfg.progress_path = crate::core::logfilter::resume::progress_path(&rcfg.out_dir, &fp);
-        match crate::core::logfilter::resume::load_node(&rcfg.out_dir) {
+        match crate::core::logfilter::resume::load_node(&rcfg.out_dir, &rcfg.mode) {
             Some(node) => {
                 self.feedback(
                     "warn",
@@ -511,13 +612,37 @@ impl FindanyApp {
             }
             return;
         }
-        let Some(dir) = pick_folder() else { return };
+        // 重传的「根」就用上面「扫描目标」里的路径（不再另弹选目录框）：递归找里面的 filter_result.xlsx
         let app_dir = self.proc_dir.to_string_lossy().to_string();
         let mut rcfg = crate::core::auto_run::filter_cfg_from_cfg(&self.cfg, &app_dir);
         rcfg.mode = "retry".into();
-        // 重传的「根」= 用户选的目录（要递归找里面的 filter_result.xlsx）
-        rcfg.root_dir = dir.to_string_lossy().to_string();
+        // 重传是真调 CLI 的：找不到就别开跑（否则每个文件都「CLI 不存在」，白等一轮还全红）
+        if !rcfg.dry_run && !std::path::Path::new(&rcfg.profile.cli_path).is_file() {
+            let got = if rcfg.profile.cli_path.is_empty() {
+                "(空)".to_string()
+            } else {
+                rcfg.profile.cli_path.clone()
+            };
+            self.feedback(
+                "err",
+                format!(
+                    "找不到回传 CLI（{got}）：在左侧「CLI 路径」选好 intunehelper_cli.exe；留空时按程序目录 {} 找",
+                    self.proc_dir.display()
+                ),
+            );
+            return;
+        }
         // 与其他两个模式**同一个起跑入口**：先读上次的进度节点决定要不要问
+        self.push_log(
+            "info",
+            &format!(
+                "重传回传 CLI：{}  类型：{}  SecretKey：{}  {}",
+                rcfg.profile.cli_path,
+                rcfg.upload_types.join(","),
+                if self.cfg.secret_key.trim().is_empty() { "空" } else { "已填" },
+                if rcfg.dry_run { "dry-run（不真调 CLI）" } else { "正式回传" }
+            ),
+        );
         self.begin_run_with_resume(rcfg, false);
     }
 
@@ -538,7 +663,9 @@ impl FindanyApp {
         }
         self.starting = true;
         let app_dir = self.proc_dir.to_string_lossy().to_string();
-        let rcfg = crate::core::auto_run::filter_cfg_from_cfg(&self.cfg, &app_dir);
+        let mut rcfg = crate::core::auto_run::filter_cfg_from_cfg(&self.cfg, &app_dir);
+        // 显式钉住模式：进度节点与指纹都按它取，别让配置里的旧 work_mode 把节点指到别的模式去
+        rcfg.mode = "filter".into();
         // 起跑入口两个模式共用：先查有没有上次没跑完的任务（有就先问主上）
         self.begin_run_with_resume(rcfg, false);
     }
@@ -578,7 +705,7 @@ impl FindanyApp {
         // 两个模式共用同一份行数据与同一条产物写出路径（差异只在 mode）
         let rows = self.filter_items.clone();
         let fsum = self.summary.clone();
-        cfg.work_mode = if self.mode == WorkMode::Scan { "scan".into() } else { "filter".into() };
+        cfg.work_mode = self.mode.key().into();
         self.spawn_job("正在导出当前数据", move || {
             let fc = crate::core::auto_run::filter_cfg_from_cfg(&cfg, &app_dir);
             // 用这次运行的真实耗时回推 t0：导出的「耗时(秒)」和跑完时是同一个数
@@ -933,24 +1060,42 @@ impl FindanyApp {
                 self.summary = outcome.summary.clone();
                 let line = {
                     let s = &self.summary;
-                    format!(
-                        "筛选完成：提取 {}/{}（未知类型 {}），回传 成功 {} / 冲突 {} / 失败 {}{}",
-                        s.extracted, s.total, s.unknown, s.upload_ok, s.upload_conflict, s.upload_fail,
-                        if s.upload_dry > 0 { format!(" / dry-run {}", s.upload_dry) } else { String::new() }
-                    )
+                    if self.mode == WorkMode::Retry {
+                        format!(
+                            "重传完成：文件 {}/{}，回传 成功 {} / 冲突 {} / 失败 {}{}",
+                            s.extracted, s.total, s.upload_ok, s.upload_conflict, s.upload_fail,
+                            if s.upload_dry > 0 { format!(" / dry-run {}", s.upload_dry) } else { String::new() }
+                        )
+                    } else {
+                        format!(
+                            "筛选完成：提取 {}/{}（未知类型 {}），回传 成功 {} / 冲突 {} / 失败 {}{}",
+                            s.extracted, s.total, s.unknown, s.upload_ok, s.upload_conflict, s.upload_fail,
+                            if s.upload_dry > 0 { format!(" / dry-run {}", s.upload_dry) } else { String::new() }
+                        )
+                    }
                 };
                 self.push_log("ok", &line);
+                // 重传是「必然回传」：判定只看实际跑了多少（整目录都无需重传 = 正常，不算异常）
+                let upload_on = if self.mode == WorkMode::Retry {
+                    self.summary.upload_ok + self.summary.upload_conflict + self.summary.upload_fail > 0
+                } else {
+                    self.cfg.enabled
+                };
                 // 拦截（都不判 PASS、不倒计时不关，自动化跑歪了必须有人看到）：
                 //  ① 数据为空；② 开了正式回传却没真的回传（定向类型一台没匹配到 / 一台都没回传 / 有失败冲突）
                 // ② 的判定与 R 结论共用 upload_anomaly，界面与验收输出不会各说一套。
                 let empty = self.summary.total == 0 || self.summary.extracted == 0;
                 if empty {
+                    let what = if self.mode == WorkMode::Retry { "filter_result.xlsx" } else { "可处理日志" };
+                    // 剩余为 0（续跑时全被跳过）= 上次其实已经跑到末尾了：清掉本模式的节点，
+                    // 免得下次点开始又被问一遍「继续上次」，问完还是什么都不跑。
+                    crate::core::logfilter::resume::clear_node(&self.cfg.out_dir, self.mode.key());
                     self.push_log(
                         "err",
-                        &format!("数据为空拦截：目录 {} 内可处理日志为 0（文件 {}，提取 {}），程序保持打开", self.cfg.root_dir, self.summary.total, self.summary.extracted),
+                        &format!("数据为空拦截：本次没有需要处理的{what}（文件 {}，提取 {}），程序保持打开", self.summary.total, self.summary.extracted),
                     );
                     self.finish_ui(false);
-                } else if let Some(why) = fengine::upload_anomaly(&self.summary, self.cfg.enabled, self.cfg.dry_run) {
+                } else if let Some(why) = fengine::upload_anomaly(&self.summary, upload_on, self.cfg.dry_run) {
                     self.push_log("err", &format!("回传拦截：{why}；程序保持打开待处理"));
                     self.finish_ui(false);
                 } else {
@@ -959,7 +1104,12 @@ impl FindanyApp {
                 }
                 // 验收输出：R<{content,status,opts}>R（与 --auto 同一套结论）
                 self.starting = false;
-                let (content, ok) = fengine::filter_verdict(&self.summary, self.cfg.enabled, self.cfg.dry_run);
+                // 结论：重传与日志筛选各用各的口径（同一份 summary，界面与 --auto 判的是同一套）
+                let (content, ok) = if self.mode == WorkMode::Retry {
+                    crate::core::logfilter::retry::retry_verdict(&self.summary, self.cfg.dry_run)
+                } else {
+                    fengine::filter_verdict(&self.summary, upload_on, self.cfg.dry_run)
+                };
                 crate::core::result::emit(&content, ok, "filter");
                 let mark = if ok { "PASS" } else { "FAIL" };
                 self.feedback(if ok { "ok" } else { "err" }, format!("筛选完成（{mark}）：{content}"));
@@ -985,7 +1135,14 @@ impl FindanyApp {
         // 旧实现按 mode 分支：筛选受 auto_close 控制、扫描无条件 Some(0) —— 同样的操作
         // 在两个模式下的弹窗/倒计时行为不一样。
         let upload_bad = self.mode == WorkMode::Filter && upload_on && ran && !all_ok;
-        if self.cfg.auto_close && allow_countdown && !empty && !upload_bad {
+        if empty {
+            // 本次一个结果都没有（续跑时剩余已被跳完 / 目录里没有可处理的文件）：
+            // **不弹「完成」窗口** —— 否则看起来就是「明明没运行却提示完成」。
+            // 原因已经写在日志与状态条里（数据为空拦截那一条）。
+            self.countdown = None;
+            return;
+        }
+        if self.cfg.auto_close && allow_countdown && !upload_bad {
             self.countdown = Some(self.cfg.countdown_sec.max(1) as u32);
         } else {
             self.countdown = Some(0); // 只弹提示，不自动关
@@ -1028,11 +1185,7 @@ impl FindanyApp {
                 .show_ui(ui, |ui| {
                     for m in [WorkMode::Scan, WorkMode::Filter, WorkMode::Retry] {
                         if ui.selectable_label(self.mode == m, m.label()).clicked() && self.mode != m {
-                            self.mode = m;
-                            self.cfg.work_mode = m.key().into();
-                            if m == WorkMode::Scan {
-                                self.scan_out_dir.clear();
-                            }
+                            self.switch_mode(m);
                         }
                     }
                 });
@@ -1261,11 +1414,20 @@ impl FindanyApp {
                 ("未选：填/选一个目录，也可以直接选单个文件".to_string(), p.text2)
             } else {
                 match kind {
-                    PathKind::File => ("识别：单个文件（只处理这一个，不走扩展名过滤）".to_string(), p.ok),
-                    PathKind::Dir => (
-                        format!("识别：目录（{}，按扩展名过滤）", if self.cfg.recursive { "含子目录" } else { "仅本层" }),
+                    // 重传找的是历史结果文件，不提「扩展名过滤」（那套只对日志有意义）
+                    PathKind::File => (
+                        if self.mode == WorkMode::Retry {
+                            "识别：单个结果文件（只处理这一个）".to_string()
+                        } else {
+                            "识别：单个文件（只处理这一个，不走扩展名过滤）".to_string()
+                        },
                         p.ok,
                     ),
+                    PathKind::Dir => {
+                        let scope = if self.cfg.recursive { "含子目录" } else { "仅本层" };
+                        let what = if self.mode == WorkMode::Retry { "找 filter_result.xlsx" } else { "按扩展名过滤" };
+                        (format!("识别：目录（{scope}，{what}）"), p.ok)
+                    }
                     PathKind::Checking => ("识别中…（网络盘可能要等一下）".to_string(), p.text2),
                     PathKind::Missing => (format!("识别：路径不存在 —— {t}"), p.err),
                 }
@@ -1274,35 +1436,44 @@ impl FindanyApp {
             ui.add_space(2.0);
             // ---- 文件类型过滤（只扫 log / txt 这类）----
             // 点标签就切换进 cfg.extensions（唯一的真源，写回 findany.toml）；「全部」= 空列表 = 不筛
-            ui.horizontal_wrapped(|ui| {
-                row_label(ui, p, "文件类型");
-                let all_on = self.cfg.extensions.is_empty();
-                if ui.selectable_label(all_on, RichText::new("全部").size(SIZE_BODY)).clicked() {
-                    self.cfg.extensions.clear();
-                }
-                for t in ["log", "txt", "csv", "json", "xml", "md", "ini"] {
-                    let on = self.cfg.extensions.iter().any(|e| e.eq_ignore_ascii_case(t));
-                    if ui.selectable_label(on, RichText::new(t).size(SIZE_BODY)).clicked() {
-                        if on {
-                            self.cfg.extensions.retain(|e| !e.eq_ignore_ascii_case(t));
-                        } else {
-                            self.cfg.extensions.push(t.to_string());
-                            self.cfg.extensions.sort();
+            if self.mode == WorkMode::Retry {
+                // 重传不按扩展名扫目录，只认历史结果文件 —— 类型就固定成 xlsx（选择仍在「扫描目标」这一处）
+                ui.horizontal_wrapped(|ui| {
+                    row_label(ui, p, "文件类型");
+                    let _ = ui.selectable_label(true, RichText::new("xlsx").size(SIZE_BODY));
+                });
+                ui.label(theme::dim("当前：只处理 filter_result.xlsx（xlsx）", p));
+            } else {
+                ui.horizontal_wrapped(|ui| {
+                    row_label(ui, p, "文件类型");
+                    let all_on = self.cfg.extensions.is_empty();
+                    if ui.selectable_label(all_on, RichText::new("全部").size(SIZE_BODY)).clicked() {
+                        self.cfg.extensions.clear();
+                    }
+                    for t in ["log", "txt", "csv", "json", "xml", "md", "ini"] {
+                        let on = self.cfg.extensions.iter().any(|e| e.eq_ignore_ascii_case(t));
+                        if ui.selectable_label(on, RichText::new(t).size(SIZE_BODY)).clicked() {
+                            if on {
+                                self.cfg.extensions.retain(|e| !e.eq_ignore_ascii_case(t));
+                            } else {
+                                self.cfg.extensions.push(t.to_string());
+                                self.cfg.extensions.sort();
+                            }
                         }
                     }
-                }
-            });
-            ui.horizontal(|ui| {
-                row_label(ui, p, "自定义");
-                let mut exts = self.cfg.extensions.join(",");
-                if ui
-                    .add(egui::TextEdit::singleline(&mut exts).desired_width(f32::INFINITY).hint_text("留空=全部；逗号分隔，如 log,txt"))
-                    .changed()
-                {
-                    self.cfg.extensions = exts.split(',').map(|s| s.trim().trim_start_matches('.').to_string()).filter(|s| !s.is_empty()).collect();
-                }
-            });
-            ui.label(theme::dim(if self.cfg.extensions.is_empty() { "当前：全部文件（不按类型过滤）".to_string() } else { format!("当前：只处理 {} 这些类型", self.cfg.extensions.join(" / ")) }, p));
+                });
+                ui.horizontal(|ui| {
+                    row_label(ui, p, "自定义");
+                    let mut exts = self.cfg.extensions.join(",");
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut exts).desired_width(f32::INFINITY).hint_text("留空=全部；逗号分隔，如 log,txt"))
+                        .changed()
+                    {
+                        self.cfg.extensions = exts.split(',').map(|s| s.trim().trim_start_matches('.').to_string()).filter(|s| !s.is_empty()).collect();
+                    }
+                });
+                ui.label(theme::dim(if self.cfg.extensions.is_empty() { "当前：全部文件（不按类型过滤）".to_string() } else { format!("当前：只处理 {} 这些类型", self.cfg.extensions.join(" / ")) }, p));
+            }
         });
 
         // ---- 自动运行（左侧独立成组，一眼能看到）----
@@ -1360,29 +1531,49 @@ impl FindanyApp {
         } else {
             // ---- 日志筛选 / 回传专属 ----
             let app_dir2 = self.proc_dir.to_string_lossy().to_string();
-            group(ui, p, "日志筛选 / 回传", "etest 系", |ui| {
-                ui.horizontal(|ui| {
-                    row_label(ui, p, "筛选类型");
-                    egui::ComboBox::from_id_salt("log_type")
-                        .width(220.0)
-                        .selected_text(match self.cfg.log_type.as_str() {
-                            "auto" => "自动识别",
-                            other => other,
-                        })
-                        .show_ui(ui, |ui| {
-                            for (label, val) in [
-                                ("自动识别", LogType::Auto.as_str()),
-                                ("etest(OA3)", LogType::EtestOa3.as_str()),
-                                ("etest", LogType::Etest.as_str()),
-                                ("e-autotest", LogType::Eautotest.as_str()),
-                                ("海格旧测试2", LogType::HegAutotest2.as_str()),
-                                ("海格旧测试3", LogType::HegAutotest3.as_str()),
-                            ] {
-                                ui.selectable_value(&mut self.cfg.log_type, val.to_string(), label);
-                            }
-                        });
-                });
-                ui.checkbox(&mut self.cfg.enabled, RichText::new("启用数据回传（逐台调第三方 CLI）").size(SIZE_BODY));
+            // 重传：回传口径只有 etest(OA3)、历史结果文件只有 xlsx，所以这两项各自都只有一个选项；
+            // 「启用数据回传」开关对它没意义（重传本身就是要传），也不显示。
+            let is_retry = self.mode == WorkMode::Retry;
+            let gtitle = if is_retry { "历史结果重传" } else { "日志筛选 / 回传" };
+            let ghint = if is_retry { "filter_result.xlsx" } else { "etest 系" };
+            group(ui, p, gtitle, ghint, |ui| {
+                if is_retry {
+                    ui.horizontal(|ui| {
+                        row_label(ui, p, "回传类型");
+                        let cur = self.cfg.types.first().cloned().unwrap_or_else(|| "etest(OA3)".to_string());
+                        egui::ComboBox::from_id_salt("retry_upload_type")
+                            .width(180.0)
+                            .selected_text(cur.as_str())
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(cur == "etest(OA3)", "etest(OA3)").clicked() {
+                                    self.cfg.types = vec!["etest(OA3)".to_string()];
+                                }
+                            });
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        row_label(ui, p, "筛选类型");
+                        egui::ComboBox::from_id_salt("log_type")
+                            .width(220.0)
+                            .selected_text(match self.cfg.log_type.as_str() {
+                                "auto" => "自动识别",
+                                other => other,
+                            })
+                            .show_ui(ui, |ui| {
+                                for (label, val) in [
+                                    ("自动识别", LogType::Auto.as_str()),
+                                    ("etest(OA3)", LogType::EtestOa3.as_str()),
+                                    ("etest", LogType::Etest.as_str()),
+                                    ("e-autotest", LogType::Eautotest.as_str()),
+                                    ("海格旧测试2", LogType::HegAutotest2.as_str()),
+                                    ("海格旧测试3", LogType::HegAutotest3.as_str()),
+                                ] {
+                                    ui.selectable_value(&mut self.cfg.log_type, val.to_string(), label);
+                                }
+                            });
+                    });
+                    ui.checkbox(&mut self.cfg.enabled, RichText::new("启用数据回传（逐台调第三方 CLI）").size(SIZE_BODY));
+                }
                 ui.checkbox(&mut self.cfg.dry_run, RichText::new("dry-run（只组包校验，不调 CLI）").size(SIZE_BODY));
                 ui.checkbox(&mut self.cfg.auto_close, RichText::new("完成后倒计时自动关闭程序").size(SIZE_BODY));
                 ui.horizontal(|ui| {
@@ -1632,9 +1823,11 @@ impl FindanyApp {
                 }
                 Running::Idle => (0, 0, 0.0, 0, 0, 0, 0, 0, 0.0),
             };
-        let is_filter = self.mode == WorkMode::Filter;
+        // 重传是「每个 xlsx 一行」，计数口径与筛选一致（回传成功 / 失败），跟扫描的命中 / 未命中不搭边
+        let is_retry = self.mode == WorkMode::Retry;
+        let is_filter = matches!(self.mode, WorkMode::Filter | WorkMode::Retry);
         let running = self.running();
-        // 运行中读实时计数；结束后读 summary（两个模式的计数都在同一个 FilterSummary 里）
+        // 运行中读实时计数；结束后读 summary（三个模式的计数都在同一个 FilterSummary 里）
         let (a, b, c) = if running {
             if is_filter {
                 (live_extracted, live_unknown, live_skip)
@@ -1647,25 +1840,51 @@ impl FindanyApp {
             (self.summary.hit, self.summary.miss, self.summary.skipped)
         };
         let elapsed = self.summary.elapsed;
+        // 回传成功 / 冲突 / 失败：运行中直接从 handle 的 Atomic 读（跟手），结束后读 summary
+        let (up_ok, up_conflict, up_fail) = match &self.running {
+            Running::Filter { handle, .. } => (
+                handle.upload_ok.load(Ordering::Relaxed),
+                handle.upload_conflict.load(Ordering::Relaxed),
+                handle.upload_fail.load(Ordering::Relaxed),
+            ),
+            _ => (self.summary.upload_ok, self.summary.upload_conflict, self.summary.upload_fail),
+        };
 
         ui.horizontal(|ui| {
-            stat(ui, p, if is_filter { "提取成功" } else { "命中" }, &a.to_string(), p.ok);
-            stat(ui, p, if is_filter { "未知类型" } else { "未命中" }, &b.to_string(), p.text2);
-            stat(ui, p, "跳过", &c.to_string(), p.warn);
+            if is_retry {
+                // 重传没有「命中」这回事，看的就是回传结果本身
+                stat(ui, p, "回传成功", &up_ok.to_string(), p.ok);
+                stat(ui, p, "回传失败", &up_fail.to_string(), if up_fail > 0 { p.err } else { p.text2 });
+                stat(ui, p, "冲突(人工)", &up_conflict.to_string(), p.warn);
+            } else {
+                stat(ui, p, if is_filter { "提取成功" } else { "命中" }, &a.to_string(), p.ok);
+                stat(ui, p, if is_filter { "未知类型" } else { "未命中" }, &b.to_string(), p.text2);
+                stat(ui, p, "跳过", &c.to_string(), p.warn);
+            }
             let total_files = if running { live_total } else { self.summary.total };
             // 遍历阶段总数还是 0：显式提示「正在统计」，避免看着像卡住
             let total_txt = if running && total_files == 0 { "统计中…".to_string() } else { total_files.to_string() };
             stat(ui, p, "文件总数", &total_txt, p.text);
-            // 回传成功 / 失败：运行中直接从 handle 的 Atomic 读（跟手），结束后读 summary。
-            // 只在日志筛选模式显示（扫描模式没有回传概念）。
-            if is_filter {
-                let (up_ok, up_fail) = match &self.running {
-                    Running::Filter { handle, .. } => (
-                        handle.upload_ok.load(Ordering::Relaxed),
-                        handle.upload_fail.load(Ordering::Relaxed),
-                    ),
-                    _ => (self.summary.upload_ok, self.summary.upload_fail),
-                };
+            // 目录统计（统计阶段落到索引里；completed 后下次复用、不再重新遍历）
+            let (idx_dirs, idx_subs, idx_ready) = match &self.running {
+                Running::Filter { handle, .. } => (
+                    handle.idx_dirs.load(Ordering::Relaxed),
+                    handle.idx_sub_dirs.load(Ordering::Relaxed),
+                    handle.idx_ready.load(Ordering::Relaxed),
+                ),
+                Running::Idle => (self.summary.idx_dirs, self.summary.idx_sub_dirs, self.summary.idx_dirs > 0),
+            };
+            if idx_dirs > 0 || idx_subs > 0 {
+                stat(
+                    ui,
+                    p,
+                    if idx_ready { "目录（已统计）" } else { "目录（统计中）" },
+                    &format!("{}（子目录 {}）", idx_dirs, idx_subs),
+                    if idx_ready { p.text } else { p.warn },
+                );
+            }
+            // 回传成功 / 失败：只在日志筛选模式重复显示（扫描没有回传概念；重传上面已经显示过）
+            if self.mode == WorkMode::Filter {
                 stat(ui, p, "回传成功", &up_ok.to_string(), p.ok);
                 stat(ui, p, "回传失败", &up_fail.to_string(), if up_fail > 0 { p.err } else { p.text2 });
             }
@@ -1733,7 +1952,7 @@ impl FindanyApp {
                 }
                 // 历史结果重传：**选目录 + 递归**（输出根→历次批次一次全跑）。
                 // 只重传「回传状态为空/失败/dry-run」的行，结果写回各自原 xlsx（写前自动备份）。
-                if is_filter
+                if self.mode == WorkMode::Filter
                     && ui
                         .add(egui::Button::new(theme::body("从历史结果重传", p)).min_size(egui::vec2(140.0, BTN_H)))
                         .on_hover_text(
@@ -1876,7 +2095,16 @@ impl FindanyApp {
                 if !prompt.node.updated_at.is_empty() {
                     ui.label(theme::dim(format!("最后更新：{}", prompt.node.updated_at), p));
                 }
-                ui.label(theme::dim("继续：把上次的行载回表格，只跑剩下的文件（已处理的跳过）", p));
+                if !prompt.node.done_dirs.is_empty() {
+                    ui.label(theme::dim(
+                        format!(
+                            "已跑完 {} 个文件夹（续跑时整份跳过；没跑完的那个会重跑一遍）",
+                            prompt.node.done_dirs.len()
+                        ),
+                        p,
+                    ));
+                }
+                ui.label(theme::dim("继续：把上次的行载回表格，只跑剩下的文件夹（已跑完的跳过）", p));
                 ui.label(theme::dim("从头开始：丢掉旧进度，所有文件重新跑一遍", p));
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -1898,9 +2126,8 @@ impl FindanyApp {
             Some(true) => {
                 // 续跑：行数据在节点指向的 JSONL 里（节点只有指针），跳过已处理文件
                 let mut rcfg = prompt.rcfg.clone();
-                if let Some(rp) = crate::core::logfilter::resume::load_rows(&prompt.node.data_file) {
-                    rcfg.skip_paths = rp.done_paths.clone();
-                }
+                // 跳过粒度 = **文件夹**：上次跑完的文件夹整份跳过（没跑完的那个会重跑一遍）
+                rcfg.skip_dirs = prompt.node.done_dirs.iter().cloned().collect();
                 self.push_log(
                     "info",
                     &format!(
@@ -1914,8 +2141,10 @@ impl FindanyApp {
                 self.launch_run(rcfg, prompt.scan_mode, Some(&node));
             }
             Some(false) => {
-                // 从头：节点与数据文件都清掉
-                crate::core::logfilter::resume::clear_node(&prompt.rcfg.out_dir);
+                // 从头：节点与数据文件都清掉；目录统计（索引）也清掉，下次重新统计
+                crate::core::logfilter::resume::clear_node(&prompt.rcfg.out_dir, &prompt.rcfg.mode);
+                let fp = crate::core::logfilter::resume::task_fingerprint(&prompt.rcfg);
+                crate::core::logfilter::treeindex::clear_index(&prompt.rcfg.out_dir, &fp);
                 if !prompt.node.data_file.is_empty() {
                     let _ = std::fs::remove_file(&prompt.node.data_file);
                 }
@@ -1932,14 +2161,20 @@ impl FindanyApp {
     fn countdown_window(&mut self, ctx: &egui::Context, p: &Palette) {
         let Some(sec) = self.countdown else { return };
         let mut close_now = false;
-        let is_filter = self.mode == WorkMode::Filter;
+        let is_retry = self.mode == WorkMode::Retry;
+        let is_filter = matches!(self.mode, WorkMode::Filter | WorkMode::Retry);
         egui::Window::new("完成")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                let title = if is_filter { "日志筛选完成" } else { "扫描完成" };
-                let sub = if is_filter {
+                let title = if is_retry { "历史结果重传完成" } else if is_filter { "日志筛选完成" } else { "扫描完成" };
+                let sub = if is_retry {
+                    format!(
+                        "回传 成功 {} / 冲突 {} / 失败 {}",
+                        self.summary.upload_ok, self.summary.upload_conflict, self.summary.upload_fail
+                    )
+                } else if is_filter {
                     format!("产物：{}", self.summary.batch_dir)
                 } else {
                     format!("命中 {}，未命中 {}，跳过 {}", self.summary.hit, self.summary.miss, self.summary.skipped)
@@ -2153,6 +2388,71 @@ pub fn render_scan_table_for_test(ui: &mut egui::Ui, items: &[ScanItem], follow:
     scan_table(ui, &p, &rows, follow, salt, true)
 }
 
+/// 回归自证入口（--uitest 用）：画一遍**历史结果重传**的结果表。
+/// 重传以前只是筛选模式里的一个按钮（走的是筛选表），独立成模式后这张表第一次真正上屏，
+/// 这里连同首帧 / 0 尺寸 / NaN 布局一起锁住。
+pub fn render_retry_table_for_test(ui: &mut egui::Ui, follow: bool) -> (f32, f32, f32, f32) {
+    let p = theme::dark();
+    let mk = |file: &str, target: i64, ok: i64, fail: i64, state: &str| {
+        let mut m = Map::new();
+        m.insert("file_name".into(), Value::String(file.into()));
+        m.insert("dir".into(), Value::String("out/2026-09-23_10-00".into()));
+        m.insert("rows_total".into(), Value::Number(12.into()));
+        m.insert("retry_targets".into(), Value::Number(target.into()));
+        m.insert("ok".into(), Value::Number(ok.into()));
+        m.insert("conflict".into(), Value::Number(0.into()));
+        m.insert("fail".into(), Value::Number(fail.into()));
+        m.insert("state".into(), Value::String(state.into()));
+        m
+    };
+    // 三行覆盖三种着色分支：完成（绿）/ 无需重传（灰）/ 读取失败（红，error 键缺失走 None 分支）
+    let mut rows = vec![
+        mk("filter_result.xlsx", 3, 3, 0, "完成（写回 12 格）"),
+        mk("filter_result.xlsx", 0, 0, 0, "无需重传"),
+        mk("filter_result.xlsx", 2, 0, 2, "读取失败"),
+    ];
+    // 第四种着色：跳过（缺字段）—— 非 OA3 判型的行，不算失败
+    rows[2].insert("skipped".into(), Value::Number(2.into()));
+    retry_table(ui, &p, &rows, follow, "uitest_retry_table", true)
+}
+
+/// 回归自证入口（--uitest 用）：切模式时左侧栏数据必须**按模式独立**。
+/// 做法：给三个模式各自设一个专属目录 → 逐一切过去改成「本模式改过的值」→ 再切一轮，
+/// 返回第二轮读到的目录。期望 ["D:/edited-scan","D:/edited-filter","D:/edited-retry"]。
+pub fn mode_switch_probe(app: &mut FindanyApp) -> Vec<String> {
+    let mut modes = [app.cfg.clone(), app.cfg.clone(), app.cfg.clone()];
+    for (i, key) in ["scan", "filter", "retry"].iter().enumerate() {
+        modes[i].root_dir = format!("D:/only-{key}");
+        modes[i].work_mode = (*key).to_string();
+    }
+    app.set_mode_cfgs(modes);
+    for m in [WorkMode::Scan, WorkMode::Filter, WorkMode::Retry] {
+        app.switch_mode(m);
+        app.cfg.root_dir = format!("D:/edited-{}", m.key());
+    }
+    let mut seen = Vec::new();
+    for m in [WorkMode::Scan, WorkMode::Filter, WorkMode::Retry] {
+        app.switch_mode(m);
+        seen.push(app.cfg.root_dir.clone());
+    }
+    // 结果数据也要按模式独立：给「日志筛选」塞两行 → 切到扫描必须为空 → 切回来两行还在
+    app.switch_mode(WorkMode::Filter);
+    app.filter_items = vec![mode_probe_row("D:/probe-a.log"), mode_probe_row("D:/probe-b.log")];
+    app.rebuild_filter_index();
+    app.switch_mode(WorkMode::Scan);
+    let scan_rows = app.filter_items.len();
+    app.switch_mode(WorkMode::Filter);
+    let back_rows = app.filter_items.len();
+    seen.push(format!("rows_scan={scan_rows}_filter={back_rows}"));
+    seen
+}
+
+fn mode_probe_row(path: &str) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("rel_path".into(), Value::String(path.into()));
+    m
+}
+
 /// ScanItem → 管道 Row（仅 uitest 构造测试数据用；运行时由 engine::scan_one 产出）
 fn scan_item_to_row(it: &ScanItem) -> Map<String, Value> {
     let mut m = Map::new();
@@ -2209,6 +2509,7 @@ fn run_retry_job(
     let mut files_fail: Vec<String> = Vec::new();
     let mut files_no_target = 0usize;
     let mut total_targets = 0usize;
+    let mut total_skipped = 0usize;
     let mut ok = 0usize;
     let mut fail = 0usize;
     let mut conflict = 0usize;
@@ -2224,13 +2525,25 @@ fn run_retry_job(
                 continue;
             }
         };
-        let targets = retry::retry_targets(&sheet);
-        if targets.is_empty() {
+        // 口径与界面重传一致：只看「判型 OA3 + 数据完整」，不看上次回传状态
+        let (targets, skipped_rows) = retry::retry_targets(profile, &sheet);
+        if targets.is_empty() && skipped_rows.is_empty() {
             files_no_target += 1;
             continue;
         }
         total_targets += targets.len();
-        let mut updates: Vec<(u32, serde_json::Map<String, serde_json::Value>)> = Vec::new();
+        total_skipped += skipped_rows.len();
+        // 不满足条件的先落表：跳过 + 原因
+        let mut updates: Vec<(u32, serde_json::Map<String, serde_json::Value>)> = skipped_rows
+            .iter()
+            .map(|(r, why)| {
+                let mut m = serde_json::Map::new();
+                m.insert("upload_state".into(), Value::String(retry::ST_SKIP.into()));
+                m.insert("upload_error".into(), Value::String(format!("跳过（{why}）")));
+                m.insert("_status".into(), Value::String(retry::ST_SKIP.into()));
+                (*r, m)
+            })
+            .collect();
         for row in sheet.rows.iter().filter(|r| targets.contains(&r.excel_row)) {
             let fields = retry::retry_one(profile, row, dry_run, &|_, _| {});
             match fields.get("_status").and_then(|v| v.as_str()).unwrap_or("") {
@@ -2255,15 +2568,16 @@ fn run_retry_job(
 
     if total_targets == 0 && files_fail.is_empty() {
         return Ok(format!(
-            "扫描了 {} 个 filter_result.xlsx：没有需要重传的行（成功与「冲突(人工)」不自动重传）",
+            "扫描了 {} 个 filter_result.xlsx：没有「判型 OA3 且数据完整」的行可回传（跳过 {total_skipped} 台）",
             paths.len()
         ));
     }
     Ok(format!(
-        "历史结果重传完成：{} 个文件 / 共 {} 台（成功 {ok} / 冲突 {conflict} / 失败 {fail}{}）；写回 {cells_written} 个单元格，{backups} 个文件已备份{}{}",
+        "历史结果重传完成：{} 个文件 / 共 {} 台（成功 {ok} / 冲突 {conflict} / 失败 {fail}{}）{}；写回 {cells_written} 个单元格，{backups} 个文件已备份{}{}",
         files_ok,
         total_targets,
         if dry > 0 { format!(" / dry-run {dry}") } else { String::new() },
+        if total_skipped > 0 { format!("，跳过 {total_skipped} 台（非 OA3 或字段不全）") } else { String::new() },
         if files_no_target > 0 { format!("；{files_no_target} 个文件无需重传") } else { String::new() },
         if files_fail.is_empty() {
             String::new()
@@ -2374,6 +2688,8 @@ fn rows_table(
     follow: bool,
     scroll_id: &str,
     rows_changed: bool,
+    // 这一列渲染成可点链接（点一下就用资源管理器打开该格的文本 = 目录路径）；None = 普通列
+    link_col: Option<usize>,
     cell: &dyn Fn(usize, usize, &Palette) -> (String, Color32),
 ) -> (f32, f32, f32, f32) {
     // 供 --uitest 断言「跟随最新时每帧都精确贴底、且 offset 单调不减」
@@ -2420,7 +2736,21 @@ fn rows_table(
                         for c in 0..cols.len() {
                             row.col(|ui| {
                                 let (txt, color) = cell(i, c, p);
-                                ui.label(RichText::new(txt).size(SIZE_BODY).color(color));
+                                // 目录列 = 可点链接：点一下直接用资源管理器打开这个目录
+                                if link_col == Some(c) && !txt.trim().is_empty() {
+                                    let r = ui.add(
+                                        egui::Label::new(
+                                            RichText::new(txt.clone()).size(SIZE_BODY).color(p.brand).underline(),
+                                        )
+                                        .sense(egui::Sense::click()),
+                                    );
+                                    if r.clicked() {
+                                        let _ = open_path(&txt);
+                                    }
+                                    r.on_hover_text("点击打开这个目录");
+                                } else {
+                                    ui.label(RichText::new(txt).size(SIZE_BODY).color(color));
+                                }
                             });
                         }
                     });
@@ -2465,7 +2795,7 @@ fn scan_table(ui: &mut egui::Ui, p: &Palette, rows: &[Map<String, Value>], follo
         ("修改时间", 160.0, 54.0),
         ("编码", 96.0, 54.0),
     ];
-    rows_table(ui, p, &COLS, rows.len(), follow, scroll_id, rows_changed, &|i, c, p| {
+    rows_table(ui, p, &COLS, rows.len(), follow, scroll_id, rows_changed, Some(2), &|i, c, p| {
         let r = &rows[i];
         match c {
             0 => ((i + 1).to_string(), p.text),
@@ -2495,7 +2825,7 @@ fn scan_table(ui: &mut egui::Ui, p: &Palette, rows: &[Map<String, Value>], follo
 }
 
 /// 把 (表头, 取值键, 列宽) 的列定义转成 rows_table 需要的 (表头, 初始宽, 最小宽)
-fn layout_of(cols: &[(&str, &str, f32)]) -> Vec<(&str, f32, f32)> {
+fn layout_of<'a>(cols: &[(&'a str, &str, f32)]) -> Vec<(&'a str, f32, f32)> {
     cols.iter().map(|(h, _, w)| (*h, *w, 54.0)).collect()
 }
 
@@ -2503,7 +2833,7 @@ fn layout_of(cols: &[(&str, &str, f32)]) -> Vec<(&str, f32, f32)> {
 /// 与扫描/筛选同一套渲染（rows_table），只是列不同。
 #[allow(clippy::type_complexity)]
 fn retry_table(ui: &mut egui::Ui, p: &Palette, rows: &[Map<String, Value>], follow: bool, scroll_id: &str, rows_changed: bool) -> (f32, f32, f32, f32) {
-    const COLS: [(&str, &str, f32); 10] = [
+    const COLS: [(&str, &str, f32); 11] = [
         ("序号", "idx", 52.0),
         ("文件", "file_name", 250.0),
         ("目录", "dir", 300.0),
@@ -2512,10 +2842,11 @@ fn retry_table(ui: &mut egui::Ui, p: &Palette, rows: &[Map<String, Value>], foll
         ("成功", "ok", 62.0),
         ("冲突", "conflict", 62.0),
         ("失败", "fail", 62.0),
+        ("跳过", "skipped", 62.0),
         ("状态", "state", 150.0),
         ("错误", "error", 260.0),
     ];
-    rows_table(ui, p, &layout_of(&COLS), rows.len(), follow, scroll_id, rows_changed, &|i, c, p| {
+    rows_table(ui, p, &layout_of(&COLS), rows.len(), follow, scroll_id, rows_changed, Some(2), &|i, c, p| {
         if c == 0 {
             return ((i + 1).to_string(), p.text);
         }
@@ -2526,7 +2857,7 @@ fn retry_table(ui: &mut egui::Ui, p: &Palette, rows: &[Map<String, Value>], foll
             Some(Value::Null) | None => String::new(),
             Some(other) => other.to_string(),
         };
-        // 状态/失败数着色：成功绿、失败红、无需重传灰
+        // 状态/计数着色：成功绿、失败红、跳过（缺字段）黄、无需重传灰
         let color = match key {
             "state" => {
                 if v.starts_with("完成") {
@@ -2539,6 +2870,7 @@ fn retry_table(ui: &mut egui::Ui, p: &Palette, rows: &[Map<String, Value>], foll
             }
             "fail" if v != "0" && !v.is_empty() => p.err,
             "ok" if v != "0" && !v.is_empty() => p.ok,
+            "skipped" if v != "0" && !v.is_empty() => p.warn,
             _ => p.text,
         };
         (truncate(&v, 80), color)
@@ -2565,7 +2897,7 @@ fn filter_table(ui: &mut egui::Ui, p: &Palette, items: &[Map<String, Value>], fo
         ("回传错误", "upload_error", 240.0),
     ];
     let layout: Vec<(&str, f32, f32)> = layout_of(&COLS);
-    rows_table(ui, p, &layout, items.len(), follow, scroll_id, rows_changed, &|i, c, p| {
+    rows_table(ui, p, &layout, items.len(), follow, scroll_id, rows_changed, None, &|i, c, p| {
         if c == 0 {
             return ((i + 1).to_string(), p.text);
         }
@@ -2619,6 +2951,13 @@ impl eframe::App for FindanyApp {
             self.need_repaint = false;
             ctx.request_repaint_after(Duration::from_millis(200));
         }
+        // **运行中必须持续醒来消费事件**（死锁根治）：
+        // worker 用有界通道推送（通道满就阻塞等 UI 取走）；如果 UI 因为「这一帧没新数据」
+        // 就不再要求重绘、egui 进入空闲，那就变成「worker 等 UI 消费 / UI 等 worker 出数据」——
+        // 表现就是整个界面卡死、CPU 0%、所有线程 Wait（长时间跑必然撞上，跟数据量无关）。
+        if self.running() || self.starting {
+            ctx.request_repaint_after(Duration::from_millis(self.cfg.ui_refresh_ms.max(20) as u64));
+        }
 
         // UI 线程登记一次：后台 I/O 辅助函数靠它把「在 UI 线程里做 I/O」当场断言出来
         crate::core::app_dir::mark_ui_thread();
@@ -2656,6 +2995,10 @@ impl eframe::App for FindanyApp {
             self.push_log("info", if self.auto_mode { "自动化模式：启动即开跑（TOML）" } else { "run.auto_start=true，自动开跑" });
             if self.mode == WorkMode::Scan {
                 self.start_scan();
+            } else if self.mode == WorkMode::Retry {
+                // 自动运行也要能跑「历史结果重传」——以前这里只有 scan/filter 两档，
+                // 配了 work_mode=retry 的机器一开启自动运行就跑成了日志筛选（把输出目录当日志目录扫）
+                self.start_retry();
             } else {
                 self.start_filter();
             }
@@ -2716,7 +3059,11 @@ pub fn run(cfg: SearchConfig, proc_dir: std::path::PathBuf, auto_mode: bool) -> 
         native_options,
         Box::new(move |cc| {
             let font_note = theme::install_fonts(&cc.egui_ctx);
-            Ok(Box::new(FindanyApp::new(cfg, proc_dir, font_note, auto_mode)))
+            let mut app = FindanyApp::new(cfg, proc_dir, font_note, auto_mode);
+            // 三个模式的模版：左侧栏数据按模式独立（读文件里各自的 [modes.<模式>.*] 段）
+            let path = crate::core::logfilter::autoconfig::config_path();
+            app.set_mode_cfgs(crate::core::logfilter::autoconfig::load_mode_configs(&path));
+            Ok(Box::new(app))
         }),
     )
 }

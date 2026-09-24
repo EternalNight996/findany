@@ -15,9 +15,14 @@ pub struct BatchDir {
     pub name: String,
 }
 
-/// out_root 下建「YYYY-MM-DD_HH-MM」批次目录，同分钟重复自动加序号。
+/// out_root 下建「YYYY-MM-DD_HH-MM-SS」批次目录，同秒撞车才自动加序号。
+///
+/// **必须精确到秒**：以前只到分钟，同分钟内靠 `_2 / _3 / …` **逐个 exists 探测**。
+/// 分批模式下（按子目录分批，动辄几千上万批）同一分钟能跑几百批，探测次数线性增长、
+/// 总代价 O(N²) —— 在慢盘/网络盘上就是「越跑越慢直到像卡死」。
+/// 精确到秒之后同秒撞车极少，绝大多数批次一次探测就过。
 pub fn make_batch_dir(out_root: &str) -> std::io::Result<BatchDir> {
-    let name = chrono::Local::now().format("%Y-%m-%d_%H-%M").to_string();
+    let name = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
     // 先把输出根解析成绝对路径：相对路径（含 "."）与进程 cwd 无关地落到预期位置，
     // 也避免 Path::join 在 "." 下拼出 "./xxx" 这类依赖 cwd 的相对批次目录
     let root = crate::core::scanner::abs_path(Path::new(if out_root.is_empty() { "." } else { out_root }));

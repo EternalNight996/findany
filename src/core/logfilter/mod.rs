@@ -5,5 +5,6 @@ pub mod extractors;
 pub mod report;
 pub mod resume;
 pub mod retry;
+pub mod treeindex;
 pub mod types;
 pub mod uploader;

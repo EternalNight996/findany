@@ -83,6 +83,8 @@ auto_start = false             # 改 true：启动即自动「检测→回传→
 countdown_sec = 3              # 完成后倒计时，归零自动关程序
 auto_close = true
 process_priority = "normal"     # normal | below_normal | idle：服务器上建议 below_normal 或 idle（仅 Windows 生效）
+work_mode = "filter"            # 上次用的工作模式：scan 通用扫描 | filter 日志筛选回传 | retry 历史结果重传
+                                # 启动时直接进这个模式的界面（点保存配置时自动写回）
 
 [upload]
 enabled = true
@@ -93,6 +95,21 @@ secret_key = ""                # 正式回传必填；本文件勿提交仓库
 args = "upload --stdin --secret-key ~secret_key~"
 timeout_sec = 60
 max_retries = 3
+
+# ---------- 三个模式各自的模版（左侧栏的数据按模式独立存这里，互不影响） ----------
+# 上面 [filter]/[upload]/[run] = 「当前模式」的镜像（findany --auto 与老工具只认它们）；
+# 下面这些段由「保存配置」写入：切模式读各自那份，改哪个模式只动哪个模式。
+[modes.scan.filter]
+[modes.scan.upload]
+[modes.scan.run]
+
+[modes.filter.filter]
+[modes.filter.upload]
+[modes.filter.run]
+
+[modes.retry.filter]
+[modes.retry.upload]
+[modes.retry.run]
 "#;
 
 /// 输出默认 toml；成功 true。已存在时不覆盖。
@@ -111,7 +128,12 @@ pub fn write_default(path: &Path) -> bool {
 // ---------- 解析（toml 文本 → SearchConfig） ----------
 
 fn table<'a>(doc: &'a toml::Value, key: &str) -> Option<&'a toml::Value> {
-    doc.get(key).filter(|v| v.is_table())
+    // 段名支持点分路径（`modes.scan.filter` 这种嵌套段），老的单层段名照旧
+    let mut cur = doc;
+    for part in key.split('.') {
+        cur = cur.get(part)?;
+    }
+    cur.is_table().then_some(cur)
 }
 
 fn str_of(doc: &toml::Value, section: &str, key: &str, def: &str) -> String {
@@ -147,50 +169,79 @@ fn str_list_of(doc: &toml::Value, section: &str, key: &str, def: &[&str]) -> Vec
 /// toml 文本 → SearchConfig（缺字段用默认；未知段/键忽略，兼容旧模板）
 pub fn parse_config(text: &str) -> SearchConfig {
     let doc: toml::Value = text.parse().unwrap_or(toml::Value::Table(Default::default()));
-    let d = SearchConfig::default();
+    parse_at(&doc, "", &SearchConfig::default())
+}
+
+/// 解析某个模式的模版段：`[modes.<模式>.filter]` / `.upload` / `.run`。
+/// 段不存在则整份回落到 base（老档升级后第一次：三个模式先都拿到顶层那份，之后各自独立）。
+pub fn parse_mode(text: &str, mode_key: &str, base: &SearchConfig) -> SearchConfig {
+    let doc: toml::Value = text.parse().unwrap_or(toml::Value::Table(Default::default()));
+    parse_at(&doc, &format!("modes.{mode_key}"), base)
+}
+
+/// 段名前缀化：pre="" → `filter`；pre="modes.scan" → `modes.scan.filter`
+fn sec(pre: &str, name: &str) -> String {
+    if pre.is_empty() {
+        name.to_string()
+    } else {
+        format!("{pre}.{name}")
+    }
+}
+
+/// 按段前缀解析一份配置：pre="" 读顶层 [filter]/[upload]/[run]，
+/// pre="modes.scan" 读 [modes.scan.*]（模式级没有 process_priority/work_mode，继承 base）
+fn parse_at(doc: &toml::Value, pre: &str, base: &SearchConfig) -> SearchConfig {
+    let f = sec(pre, "filter");
+    let u = sec(pre, "upload");
+    let r = sec(pre, "run");
     SearchConfig {
-        root_dir: str_of(&doc, "filter", "root_dir", &d.root_dir),
-        name_filter: str_of(&doc, "filter", "name_filter", &d.name_filter),
-        mem_limit_mb: int_of(&doc, "filter", "mem_limit_mb", d.mem_limit_mb).max(0),
-        batch_dirs: bool_of(&doc, "filter", "batch_dirs", d.batch_dirs),
-        batch_name_filter: str_of(&doc, "filter", "batch_name_filter", &d.batch_name_filter),
-        keyword: str_of(&doc, "filter", "keyword", &d.keyword),
-        mode: str_of(&doc, "filter", "mode", &d.mode),
-        threads: int_of(&doc, "filter", "threads", d.threads),
+        root_dir: str_of(doc, &f, "root_dir", &base.root_dir),
+        name_filter: str_of(doc, &f, "name_filter", &base.name_filter),
+        mem_limit_mb: int_of(doc, &f, "mem_limit_mb", base.mem_limit_mb).max(0),
+        batch_dirs: bool_of(doc, &f, "batch_dirs", base.batch_dirs),
+        batch_name_filter: str_of(doc, &f, "batch_name_filter", &base.batch_name_filter),
+        keyword: str_of(doc, &f, "keyword", &base.keyword),
+        mode: str_of(doc, &f, "mode", &base.mode),
+        threads: int_of(doc, &f, "threads", base.threads),
         extensions: str_list_of(
-            &doc,
-            "filter",
+            doc,
+            &f,
             "extensions",
-            &d.extensions.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            &base.extensions.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
         ),
-        encoding: str_of(&doc, "filter", "encoding", &d.encoding),
-        case_sensitive: bool_of(&doc, "filter", "case_sensitive", d.case_sensitive),
-        recursive: bool_of(&doc, "filter", "recursive", d.recursive),
-        copy_files: bool_of(&doc, "filter", "copy_files", d.copy_files),
-        record_miss: bool_of(&doc, "filter", "record_miss", d.record_miss),
-        max_file_mb: float_of(&doc, "filter", "max_file_mb", d.max_file_mb),
-        out_dir: str_of(&doc, "filter", "out_dir", &d.out_dir),
-        ui_refresh_ms: {
-            let v = int_of(&doc, "filter", "ui_refresh_ms", d.ui_refresh_ms);
-            v.clamp(0, 5000)
+        encoding: str_of(doc, &f, "encoding", &base.encoding),
+        case_sensitive: bool_of(doc, &f, "case_sensitive", base.case_sensitive),
+        recursive: bool_of(doc, &f, "recursive", base.recursive),
+        copy_files: bool_of(doc, &f, "copy_files", base.copy_files),
+        record_miss: bool_of(doc, &f, "record_miss", base.record_miss),
+        max_file_mb: float_of(doc, &f, "max_file_mb", base.max_file_mb),
+        out_dir: str_of(doc, &f, "out_dir", &base.out_dir),
+        ui_refresh_ms: int_of(doc, &f, "ui_refresh_ms", base.ui_refresh_ms).clamp(0, 5000),
+        throttle_ms: int_of(doc, &f, "throttle_ms", base.throttle_ms).clamp(0, 5000),
+        max_files: int_of(doc, &f, "max_files", base.max_files).max(0),
+        cache_capacity_rows: int_of(doc, &f, "cache_capacity_rows", base.cache_capacity_rows).clamp(0, 100_000),
+        log_type: str_of(doc, &f, "log_type", &base.log_type),
+        enabled: bool_of(doc, &u, "enabled", base.enabled),
+        dry_run: bool_of(doc, &u, "dry_run", base.dry_run),
+        types: str_list_of(doc, &u, "types", &base.types.iter().map(|s| s.as_str()).collect::<Vec<_>>()),
+        cli_path: str_of(doc, &u, "cli_path", &base.cli_path),
+        secret_key: str_of(doc, &u, "secret_key", &base.secret_key),
+        args: str_of(doc, &u, "args", &base.args),
+        timeout_sec: float_of(doc, &u, "timeout_sec", base.timeout_sec),
+        max_retries: int_of(doc, &u, "max_retries", base.max_retries),
+        auto_start: bool_of(doc, &r, "auto_start", base.auto_start),
+        countdown_sec: int_of(doc, &r, "countdown_sec", base.countdown_sec),
+        auto_close: bool_of(doc, &r, "auto_close", base.auto_close),
+        process_priority: str_of(doc, &r, "process_priority", &base.process_priority),
+        // 上次用的工作模式：启动时直接进这个模式的界面（scan / filter / retry）。
+        // 非法值回落默认，避免手改 toml 写错就进不去界面。
+        work_mode: {
+            let v = str_of(doc, &r, "work_mode", &base.work_mode);
+            match v.as_str() {
+                "scan" | "filter" | "retry" => v,
+                _ => base.work_mode.clone(),
+            }
         },
-        throttle_ms: int_of(&doc, "filter", "throttle_ms", d.throttle_ms).clamp(0, 5000),
-        max_files: int_of(&doc, "filter", "max_files", d.max_files).max(0),
-        cache_capacity_rows: int_of(&doc, "filter", "cache_capacity_rows", d.cache_capacity_rows).clamp(0, 100_000),
-        log_type: str_of(&doc, "filter", "log_type", &d.log_type),
-        enabled: bool_of(&doc, "upload", "enabled", d.enabled),
-        dry_run: bool_of(&doc, "upload", "dry_run", d.dry_run),
-        types: str_list_of(&doc, "upload", "types", &d.types.iter().map(|s| s.as_str()).collect::<Vec<_>>()),
-        cli_path: str_of(&doc, "upload", "cli_path", &d.cli_path),
-        secret_key: str_of(&doc, "upload", "secret_key", &d.secret_key),
-        args: str_of(&doc, "upload", "args", &d.args),
-        timeout_sec: float_of(&doc, "upload", "timeout_sec", d.timeout_sec),
-        max_retries: int_of(&doc, "upload", "max_retries", d.max_retries),
-        auto_start: bool_of(&doc, "run", "auto_start", d.auto_start),
-        countdown_sec: int_of(&doc, "run", "countdown_sec", d.countdown_sec),
-        auto_close: bool_of(&doc, "run", "auto_close", d.auto_close),
-        process_priority: str_of(&doc, "run", "process_priority", &d.process_priority),
-        work_mode: d.work_mode,
     }
 }
 
@@ -216,58 +267,94 @@ pub fn load_config(path: &Path) -> SearchConfig {
 
 // ---------- 写回（合并受管键，保留注释 / auto_start / 其余键） ----------
 
-/// 受管键表：[段] -> [(toml 键, SearchConfig 字段)]
-fn managed_keys() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+/// 三个模式各自的模版（顺序固定：**scan / filter / retry**）。
+///
+/// 左侧栏的数据按模式独立：切模式读各自那份、保存时各写各的，互不覆盖。
+/// `[modes.<模式>.*]` 段不存在时，该模式整份回落到顶层（老档第一次升级就是这个状态）。
+pub fn load_mode_configs(path: &Path) -> [SearchConfig; 3] {
+    let base = load_config(path);
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut out = [base.clone(), base.clone(), base.clone()];
+    for (i, key) in ["scan", "filter", "retry"].iter().enumerate() {
+        let mut c = parse_mode(&text, key, &base);
+        if c.out_dir.is_empty() {
+            c.out_dir = base.out_dir.clone();
+        }
+        c.work_mode = (*key).to_string();
+        out[i] = c;
+    }
+    out
+}
+
+
+/// `filter` 段的受管键（检索条件 / 文件类型 / 资源控制）
+fn filter_keys() -> Vec<(&'static str, &'static str)> {
     vec![
-        (
-            "filter",
-            vec![
-                ("root_dir", "root_dir"),
-                ("log_type", "log_type"),
-                ("keyword", "keyword"),
-                ("mode", "mode"),
-                ("extensions", "extensions"),
-                ("encoding", "encoding"),
-                ("threads", "threads"),
-                ("case_sensitive", "case_sensitive"),
-                ("recursive", "recursive"),
-                ("copy_files", "copy_files"),
-                ("record_miss", "record_miss"),
-                ("max_file_mb", "max_file_mb"),
-                ("out_dir", "out_dir"),
-                ("ui_refresh_ms", "ui_refresh_ms"),
-                ("name_filter", "name_filter"),
-                ("mem_limit_mb", "mem_limit_mb"),
-                ("batch_dirs", "batch_dirs"),
-                ("batch_name_filter", "batch_name_filter"),
-                ("throttle_ms", "throttle_ms"),
-                ("max_files", "max_files"),
-                ("cache_capacity_rows", "cache_capacity_rows"),
-            ],
-        ),
-        (
-            "upload",
-            vec![
-                ("enabled", "enabled"),
-                ("dry_run", "dry_run"),
-                ("types", "types"),
-                ("cli_path", "cli_path"),
-                ("secret_key", "secret_key"),
-                ("args", "args"),
-                ("timeout_sec", "timeout_sec"),
-                ("max_retries", "max_retries"),
-            ],
-        ),
-        (
-            "run",
-            vec![
-                ("auto_start", "auto_start"),
-                ("countdown_sec", "countdown_sec"),
-                ("auto_close", "auto_close"),
-                ("process_priority", "process_priority"),
-            ],
-        ),
+        ("root_dir", "root_dir"),
+        ("log_type", "log_type"),
+        ("keyword", "keyword"),
+        ("mode", "mode"),
+        ("extensions", "extensions"),
+        ("encoding", "encoding"),
+        ("threads", "threads"),
+        ("case_sensitive", "case_sensitive"),
+        ("recursive", "recursive"),
+        ("copy_files", "copy_files"),
+        ("record_miss", "record_miss"),
+        ("max_file_mb", "max_file_mb"),
+        ("out_dir", "out_dir"),
+        ("ui_refresh_ms", "ui_refresh_ms"),
+        ("name_filter", "name_filter"),
+        ("mem_limit_mb", "mem_limit_mb"),
+        ("batch_dirs", "batch_dirs"),
+        ("batch_name_filter", "batch_name_filter"),
+        ("throttle_ms", "throttle_ms"),
+        ("max_files", "max_files"),
+        ("cache_capacity_rows", "cache_capacity_rows"),
     ]
+}
+
+/// `upload` 段的受管键（回传参数）
+fn upload_keys() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("enabled", "enabled"),
+        ("dry_run", "dry_run"),
+        ("types", "types"),
+        ("cli_path", "cli_path"),
+        ("secret_key", "secret_key"),
+        ("args", "args"),
+        ("timeout_sec", "timeout_sec"),
+        ("max_retries", "max_retries"),
+    ]
+}
+
+/// `run` 段的受管键（自动化开关 / 倒计时 / 进程优先级）
+fn run_keys() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("auto_start", "auto_start"),
+        ("countdown_sec", "countdown_sec"),
+        ("auto_close", "auto_close"),
+        ("process_priority", "process_priority"),
+        ("work_mode", "work_mode"),
+    ]
+}
+
+/// 受管键表：[段] -> [(toml 键, SearchConfig 字段)]
+///
+/// 顶层三段 = **当前模式**的镜像（`findany --auto` 与老工具只认它们）；
+/// `modes.<模式>.<段>` = 三个模式各自的模版（左侧栏数据按模式独立），互不影响。
+fn managed_keys() -> Vec<(String, Vec<(&'static str, &'static str)>)> {
+    let mut v: Vec<(String, Vec<(&'static str, &'static str)>)> = vec![
+        ("filter".to_string(), filter_keys()),
+        ("upload".to_string(), upload_keys()),
+        ("run".to_string(), run_keys()),
+    ];
+    for m in ["scan", "filter", "retry"] {
+        v.push((format!("modes.{m}.filter"), filter_keys()));
+        v.push((format!("modes.{m}.upload"), upload_keys()));
+        v.push((format!("modes.{m}.run"), run_keys()));
+    }
+    v
 }
 
 fn cfg_value(cfg: &SearchConfig, key: &str) -> Value {
@@ -294,6 +381,7 @@ fn cfg_value(cfg: &SearchConfig, key: &str) -> Value {
         "max_files" => Value::Number(cfg.max_files.into()),
         "cache_capacity_rows" => Value::Number(cfg.cache_capacity_rows.into()),
         "process_priority" => Value::String(cfg.process_priority.clone()),
+        "work_mode" => Value::String(cfg.work_mode.clone()),
         "enabled" => Value::Bool(cfg.enabled),
         "dry_run" => Value::Bool(cfg.dry_run),
         "types" => Value::Array(cfg.types.iter().map(|t| Value::String(t.clone())).collect()),
@@ -341,9 +429,27 @@ fn set_last(v: &mut Vec<(String, usize)>, section: &str, idx: usize) {
     }
 }
 
+/// 段名 → 用哪一份配置：`modes.<模式>.<段>` 用该模式的模版；顶层 filter/upload/run 用当前模式那份。
+/// （顶层段名的第二段不存在 → 落到 current）
+fn cfg_for_section<'a>(sec: &str, current: &'a SearchConfig, modes: &'a [SearchConfig; 3]) -> &'a SearchConfig {
+    match sec.split('.').nth(1) {
+        Some("scan") => &modes[0],
+        Some("filter") => &modes[1],
+        Some("retry") => &modes[2],
+        _ => current,
+    }
+}
+
 /// 把配置合并回 toml：受管键改右值，缺键补齐到对应段末尾；
 /// 注释、空行、run.auto_start 与其它未管键原样保留。返回写入路径。
 pub fn save_config(path: &Path, cfg: &SearchConfig) -> std::io::Result<String> {
+    // 兼容入口（自动化 / 测试）：只按一份配置写，三个模式段与顶层取同一个值
+    let modes = [cfg.clone(), cfg.clone(), cfg.clone()];
+    save_config_all(path, cfg, &modes)
+}
+
+/// 保存：顶层三段 = `current`（当前模式）的镜像，另加三个模式各自的模版段。
+pub fn save_config_all(path: &Path, current: &SearchConfig, modes: &[SearchConfig; 3]) -> std::io::Result<String> {
     if !path.exists() {
         write_default(path);
     }
@@ -356,6 +462,7 @@ pub fn save_config(path: &Path, cfg: &SearchConfig) -> std::io::Result<String> {
     let mut last_idx: Vec<(String, usize)> = Vec::new();
 
     let value_for = |sec: &str, key: &str| -> Option<Value> {
+        let cfg = cfg_for_section(sec, current, modes);
         for (s, keys) in managed_keys() {
             if s != sec {
                 continue;
@@ -401,20 +508,20 @@ pub fn save_config(path: &Path, cfg: &SearchConfig) -> std::io::Result<String> {
     for (sec, keys) in managed_keys() {
         let mut adds: Vec<String> = Vec::new();
         for (tk, _) in keys {
-            if written.iter().any(|(s, k)| s == sec && k == tk) {
+            if written.iter().any(|(s, k)| s == &sec && k == tk) {
                 continue;
             }
-            if let Some(v) = value_for(sec, tk) {
+            if let Some(v) = value_for(&sec, tk) {
                 adds.push(format!("{tk} = {}", toml_value(&v)));
             }
         }
         if adds.is_empty() {
             continue;
         }
-        match last_idx.iter().find(|(s, _)| *s == sec) {
+        match last_idx.iter().find(|(s, _)| s == &sec) {
             Some((_, i)) => missing.push((adds, *i)),
             // 整段缺失（老档没有 [upload] 这类）：在文件末尾补出整段
-            None => new_sections.push((sec.to_string(), adds)),
+            None => new_sections.push((sec, adds)),
         }
     }
     missing.sort_by_key(|(_, i)| std::cmp::Reverse(*i));
