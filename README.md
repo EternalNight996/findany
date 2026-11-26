@@ -304,7 +304,7 @@ just dist-linux    # Linux 包   -> dist/findany-v<版本>-linux.tar.gz（需在
 包内清单（Windows 包，zip 约 58MB —— 回传 CLI 35MB、Mesa 软件 OpenGL 兜底约 59MB（压缩后占比小），本体 13.9MB）：
 
 ```
-findany-v2.0.1-beta.1/windows/
+findany-v2.1.0/windows/
  ├─ findany.exe             # 13.9MB 单文件，无运行时依赖
  ├─ findany.toml            # 自动化模板（与程序内 DEFAULT_TOML 逐字一致，含注释）
  ├─ intunehelper_cli.exe    # 回传 CLI（doc/ 下有才带）
@@ -412,7 +412,9 @@ git push -u gitee  main
 > - 若提示 `Permission denied (publickey)`，检查公钥是否已添加、`ssh -T git@github.com` 是否能通。
 > - `build/`、`dist/`、`out/`、`findany.toml`、`legacy/`、`target/`、`__pycache__` 已写入 `.gitignore`，不会提交。
 
-## 版本要点（v2.0.1-beta.1）
+## 版本要点（v2.1.0 正式版）
+
+由 `v2.0.1-beta.1` 验证通过后转正（业主批准）。
 
 ### 通用扫描产物区分命中 / 未命中
 - 扫描产物独立为 `scan_result.xlsx`（超 1 万行降级 `scan_result.csv`），明细自带「包含状态 = 命中 / 未命中 / 跳过」、命中行号/内容、匹配计数、跳过原因。
