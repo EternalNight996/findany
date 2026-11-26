@@ -22,6 +22,7 @@ pub fn filter_cfg_from_cfg(cfg: &SearchConfig, app_dir: &str) -> FilterRunCfg {
         max_file_mb: cfg.max_file_mb,
         threads: cfg.threads,
         keep_logs: cfg.copy_files,
+        record_miss: cfg.record_miss,
         upload_enabled: cfg.enabled,
         upload_types: cfg.types.clone(),
         dry_run: cfg.dry_run,
@@ -142,15 +143,29 @@ pub fn run_headless(cli: &CliArgs, app_dir: &str) -> i32 {
         }
     } else {
         let (_items, summary) = fengine::run_filter(&rcfg, None, &cancel);
+        let is_scan = rcfg.mode == "scan";
         crate::core::app_dir::log_line(
             "findany-run.log",
             "info",
-            &format!(
-                "自动化结束：文件 {}，提取 {}，跳过 {}，回传 成功{}/冲突{}/失败{}，耗时 {}s，产物 {}",
-                summary.total, summary.extracted, summary.skipped, summary.upload_ok, summary.upload_conflict, summary.upload_fail, summary.elapsed, summary.batch_dir
-            ),
+            &if is_scan {
+                format!(
+                    "自动化结束（扫描）：文件 {}，命中 {}，未命中 {}，跳过 {}，耗时 {}s，产物 {}",
+                    summary.total, summary.hit, summary.miss, summary.skipped, summary.elapsed, summary.batch_dir
+                )
+            } else {
+                format!(
+                    "自动化结束：文件 {}，提取 {}，跳过 {}，回传 成功{}/冲突{}/失败{}，耗时 {}s，产物 {}",
+                    summary.total, summary.extracted, summary.skipped, summary.upload_ok, summary.upload_conflict, summary.upload_fail, summary.elapsed, summary.batch_dir
+                )
+            },
         );
-        let (content, ok) = fengine::filter_verdict(&summary, rcfg.upload_enabled, rcfg.dry_run);
+        // 扫描与筛选是两套判定：扫描看「命中 > 0」，筛选看提取/回传异常。
+        // 以前扫描也走 filter_verdict —— 一个都没命中时 --auto 仍报 PASS，结论里连命中数都没有。
+        let (content, ok) = if is_scan {
+            fengine::scan_verdict(&summary)
+        } else {
+            fengine::filter_verdict(&summary, rcfg.upload_enabled, rcfg.dry_run)
+        };
         crate::core::result::emit(&content, ok, "auto");
         if ok {
             println!("[findany] PASS {content}");

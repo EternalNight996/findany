@@ -711,7 +711,17 @@ impl FindanyApp {
             // 用这次运行的真实耗时回推 t0：导出的「耗时(秒)」和跑完时是同一个数
             let t0 = Instant::now() - Duration::from_secs_f64(fsum.elapsed.max(0.0));
             match fengine::export_products(&fc, &rows, &fsum, t0) {
-                Ok((dir, _excel, _audit, _kept)) => (format!("已导出 {} 条 → {dir}", rows.len()), dir),
+                Ok((dir, _excel, _audit, _kept)) => {
+                    // 提示条数要与产物一致：扫描不记录未命中时只导出命中行
+                    let n = if fc.mode == "scan" && !fc.record_miss {
+                        rows.iter()
+                            .filter(|r| r.get("hit").and_then(|v| v.as_bool()) == Some(true))
+                            .count()
+                    } else {
+                        rows.len()
+                    };
+                    (format!("已导出 {n} 条 → {dir}"), dir)
+                }
                 Err(e) => (format!("导出失败：{e}"), String::new()),
             }
         });
@@ -1018,7 +1028,9 @@ impl FindanyApp {
                 self.push_log("ok", &format!("完成：命中 {s_hit} / 未命中 {s_miss} / 跳过 {s_skipped}，耗时 {s_elapsed}s"));
                 self.push_log("info", &format!("输出：{target}"));
                 self.scan_out_dir = s_batch.clone();
-                let ok = s_hit > 0;
+                let ok = s_hit > 0
+                    && (self.summary.batches_total <= 1
+                        || self.summary.batches_pass == self.summary.batches_total);
                 let content = format!(
                     "扫描 命中 {}/{}（未命中 {}，跳过 {}），耗时 {}s，产物 {}",
                     s_hit, s_total, s_miss, s_skipped, s_elapsed, target

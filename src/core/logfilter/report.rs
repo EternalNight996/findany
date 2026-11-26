@@ -21,6 +21,31 @@ fn s(row: &Row, key: &str) -> String {
             _ => "失败".to_string(),
         };
     }
+    // 扫描模式下下面两列同样是**派生列**：不要求每行 Map 都预先塞好，
+    // 老进度文件（JSONL）读回来的行也能正确导出。
+    // `ext`：扩展名由 filename 现算（旧扫描模板里的「扩展名」列）。
+    if key == "ext" {
+        let name = match row.get("filename") {
+            Some(Value::String(v)) => v.clone(),
+            _ => String::new(),
+        };
+        return match name.rsplit_once('.') {
+            Some((_, e)) => e.to_lowercase(),
+            None => String::new(),
+        };
+    }
+    // `hit_state`：命中 / 未命中 / 跳过（跳过 = 读不了/超大/二进制，本就没参与判定）。
+    // 这一列就是扫描产物里区分「谁命中、谁没命中」的权威口径。
+    if key == "hit_state" {
+        if !s(row, "skip_reason").is_empty() {
+            return "跳过".to_string();
+        }
+        return match row.get("hit").and_then(|v| v.as_bool()) {
+            Some(true) => "命中".to_string(),
+            Some(false) => "未命中".to_string(),
+            None => String::new(),
+        };
+    }
     match row.get(key) {
         Some(Value::String(v)) => v.clone(),
         Some(Value::Null) | None => String::new(),
@@ -61,6 +86,27 @@ pub fn detail_cols() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// **通用扫描**的明细列（与筛选的 36 列模板分开）：
+/// 扫描回答的是「哪些文件命中、哪些没命中」，所以第一优先是把「包含状态」摆出来；
+/// 以前扫描行被塞进筛选的 36 列模板，Excel 里根本没这一列 —— 打开产物看不出谁命中谁没中。
+pub fn scan_detail_cols() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("序号", "idx"),
+        ("相对路径", "rel_path"),
+        ("目录", "dir_name"),
+        ("扩展名", "ext"),
+        ("包含状态", "hit_state"),
+        ("命中行号", "hit_lines"),
+        ("命中行内容", "hit_line_text"),
+        ("匹配计数", "hit_count"),
+        ("大小", "size_str"),
+        ("修改时间", "mtime_str"),
+        ("编码", "encoding"),
+        ("跳过原因", "skip_reason"),
+        ("绝对路径", "abs_path"),
+    ]
+}
+
 /// 固定宽度偏好（未列出的按内容自适应，上限 40）
 fn col_width_fixed(key: &str) -> Option<f64> {
     Some(match key {
@@ -79,6 +125,11 @@ fn col_width_fixed(key: &str) -> Option<f64> {
         "product_key" => 30.0,
         "request_id" => 22.0,
         "upload_error" => 40.0,
+        // 扫描明细
+        "hit_lines" => 16.0,
+        "hit_line_text" => 60.0,
+        "skip_reason" => 28.0,
+        "abs_path" => 50.0,
         _ => return None,
     })
 }
@@ -170,6 +221,13 @@ fn freeze_at(ws: &mut umya_spreadsheet::Worksheet, cell: &str, cols: f64, rows: 
 
 /// 写一个 sheet：表头样式 + 批次自适应（空列隐藏/宽度自适应）+ 冻结 C2。
 fn write_sheet(ws: &mut umya_spreadsheet::Worksheet, cols: &[(&str, &str)], rows: &[Row]) {
+    let refs: Vec<&Row> = rows.iter().collect();
+    write_sheet_refs(ws, cols, &refs);
+}
+
+/// 同上，但行以引用切片传入：扫描导出要按「记录未命中」过滤，
+/// 过滤结果只借原行、不做整行 clone（10 万行 × 十几 KB 的克隆是实打实的内存峰值）。
+fn write_sheet_refs(ws: &mut umya_spreadsheet::Worksheet, cols: &[(&str, &str)], rows: &[&Row]) {
     for (i, (header, _)) in cols.iter().enumerate() {
         let cell = ws.get_cell_mut(((i + 1) as u32, 1u32));
         cell.set_value(*header);
@@ -212,6 +270,37 @@ fn write_sheet(ws: &mut umya_spreadsheet::Worksheet, cols: &[(&str, &str)], rows
     freeze_at(ws, "C2", 2.0, 1.0); // 冻结表头 + 序号/文件两列
 }
 
+/// 摘要 sheet（筛选 / 扫描共用）。原先这段内联在 `export_filter_excel` 里，
+/// 扫描产物也要同一张摘要，抽出来避免两份实现。
+fn write_summary_sheet(
+    book: &mut umya_spreadsheet::Spreadsheet,
+    summary_text: &[(&str, String)],
+) -> anyhow::Result<()> {
+    let ws = book.new_sheet("摘要").map_err(|e| anyhow::anyhow!("摘要 sheet: {e:?}"))?;
+    let mut bold = Font::default();
+    bold.set_bold(true);
+    ws.get_cell_mut((1u32, 1u32)).set_value("项目");
+    ws.get_cell_mut((1u32, 1u32)).get_style_mut().set_font(bold.clone());
+    ws.get_cell_mut((2u32, 1u32)).set_value("内容");
+    ws.get_cell_mut((2u32, 1u32)).get_style_mut().set_font(bold);
+    for (i, (k, v)) in summary_text.iter().enumerate() {
+        let r = (i + 2) as u32;
+        ws.get_cell_mut((1u32, r)).set_value(*k);
+        ws.get_cell_mut((2u32, r)).set_value(v.as_str());
+    }
+    ws.get_column_dimension_mut("A").set_width(18.0);
+    ws.get_column_dimension_mut("B").set_width(80.0);
+    Ok(())
+}
+
+/// 扫描行过滤：`record_miss=false` 时只保留命中行（与界面上「Excel 记录未命中」勾选框同义）。
+/// 跳过行不算命中，同样只在「记录未命中」时一并留档（它没参与判定，需要能看见原因）。
+fn scan_rows<'a>(rows: &'a [Row], record_miss: bool) -> Vec<&'a Row> {
+    rows.iter()
+        .filter(|r| record_miss || r.get("hit").and_then(|v| v.as_bool()) == Some(true))
+        .collect()
+}
+
 /// 明细 sheet + 摘要。返回实际生成文件路径。
 pub fn export_filter_excel(path: &str, rows: &[Row], summary_text: &[(&str, String)]) -> anyhow::Result<String> {
     let mut book = umya_spreadsheet::new_file();
@@ -234,21 +323,55 @@ pub fn export_filter_excel(path: &str, rows: &[Row], summary_text: &[(&str, Stri
             let ws2 = book.new_sheet(&name).map_err(|e| anyhow::anyhow!("新建 sheet 失败: {e:?}"))?;
             write_sheet(ws2, &cols, &type_rows);
         }
-        let ws3 = book.new_sheet("摘要").map_err(|e| anyhow::anyhow!("摘要 sheet: {e:?}"))?;
-        ws3.get_cell_mut((1u32, 1u32)).set_value("项目");
-        let mut bold = Font::default();
-        bold.set_bold(true);
-        ws3.get_cell_mut((1u32, 1u32)).get_style_mut().set_font(bold);
-        ws3.get_cell_mut((2u32, 1u32)).set_value("内容");
-        for (i, (k, v)) in summary_text.iter().enumerate() {
-            let r = (i + 2) as u32;
-            ws3.get_cell_mut((1u32, r)).set_value(*k);
-            ws3.get_cell_mut((2u32, r)).set_value(v.as_str());
-        }
-        ws3.get_column_dimension_mut("A").set_width(18.0);
-        ws3.get_column_dimension_mut("B").set_width(80.0);
     }
+    write_summary_sheet(&mut book, summary_text)?;
     umya_spreadsheet::writer::xlsx::write(&book, path).map_err(|e| anyhow::anyhow!("写 Excel 失败: {e:?}"))?;
+    Ok(path.to_string())
+}
+
+/// **通用扫描产物**（明细 + 摘要）：与筛选产物分开写，扫描明细自带「包含状态」。
+/// `record_miss=false` 时明细只留命中行；`summary_text` 由调用方给出（关键字/模式/计数）。
+pub fn export_scan_excel(
+    path: &str,
+    rows: &[Row],
+    summary_text: &[(&str, String)],
+    record_miss: bool,
+) -> anyhow::Result<String> {
+    let mut book = umya_spreadsheet::new_file();
+    {
+        let ws = book.get_sheet_mut(&0).unwrap();
+        ws.set_name("明细");
+        let cols = scan_detail_cols();
+        let picked = scan_rows(rows, record_miss);
+        write_sheet_refs(ws, &cols, &picked);
+    }
+    write_summary_sheet(&mut book, summary_text)?;
+    umya_spreadsheet::writer::xlsx::write(&book, path).map_err(|e| anyhow::anyhow!("写 Excel 失败: {e:?}"))?;
+    Ok(path.to_string())
+}
+
+/// 扫描 CSV（utf-8-sig，带 BOM）：行数超 Excel 阈值时走这条，列与 xlsx 明细完全一致。
+pub fn export_scan_csv(path: &str, rows: &[Row], record_miss: bool) -> anyhow::Result<String> {
+    let cols = scan_detail_cols();
+    let picked = scan_rows(rows, record_miss);
+    let mut out = String::from("\u{feff}");
+    let push = |out: &mut String, cells: Vec<String>| {
+        out.push_str(&cells.iter().map(|c| csv_cell(c)).collect::<Vec<_>>().join(","));
+        out.push_str("\r\n");
+    };
+    push(&mut out, cols.iter().map(|(h, _)| h.to_string()).collect());
+    for (ri, row) in picked.iter().enumerate() {
+        let mut cells = Vec::with_capacity(cols.len());
+        for (ci, (_, key)) in cols.iter().enumerate() {
+            if ci == 0 {
+                cells.push((ri + 1).to_string());
+            } else {
+                cells.push(clean_cell(&s(row, key)));
+            }
+        }
+        push(&mut out, cells);
+    }
+    std::fs::write(path, out)?;
     Ok(path.to_string())
 }
 
@@ -290,36 +413,48 @@ fn csv_cell(c: &str) -> String {
     }
 }
 
-/// 提取成功的日志按「目录/文件名」留存到批次目录，同名自动加序号。
-pub fn copy_logs(items: &[Row], batch_dir: &str) -> usize {
-    let mut copied = 0usize;
-    for it in items {
-        if it.get("extract_ok").and_then(|v| v.as_bool()) != Some(true) {
-            continue;
-        }
-        let dir_name = {
-            let d = s(it, "dir_name");
-            if d.is_empty() { ".".to_string() } else { d }
-        };
-        let target_dir = Path::new(batch_dir).join(dir_name.replace('/', std::path::MAIN_SEPARATOR_STR));
-        if std::fs::create_dir_all(&target_dir).is_err() {
-            continue;
-        }
-        let filename = s(it, "filename");
-        let mut dst = target_dir.join(&filename);
-        if dst.exists() {
-            let stem = Path::new(&filename).file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
-            let ext = Path::new(&filename).extension().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
-            let mut n = 2;
-            while dst.exists() {
-                let name = if ext.is_empty() { format!("{stem}_{n}") } else { format!("{stem}_{n}.{ext}") };
-                dst = target_dir.join(name);
-                n += 1;
-            }
-        }
-        if std::fs::copy(s(it, "abs_path"), &dst).is_ok() {
-            copied += 1;
+/// 单份文件按「目录/文件名」复制到批次目录，同名自动加序号。返回是否复制成功。
+fn copy_one(it: &Row, batch_dir: &str) -> bool {
+    let dir_name = {
+        let d = s(it, "dir_name");
+        if d.is_empty() { ".".to_string() } else { d }
+    };
+    let target_dir = Path::new(batch_dir).join(dir_name.replace('/', std::path::MAIN_SEPARATOR_STR));
+    if std::fs::create_dir_all(&target_dir).is_err() {
+        return false;
+    }
+    let filename = s(it, "filename");
+    let mut dst = target_dir.join(&filename);
+    if dst.exists() {
+        let stem = Path::new(&filename).file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+        let ext = Path::new(&filename).extension().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+        let mut n = 2;
+        while dst.exists() {
+            let name = if ext.is_empty() { format!("{stem}_{n}") } else { format!("{stem}_{n}.{ext}") };
+            dst = target_dir.join(name);
+            n += 1;
         }
     }
-    copied
+    std::fs::copy(s(it, "abs_path"), &dst).is_ok()
+}
+
+/// 提取成功的日志按「目录/文件名」留存到批次目录，同名自动加序号。
+pub fn copy_logs(items: &[Row], batch_dir: &str) -> usize {
+    items
+        .iter()
+        .filter(|it| it.get("extract_ok").and_then(|v| v.as_bool()) == Some(true))
+        .filter(|it| copy_one(it, batch_dir))
+        .count()
+}
+
+/// **扫描模式**的「将命中文件复制到 out」：只复制 `hit=true` 的行。
+///
+/// 旧实现在扫描模式也走 `copy_logs`（判据是 `extract_ok`，而扫描的未命中文件同样
+/// `extract_ok=true`），结果 out 目录里命中和没命中的文件全被复制 —— 用户根本分不清哪些是命中。
+pub fn copy_scan_hits(items: &[Row], batch_dir: &str) -> usize {
+    items
+        .iter()
+        .filter(|it| it.get("hit").and_then(|v| v.as_bool()) == Some(true))
+        .filter(|it| copy_one(it, batch_dir))
+        .count()
 }

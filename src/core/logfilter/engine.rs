@@ -28,6 +28,9 @@ pub struct FilterRunCfg {
     pub threads: i64,
     /// 提取成功日志留存
     pub keep_logs: bool,
+    /// **扫描模式**：Excel/CSV 是否记录未命中（与界面「Excel 记录未命中」同义）。
+    /// 筛选模式不读这一项（筛选的回传/审计只看提取成功）。
+    pub record_miss: bool,
     pub upload_enabled: bool,
     /// 参与回传的判型（定版②A：默认仅 OA3）
     pub upload_types: Vec<String>,
@@ -86,6 +89,7 @@ impl Default for FilterRunCfg {
             max_file_mb: 20.0,
             threads: 8,
             keep_logs: true,
+            record_miss: true,
             upload_enabled: false,
             upload_types: vec![LogType::EtestOa3.as_str().into()],
             dry_run: true,
@@ -320,6 +324,11 @@ fn scan_one(path: &str, root: &str, cfg: &FilterRunCfg) -> Map<String, Value> {
     if !it.skipped.is_empty() {
         item.insert("error".into(), Value::String(it.skipped.clone()));
         item.insert("skip_reason".into(), Value::String(it.skipped.clone()));
+        // 跳过 ≠ 未命中：它根本没参与判定。导出时靠 hit_state="跳过" 单独一档，
+        // 不能和「未命中」混在一起（否则用户会以为「读了但没找到」）。
+        item.insert("hit".into(), Value::Bool(false));
+        item.insert("hit_state".into(), Value::String("跳过".into()));
+        item.insert("hit_count".into(), Value::Number(0.into()));
         item.insert("size".into(), Value::Number(it.size.into()));
         item.insert("size_str".into(), Value::String(it.size_str()));
         item.insert("mtime_str".into(), Value::String(it.mtime_str()));
@@ -939,10 +948,18 @@ pub fn run_filter_one(
                 s.batch_dir = batch_dir.clone();
                 s.excel_path = excel;
                 s.audit_path = audit;
-                log(
-                    "ok",
-                    &format!("产物：{batch_dir}  （Excel {} + 审计 upload-result.csv + 留存 {kept} 份日志）", file_name(&s.excel_path)),
-                );
+                let msg = if cfg.mode == "scan" {
+                    format!(
+                        "产物：{batch_dir}（{} + 留存 {kept} 份命中文件）",
+                        file_name(&s.excel_path)
+                    )
+                } else {
+                    format!(
+                        "产物：{batch_dir}  （Excel {} + 审计 upload-result.csv + 留存 {kept} 份日志）",
+                        file_name(&s.excel_path)
+                    )
+                };
+                log("ok", &msg);
                 // 跑完了：进度文件的使命结束（产物已有 Excel / 审计 CSV），删掉它，
                 // 否则下次点开始会被当成「未完成的任务」反复追问。
                 if !cfg.progress_path.is_empty() {
@@ -959,14 +976,24 @@ pub fn run_filter_one(
 
     s.elapsed = ((t0.elapsed().as_secs_f64()) * 100.0).round() / 100.0;
     send(FilterEvent::Progress { phase: "done", done: s.total, total: s.total, pct: 100.0 });
-    let tail = if s.upload_dry > 0 { format!(" / dry-run {}", s.upload_dry) } else { String::new() };
-    log(
-        "ok",
-        &format!(
-            "筛选完成：提取 {}/{}，未知 {}，跳过 {}，回传 成功 {} / 冲突 {} / 失败 {}{}，耗时 {}s",
-            s.extracted, s.total, s.unknown, s.skipped, s.upload_ok, s.upload_conflict, s.upload_fail, tail, s.elapsed
-        ),
-    );
+    if cfg.mode == "scan" {
+        log(
+            "ok",
+            &format!(
+                "扫描完成：命中 {} / 未命中 {} / 跳过 {}（文件 {}），耗时 {}s",
+                s.hit, s.miss, s.skipped, s.total, s.elapsed
+            ),
+        );
+    } else {
+        let tail = if s.upload_dry > 0 { format!(" / dry-run {}", s.upload_dry) } else { String::new() };
+        log(
+            "ok",
+            &format!(
+                "筛选完成：提取 {}/{}，未知 {}，跳过 {}，回传 成功 {} / 冲突 {} / 失败 {}{}，耗时 {}s",
+                s.extracted, s.total, s.unknown, s.skipped, s.upload_ok, s.upload_conflict, s.upload_fail, tail, s.elapsed
+            ),
+        );
+    }
     (items, s)
 }
 
@@ -1024,6 +1051,10 @@ pub fn run_filter_shared(
                 agg.extracted += s_i.extracted;
                 agg.unknown += s_i.unknown;
                 agg.skipped += s_i.skipped;
+                // 扫描分批：命中/未命中必须逐批累加，否则汇总后的结论永远写着「命中 0」
+                //（界面与 --auto 都读这份汇总；此前漏了这一步，分批扫描看不出命中）
+                agg.hit += s_i.hit;
+                agg.miss += s_i.miss;
                 agg.upload_ok += s_i.upload_ok;
                 agg.upload_conflict += s_i.upload_conflict;
                 agg.upload_fail += s_i.upload_fail;
@@ -1109,7 +1140,12 @@ fn emit_batch(send: &impl Fn(FilterEvent), items: Vec<Map<String, Value>>, total
     send(FilterEvent::Progress { phase: "extract", done: live.done, total, pct: live.pct });
 }
 
-/// 写产物（批次目录 + Excel + 审计 CSV + 可选留存日志）。
+/// 写产物（批次目录 + 明细 + 可选留存文件）。
+///
+/// - `mode="scan"`：`scan_result.xlsx`（超阈值降级 `scan_result.csv`），明细自带
+///   「包含状态 = 命中/未命中/跳过」；`keep_logs` 只复制**命中**文件。
+/// - `mode="filter"`：`filter_result.xlsx` + `upload-result.csv` 审计 + 留存提取成功日志。
+///
 /// 界面「导出当前数据」直接复用同一条路径，保证手工导出与正常跑的产物结构一字不差。
 pub fn export_products(
     cfg: &FilterRunCfg,
@@ -1127,6 +1163,63 @@ pub fn export_products(
     // 不再 `items.to_vec()`：旧实现为了给每行补一个派生列 `extract_state` 而整体 clone 一份
     // （5000 行 × 13KB ≈ 65MB 峰值，十万行更甚）。该列现由 report::s() 当场从 extract_ok 派生。
     let rows: &[Map<String, Value>] = items;
+
+    // ---------- 通用扫描：独立明细模板 +「命中/未命中」摘要 ----------
+    if cfg.mode == "scan" {
+        let over = rows.len() > EXCEL_MAX_ROWS;
+        let detail_name = if over { "scan_result.csv" } else { "scan_result.xlsx" };
+        // 明细行数：关闭「记录未命中」时只剩命中行；行缓存上限淘汰时也会小于上方统计（摘要里写清）
+        let detail_rows = if cfg.record_miss {
+            rows.len()
+        } else {
+            rows.iter().filter(|r| r.get("hit").and_then(|v| v.as_bool()) == Some(true)).count()
+        };
+        let summary_rows: Vec<(&str, String)> = vec![
+            ("扫描目录", cfg.root_dir.clone()),
+            ("关键字", cfg.keyword.clone()),
+            ("匹配模式", if cfg.match_mode == "inc" { "包含".into() } else { "不包含".into() }),
+            ("大小写敏感", if cfg.case_sensitive { "是" } else { "否" }.into()),
+            (
+                "文件扩展名",
+                if cfg.extensions.is_empty() { "全部".into() } else { cfg.extensions.join(", ") },
+            ),
+            ("编码", cfg.encoding.clone()),
+            ("并发线程", cfg.threads.to_string()),
+            ("文件总数", s.total.to_string()),
+            ("已判定文件", (s.hit + s.miss).to_string()),
+            ("命中文件", s.hit.to_string()),
+            ("未命中文件", s.miss.to_string()),
+            ("跳过文件", s.skipped.to_string()),
+            (
+                "明细范围",
+                if cfg.record_miss { "命中 + 未命中 + 跳过".into() } else { "仅命中".into() },
+            ),
+            ("明细行数", detail_rows.to_string()),
+            ("明细文件", detail_name.to_string()),
+            ("耗时(秒)", format!("{}", ((t0.elapsed().as_secs_f64()) * 100.0).round() / 100.0)),
+            ("导出时间", chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
+        ];
+        // 行数超阈值：umya 整本驻留内存，大任务只出 CSV（列与 xlsx 明细一致）。
+        let detail = if over {
+            report::export_scan_csv(
+                &PathBuf::from(&batch_dir).join(detail_name).to_string_lossy(),
+                &rows,
+                cfg.record_miss,
+            )?
+        } else {
+            report::export_scan_excel(
+                &PathBuf::from(&batch_dir).join(detail_name).to_string_lossy(),
+                &rows,
+                &summary_rows,
+                cfg.record_miss,
+            )?
+        };
+        // 扫描的「留存」= 复制**命中**文件（未命中/跳过不复制，out 目录一眼能看出战果）
+        let kept = if cfg.keep_logs { report::copy_scan_hits(&rows, &batch_dir) } else { 0 };
+        return Ok((batch_dir, detail, String::new(), kept));
+    }
+
+    // ---------- 日志筛选 / 回传：36 列业务模板 + 回传审计 ----------
     let summary_rows: Vec<(&str, String)> = vec![
         ("扫描目录", cfg.root_dir.clone()),
         ("筛选类型", if cfg.log_type.is_empty() { "auto".into() } else { cfg.log_type.clone() }),
@@ -1269,5 +1362,47 @@ pub fn filter_verdict(summary: &FilterSummary, upload_enabled: bool, dry_run: bo
             summary.extracted, summary.total, summary.unknown, summary.skipped, summary.elapsed, summary.batch_dir
         ),
         true,
+    )
+}
+
+/// **通用扫描结论**：命中 / 未命中 / 跳过必须出现在一行 R 结论里；
+/// 零命中 = FAIL（与 README「扫描零命中 → status:false」及界面判定同一口径）。
+///
+/// 旧实现让扫描走 `filter_verdict`：只要文件读得动就算 PASS，结论只写「提取 N」——
+/// 扫出来一个都没命中，自动化那边照样报 PASS，看日志也看不出命中了几分。
+pub fn scan_verdict(summary: &FilterSummary) -> (String, bool) {
+    let prod = if summary.batch_dir.is_empty() {
+        String::new()
+    } else {
+        format!("，产物 {}", summary.batch_dir)
+    };
+    if summary.total == 0 {
+        return (format!("扫描数据为空：目录下没有匹配的文件（文件 0）{prod}"), false);
+    }
+    if summary.hit == 0 {
+        return (
+            format!(
+                "扫描零命中：文件 {}，命中 0，未命中 {}，跳过 {}，耗时 {}s{prod}",
+                summary.total, summary.miss, summary.skipped, summary.elapsed
+            ),
+            false,
+        );
+    }
+    let batch = if summary.batches_total > 1 {
+        format!(
+            "分批 {} 批（PASS {}/{}），",
+            summary.batches_total, summary.batches_pass, summary.batches_total
+        )
+    } else {
+        String::new()
+    };
+    // 分批模式：有批次没跑通（导出失败/空批次）也算失败，不能只看总命中数
+    let batch_ok = summary.batches_total <= 1 || summary.batches_pass == summary.batches_total;
+    (
+        format!(
+            "{batch}扫描 命中 {}/{}（未命中 {}，跳过 {}），耗时 {}s{prod}",
+            summary.hit, summary.total, summary.miss, summary.skipped, summary.elapsed
+        ),
+        batch_ok,
     )
 }

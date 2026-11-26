@@ -705,20 +705,178 @@ fn run_selftest(dir: &str) -> i32 {
         check("样例 0025 存在", false, "未找到");
     }
 
-    // 3) 通用扫描端到端：出 Excel 产物（**与界面同一条管道**，mode="scan"）
+    // 3) 通用扫描端到端：产物必须**区分命中与未命中**（列 + 摘要 + 落盘文件）
     {
         let out_root = std::env::temp_dir().join("findany-selftest-out");
         let _ = std::fs::create_dir_all(&out_root);
-        let scfg = scan_pipe_cfg(dir, &out_root.to_string_lossy(), "HardwareHash", 4);
+        let mut scfg = scan_pipe_cfg(dir, &out_root.to_string_lossy(), "HardwareHash", 4);
+        scfg.keep_logs = true; // 验证「复制命中文件到 out」只复制命中
         let cancel0 = std::sync::atomic::AtomicBool::new(false);
         let (items, summary0) = core::logfilter::engine::run_filter(&scfg, None, &cancel0);
         check("扫描命中", summary0.hit >= 3, &format!("hit={}", summary0.hit));
         check("扫描无跳过", summary0.skipped == 0, &format!("skipped={}", summary0.skipped));
+
+        let count_states = |path: &str| -> (usize, usize, usize) {
+            let mut hit = 0usize;
+            let mut miss = 0usize;
+            let mut skip = 0usize;
+            if let Ok(book) = umya_spreadsheet::reader::xlsx::read(std::path::Path::new(path)) {
+                if let Some(ws) = book.get_sheet_by_name("明细") {
+                    for r in 2..=ws.get_highest_row() {
+                        match ws.get_value((5u32, r)).to_string().as_str() {
+                            "命中" => hit += 1,
+                            "未命中" => miss += 1,
+                            "跳过" => skip += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            (hit, miss, skip)
+        };
+
         match core::logfilter::engine::export_products(&scfg, &items, &summary0, std::time::Instant::now()) {
-            Ok((batch, excel, _audit, _kept)) => {
+            Ok((batch, excel, _audit, kept)) => {
                 let size = std::fs::metadata(&excel).map(|m| m.len()).unwrap_or(0);
                 check("Excel 产物落盘", size > 4096, &format!("{excel} size={size}"));
                 check("批次目录按时间命名", std::path::Path::new(&batch).is_dir(), &batch);
+                check(
+                    "扫描明细命名 scan_result.xlsx",
+                    std::path::Path::new(&excel).file_name().map(|n| n == "scan_result.xlsx").unwrap_or(false),
+                    &excel,
+                );
+                // 明细第 5 列 = 包含状态：命中与未命中必须同时出现在产物里
+                let (hit, miss, _skip) = count_states(&excel);
+                check(
+                    "扫描明细同时有命中/未命中行",
+                    hit >= 3 && miss > 0,
+                    &format!("命中行={hit} 未命中行={miss}"),
+                );
+                // 摘要 sheet 要有「命中文件/未命中文件」两项，且数字与汇总一致
+                let summary_ok = umya_spreadsheet::reader::xlsx::read(std::path::Path::new(&excel))
+                    .ok()
+                    .and_then(|book| {
+                        let ws = book.get_sheet_by_name("摘要")?;
+                        let mut hit_ok = false;
+                        let mut miss_ok = false;
+                        for r in 2..=ws.get_highest_row() {
+                            let k = ws.get_value((1u32, r)).to_string();
+                            let v = ws.get_value((2u32, r)).to_string();
+                            if k == "命中文件" && v == summary0.hit.to_string() {
+                                hit_ok = true;
+                            }
+                            if k == "未命中文件" && v == summary0.miss.to_string() {
+                                miss_ok = true;
+                            }
+                        }
+                        Some(hit_ok && miss_ok)
+                    })
+                    .unwrap_or(false);
+                check("扫描摘要写命中/未命中数", summary_ok, &format!("hit={} miss={}", summary0.hit, summary0.miss));
+                // out 目录里只应出现命中文件（未命中文件即使 extract_ok=true 也不该被复制）
+                check(
+                    "只复制命中文件到 out",
+                    kept == summary0.hit,
+                    &format!("copied={kept} hit={}", summary0.hit),
+                );
+
+                // 「Excel 记录未命中」关闭：明细只剩命中行
+                let mut ncfg = scfg.clone();
+                ncfg.record_miss = false;
+                match core::logfilter::engine::export_products(&ncfg, &items, &summary0, std::time::Instant::now()) {
+                    Ok((b2, excel2, _a2, kept2)) => {
+                        let (hit2, miss2, skip2) = count_states(&excel2);
+                        check(
+                            "关闭「记录未命中」后明细只剩命中",
+                            hit2 >= 3 && miss2 == 0 && skip2 == 0,
+                            &format!("命中行={hit2} 未命中行={miss2} 跳过行={skip2}"),
+                        );
+                        check(
+                            "关闭「记录未命中」不影响命中文件落盘",
+                            kept2 == summary0.hit,
+                            &format!("copied={kept2} hit={}", summary0.hit),
+                        );
+                        // CSV 降级路径（超 1 万行走它）：列与 xlsx 一致，且同样区分命中/未命中
+                        let csv_all = std::path::Path::new(&b2).join("scan_result_all.csv");
+                        let csv_ok = core::logfilter::report::export_scan_csv(
+                            &csv_all.to_string_lossy(),
+                            &items,
+                            true,
+                        )
+                        .is_ok();
+                        let csv_text = std::fs::read_to_string(&csv_all).unwrap_or_default();
+                        let csv_rows = csv_text.lines().filter(|l| !l.trim().is_empty()).count().saturating_sub(1);
+                        check(
+                            "扫描 CSV 同样有包含状态且命中/未命中都在",
+                            csv_ok
+                                && csv_text.contains("包含状态")
+                                && csv_text.contains("命中")
+                                && csv_text.contains("未命中"),
+                            &format!("rows={csv_rows}"),
+                        );
+                        let csv_hit_only = std::path::Path::new(&b2).join("scan_result_hit_only.csv");
+                        let _ = core::logfilter::report::export_scan_csv(
+                            &csv_hit_only.to_string_lossy(),
+                            &items,
+                            false,
+                        );
+                        let hit_only_rows = std::fs::read_to_string(&csv_hit_only)
+                            .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count().saturating_sub(1))
+                            .unwrap_or(0);
+                        check(
+                            "扫描 CSV 关闭记录未命中后行数=命中数",
+                            hit_only_rows == summary0.hit,
+                            &format!("rows={hit_only_rows} hit={}", summary0.hit),
+                        );
+                    }
+                    Err(e) => check("关闭「记录未命中」后明细只剩命中", false, &e.to_string()),
+                }
+
+                // 结论口径：命中/未命中必须出现；零命中 = FAIL
+                let (ctext, cok) = core::logfilter::engine::scan_verdict(&summary0);
+                check(
+                    "扫描结论含命中与未命中",
+                    cok && ctext.contains("命中") && ctext.contains("未命中"),
+                    &ctext,
+                );
+                let mut zero = summary0.clone();
+                zero.hit = 0;
+                zero.miss = zero.extracted;
+                let (ztext, zok) = core::logfilter::engine::scan_verdict(&zero);
+                check("扫描零命中判 FAIL", !zok && ztext.contains("零命中"), &ztext);
+
+                // 分批扫描：命中/未命中必须**跨批累加**（旧实现只累加提取数，汇总永远「命中 0」）
+                let bdir = std::env::temp_dir().join("findany-scan-batch");
+                let _ = std::fs::remove_dir_all(&bdir);
+                for (name, body) in [
+                    ("a", "HardwareHash hit\n"),
+                    ("b", "HardwareHash hit\n"),
+                    ("c", "no keyword here\n"),
+                ] {
+                    let _ = std::fs::create_dir_all(bdir.join(name));
+                    let _ = std::fs::write(bdir.join(name).join("x.log"), body);
+                }
+                let mut bcfg = scan_pipe_cfg(
+                    &bdir.to_string_lossy(),
+                    &std::env::temp_dir().join("findany-scan-batch-out").to_string_lossy(),
+                    "HardwareHash",
+                    2,
+                );
+                bcfg.batch_dirs = true;
+                let bh = core::logfilter::engine::FilterHandle::default();
+                let (_bitems, bs) = core::logfilter::engine::run_filter_shared(&bcfg, None, &bh.cancel, &bh);
+                let (btxt, bok) = core::logfilter::engine::scan_verdict(&bs);
+                check(
+                    "分批扫描：命中/未命中跨批累加",
+                    bs.batches_total == 3 && bs.hit == 2 && bs.miss == 1,
+                    &format!("batches={} hit={} miss={}", bs.batches_total, bs.hit, bs.miss),
+                );
+                check(
+                    "分批扫描结论含批次与命中数",
+                    bok && btxt.contains("分批 3 批") && btxt.contains("命中 2/3"),
+                    &btxt,
+                );
+                let _ = std::fs::remove_dir_all(&bdir);
             }
             Err(e) => check("Excel 产物落盘", false, &e.to_string()),
         }

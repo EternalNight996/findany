@@ -138,8 +138,11 @@ findany --uitest                         # 验证表格虚拟化：每帧只渲�
 
 **回传判定**（移植 etest-core `check_result` 思路，规则可配）：退出码 0 且 stdout `status∈{accepted, duplicate_accepted}` 双确认=成功；退出码 12=冲突转人工（黄）；其余=失败（红）。结果审计落 `out/<时间>/upload-result.csv`（不含 Hash 与 SecretKey）。
 
-**产物**：`out/<YYYY-MM-DD_HH-MM>/` 下 `filter_result.xlsx`、`upload-result.csv`（回传审计）、命中日志留存。
-Excel 明细为**统一模板 36 列**（6 组逻辑排序：识别→设备→网络→OA3→原始→结果，OA3 组含 **HardwareHash 本体** 4000 字符全值）+ 摘要 sheet；**批次自适应**：本批整列全空自动隐藏、列宽按内容自适应、冻结表头+序号/文件列（openpyxl 缺失降级 CSV）。
+**产物**：`out/<YYYY-MM-DD_HH-MM-SS>/` 下按模式分别出：
+- **通用扫描**：`scan_result.xlsx`（命中/未命中明细 + 摘要）、命中文件留存；行数超 1 万降级 `scan_result.csv`（列与 xlsx 一致）。
+- **日志筛选 / 回传**：`filter_result.xlsx`、`upload-result.csv`（回传审计）、提取成功日志留存。
+
+筛选 Excel 明细为**统一模板 36 列**（6 组逻辑排序：识别→设备→网络→OA3→原始→结果，OA3 组含 **HardwareHash 本体** 4000 字符全值）+ 摘要 sheet；**批次自适应**：本批整列全空自动隐藏、列宽按内容自适应、冻结表头+序号/文件列。
 另有**按判型动态生成的专属 sheet**（etest(OA3)/etest/e-autotest/海格旧测试2/海格旧测试3 各用各的列集，批内没有的类型不生成；未知类型只落总表兜底）。新判型在 `src/core/logfilter/report.rs::type_templates` 登记即获得专属模板。
 
 ## 验收输出（etest `R<...>R` 标准）
@@ -270,12 +273,14 @@ process_priority = "below_normal"   # 或 idle：Windows 会把它的 CPU/IO 优
 
 ```
 <程序目录>/out/
- └─ <YYYY-MM-DD_HH-MM>/           # 本次批次（同分钟自动加序号，不覆盖）
-     ├─ scan_result.xlsx          # 明细 + 摘要
-     └─ {目录}/{文件}             # 命中文件（勾选「复制到 out」才复制）
+ └─ <YYYY-MM-DD_HH-MM-SS>/        # 本次批次（同秒自动加序号，不覆盖）
+     ├─ scan_result.xlsx          # 通用扫描：明细（含「包含状态」）+ 摘要
+     ├─ scan_result.csv           # 行数超 1 万时的降级明细（列同 xlsx）
+     └─ {目录}/{文件}             # 只有「命中」文件（勾选「复制到 out」才复制）
 ```
 
-明细列：序号、相对路径、目录、扩展名、包含状态、命中行号、命中行内容、匹配计数、大小、修改时间、编码、绝对路径。
+扫描明细列：序号、相对路径、目录、扩展名、**包含状态（命中 / 未命中 / 跳过）**、命中行号、命中行内容、匹配计数、大小、修改时间、编码、跳过原因、绝对路径。
+摘要 sheet 另写文件总数、命中文件、未命中文件、跳过文件、关键字 / 匹配模式 / 大小写敏感等口径；「Excel 记录未命中」不勾时明细只留命中行（摘要仍按全量统计）。
 
 ## 日志
 
@@ -296,11 +301,11 @@ just dist          # Windows 包 -> dist/findany-v<版本>.zip
 just dist-linux    # Linux 包   -> dist/findany-v<版本>-linux.tar.gz（需在 Linux 上先 just build-linux）
 ```
 
-包内清单（Windows 包，约 35MB —— 其中 35MB 是回传 CLI，本体只 12.6MB）：
+包内清单（Windows 包，zip 约 58MB —— 回传 CLI 35MB、Mesa 软件 OpenGL 兜底约 59MB（压缩后占比小），本体 13.9MB）：
 
 ```
-findany-v2.0.0/windows/
- ├─ findany.exe             # 12.6MB 单文件，无运行时依赖
+findany-v2.0.1-beta.1/windows/
+ ├─ findany.exe             # 13.9MB 单文件，无运行时依赖
  ├─ findany.toml            # 自动化模板（与程序内 DEFAULT_TOML 逐字一致，含注释）
  ├─ intunehelper_cli.exe    # 回传 CLI（doc/ 下有才带）
  ├─ README.md
@@ -406,6 +411,14 @@ git push -u gitee  main
 > - SSH 方式推送，无需每次输入账号密码，需先在本地 `ssh-keygen` 生成密钥并在两端添加公钥。
 > - 若提示 `Permission denied (publickey)`，检查公钥是否已添加、`ssh -T git@github.com` 是否能通。
 > - `build/`、`dist/`、`out/`、`findany.toml`、`legacy/`、`target/`、`__pycache__` 已写入 `.gitignore`，不会提交。
+
+## 版本要点（v2.0.1-beta.1）
+
+### 通用扫描产物区分命中 / 未命中
+- 扫描产物独立为 `scan_result.xlsx`（超 1 万行降级 `scan_result.csv`），明细自带「包含状态 = 命中 / 未命中 / 跳过」、命中行号/内容、匹配计数、跳过原因。
+- 摘要写入文件总数、命中 / 未命中 / 跳过数；`--auto` 结论写明命中数，**零命中判 FAIL**。
+- 「Excel 记录未命中」不再失效；「复制命中文件到 out」只复制命中文件，不再把未命中一起拷进批次目录。
+- 分批扫描的命中 / 未命中计数跨批累加。
 
 ## 版本要点（v2.0.0 完结版）
 
